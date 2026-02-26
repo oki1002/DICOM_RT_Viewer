@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dicom-viewer"
+version = "0.1.0"
+description = "SimpleITK-based DICOM MPR viewer widget for Tkinter"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+dependencies = [
+    "SimpleITK>=2.3",
+    "matplotlib>=3.7",
+    "numpy>=1.24",
+    "pydicom>=2.4",
+    "scikit-image>=0.21",
+    "scipy>=1.11",
+]
+
+[project.optional-dependencies]
+# Install with: pip install dicom-viewer[dev]
+dev = [
+    "pytest>=7",
+    "mypy>=1.0",
+]
+
+[tool.hatch.build.targets.wheel]
+# src layout: only the package under src/ is included in the wheel.
+packages = ["src/dicom_viewer"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true

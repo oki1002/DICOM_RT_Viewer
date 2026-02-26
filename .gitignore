@@ -1,0 +1,61 @@
+# --- Python build / distribution ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# --- Virtual Environments ---
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# --- Testing / Coverage ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- IDEs / Editors ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# --- DICOM / Medical Data (Safety first) ---
+*.dcm
+*.DCM
+/data/
+/samples/
+/tests/data/
+!/tests/data/.gitkeep
+
+# --- SimpleITK / Visualization ---
+*.nii
+*.nii.gz
+*.mhd
+*.zraw
+*.raw
