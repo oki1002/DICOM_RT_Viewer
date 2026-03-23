@@ -381,16 +381,34 @@ class DicomViewer(ttk.Frame):
     # ------------------------------------------------------------------
     # Contour rendering
     # ------------------------------------------------------------------
-    def _draw_axis_contours(self, axis: str) -> None:
+    def _draw_axis_contours(
+        self,
+        axis: str,
+        override_mask: dict[int, np.ndarray] | None = None,
+    ) -> None:
+        """Render contour patches for all active ROIs on *axis*.
+
+        Args:
+            axis: One of ``"axial"``, ``"coronal"``, or ``"sagittal"``.
+            override_mask: Optional mapping of ``{roi_number: 2-D numpy array}``
+                used during brush dragging.  When a ROI number is present in
+                this dict its slice data is taken from the provided array
+                instead of ``state.structure_set``, so the contour reflects
+                in-progress edits that have not yet been committed to State.
+        """
         ax = self.axs[axis]
         existing = self.contour_patches[axis]
         used: Set[int] = set()
+        effective_override = override_mask or {}
 
         for roi_number in self.state.active_contours:
-            mask_sitk = self.state.structure_set.get_mask(roi_number)
-            if mask_sitk is None:
-                continue
-            mask_slice = self.state.get_slice_data(mask_sitk, axis)
+            if roi_number in effective_override:
+                mask_slice = effective_override[roi_number]
+            else:
+                mask_sitk = self.state.structure_set.get_mask(roi_number)
+                if mask_sitk is None:
+                    continue
+                mask_slice = self.state.get_slice_data(mask_sitk, axis)
             if mask_slice.shape[0] < 2 or mask_slice.shape[1] < 2:
                 continue
             extent = self.state.get_extent(axis)

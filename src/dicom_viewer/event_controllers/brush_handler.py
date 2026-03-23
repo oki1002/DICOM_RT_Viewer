@@ -34,6 +34,10 @@ class BrushEventHandler:
         self._active_axis: str | None = None  # axis on which the stroke was started
         self._last_pos_px: tuple[int, int] | None = None
         self._stroke_mask: np.ndarray | None = None
+
+        self._cached_mask_volume: np.ndarray | None = None
+        self._cached_roi_number: int | None = None
+
         # Cursor circle is shown only after the first real mouse-move inside
         # a view, to prevent a stale circle appearing at activation time.
         self._cursor_ready: bool = False
@@ -73,6 +77,9 @@ class BrushEventHandler:
         mask_slice = self.state.get_slice_data(mask_image, self._active_axis)
         self._stroke_mask = np.zeros_like(mask_slice, dtype=bool)
 
+        self._cached_mask_volume = sitk.GetArrayFromImage(mask_image)
+        self._cached_roi_number = roi_number
+
         self._last_pos_px = None
         self._paint_at(event)
 
@@ -104,14 +111,7 @@ class BrushEventHandler:
             self._paint_at(event, interpolate=True)
 
     def handle_release(self, event) -> None:
-        """Commit the completed stroke to the ROI mask volume.
-
-        During the drag, _apply_stroke_to_mask() writes incremental preview
-        updates without hole-filling (fast path).  On release this method
-        performs the authoritative commit: it re-applies the accumulated
-        stroke mask against the current volume slice and optionally runs
-        binary_fill_holes, producing the final clean result.
-        """
+        """Commit the completed stroke to the ROI mask volume."""
         if not self._is_dragging:
             return
         self._is_dragging = False
@@ -120,31 +120,25 @@ class BrushEventHandler:
         self._active_axis = None
 
         if not axis:
-            self._stroke_mask = None
+            self._discard_cache()
             return
 
         roi_number = self.state.selected_roi_number
         if roi_number is None or roi_number not in self.state.structure_set:
-            self._stroke_mask = None
+            self._discard_cache()
             return
 
-        mask_image = self.state.structure_set.get_mask(roi_number)
-        mask_volume = sitk.GetArrayFromImage(mask_image)
+        # _cached_mask_volume already contains every in-stroke write.
+        # Apply fill_holes on the final 2-D slice if requested, then commit.
+        mask_volume = self._cached_mask_volume
         numpy_idx = self.state._axis_to_numpy_index(axis)
         slice_idx = self.state.indices[axis]
 
         slobj: list = [slice(None)] * 3
         slobj[numpy_idx] = slice_idx
-        original = mask_volume[tuple(slobj)]
 
-        if self._button == 1:
-            combined = np.logical_or(original, self._stroke_mask)
-            if self.state.brush_fill_inside:
-                combined = binary_fill_holes(combined)
-        else:
-            combined = np.logical_and(original, np.logical_not(self._stroke_mask))
-
-        mask_volume[tuple(slobj)] = combined
+        if self._button == 1 and self.state.brush_fill_inside:
+            mask_volume[tuple(slobj)] = binary_fill_holes(mask_volume[tuple(slobj)])
 
         new_mask = sitk.GetImageFromArray(mask_volume.astype(np.uint8))
         new_mask.CopyInformation(self.state.primary_image)
@@ -152,6 +146,7 @@ class BrushEventHandler:
 
         self._last_pos_px = None
         self._stroke_mask = None
+        self._discard_cache()
 
     def handle_scroll(self, event) -> None:
         """Adjust the brush size by 1 mm per scroll step."""
@@ -231,10 +226,14 @@ class BrushEventHandler:
             self._interpolate_and_draw_stroke(axis, self._last_pos_px, center_px)
 
         self._draw_brush_on_stroke_mask(axis, center_px)
-        self._apply_stroke_to_mask()
+
+        self._apply_stroke_to_mask_cached()
+
         self._last_pos_px = center_px
 
-        self.viewer._draw_axis_contours(axis)
+        # Render the contour from the cached slice so the outline reflects the
+        # latest paint state without a sitk round-trip or State notification.
+        self._draw_axis_contours_from_cache(axis)
         self.viewer.drawing_manager.add_request(axis)
 
     def _interpolate_and_draw_stroke(
@@ -270,14 +269,81 @@ class BrushEventHandler:
         ellipse = ((rows - row_c) / ry_px) ** 2 + ((cols - col_c) / rx_px) ** 2 <= 1
         self._stroke_mask[row_min:row_max, col_min:col_max][ellipse] = True
 
-    def _apply_stroke_to_mask(self) -> None:
-        """Composite the current stroke mask into the ROI volume."""
-        if self._stroke_mask is None:
+    def _apply_stroke_to_mask_cached(self) -> None:
+        """Write the current stroke mask into the cached NumPy volume in-place.
+
+        No ``sitk`` conversion or State notification is performed; the result
+        stays in ``_cached_mask_volume`` until ``handle_release`` commits it.
+        """
+        if self._stroke_mask is None or self._cached_mask_volume is None:
             return
-        self._apply_mask_to_volume(self._stroke_mask)
+
+        axis = self._active_axis
+        if axis is None:
+            return
+
+        numpy_idx = self.state._axis_to_numpy_index(axis)
+        slobj: list = [slice(None)] * 3
+        slobj[numpy_idx] = self.state.indices[axis]
+        original = self._cached_mask_volume[tuple(slobj)]
+
+        if self._button == 1:
+            self._cached_mask_volume[tuple(slobj)] = np.logical_or(
+                original, self._stroke_mask
+            )
+        else:
+            self._cached_mask_volume[tuple(slobj)] = np.logical_and(
+                original, np.logical_not(self._stroke_mask)
+            )
+
+    def _draw_axis_contours_from_cache(self, axis: str) -> None:
+        """Re-render the contour for the edited ROI using the cached slice.
+
+        During dragging the cached volume reflects the latest paint but has
+        not yet been written back to State.  This method extracts the current
+        2-D slice from ``_cached_mask_volume`` and passes it to the viewer's
+        contour renderer via the ``override_mask`` parameter, bypassing
+        ``state.structure_set`` for the active ROI.  The outline therefore
+        updates in real time without a sitk round-trip or a State notification.
+        """
+        if self._cached_mask_volume is None or self._cached_roi_number is None:
+            self.viewer._draw_axis_contours(axis)
+            return
+
+        roi_number = self._cached_roi_number
+        numpy_idx = self.state._axis_to_numpy_index(axis)
+        slobj: list = [slice(None)] * 3
+        slobj[numpy_idx] = self.state.indices[axis]
+        cached_slice = self._cached_mask_volume[tuple(slobj)]
+
+        self.viewer._draw_axis_contours(axis, override_mask={roi_number: cached_slice})
+
+    # ------------------------------------------------------------------
+    # Cache helpers
+    # ------------------------------------------------------------------
+    def _discard_cache(self) -> None:
+        """Release the cached NumPy volume and associated metadata."""
+        self._cached_mask_volume = None
+        self._cached_roi_number = None
+
+    # --- Legacy methods kept for backward compatibility ---
+    def _apply_stroke_to_mask(self) -> None:
+        """Composite the current stroke mask into the ROI volume.
+
+        .. deprecated::
+            In-stroke writes now go through ``_apply_stroke_to_mask_cached``.
+            This method is retained for external callers only.
+        """
+        self._apply_stroke_to_mask_cached()
 
     def _apply_mask_to_volume(self, new_slice_mask: np.ndarray) -> None:
-        """Merge a 2-D mask into the 3-D ROI volume and write back to State."""
+        """Merge a 2-D mask into the 3-D ROI volume and write back to State.
+
+        .. deprecated::
+            In-stroke writes now go through ``_apply_stroke_to_mask_cached``
+            and ``handle_release``.  This method is retained for external
+            callers only.
+        """
         axis = self.state.current_axis
         roi_number = self.state.selected_roi_number
         if roi_number is None or roi_number not in self.state.structure_set:
