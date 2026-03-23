@@ -7,6 +7,7 @@ Design:
     - Rendering is handled by :class:`DicomViewer` through the
       ``"crosshair_changed"`` listener — this class never draws anything.
 """
+
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -76,16 +77,16 @@ class CrosshairEventHandler:
     def handle_motion(self, event) -> None:
         """Translate drag motion into slice index updates on the State."""
         if not self._is_dragging:
-            return False
+            return
         axis = self._active_axis
         if not (axis and event.xdata is not None and event.ydata is not None):
-            return True
+            return
 
         # Mapping of (view, direction) -> (target_axis, physical_coord)
         actions = {
-            "axial":    {"v": ("sagittal", event.xdata), "h": ("coronal",  event.ydata)},
-            "coronal":  {"v": ("sagittal", event.xdata), "h": ("axial",    event.ydata)},
-            "sagittal": {"v": ("coronal",  event.xdata), "h": ("axial",    event.ydata)},
+            "axial": {"v": ("sagittal", event.xdata), "h": ("coronal", event.ydata)},
+            "coronal": {"v": ("sagittal", event.xdata), "h": ("axial", event.ydata)},
+            "sagittal": {"v": ("coronal", event.xdata), "h": ("axial", event.ydata)},
         }
 
         targets = []
@@ -111,5 +112,3 @@ class CrosshairEventHandler:
             self._is_dragging = False
             self._active_axis = None
             self._drag_target = None
-            return True
-        return False

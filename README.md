@@ -11,7 +11,7 @@ A SimpleITK-based DICOM MPR viewer widget for Tkinter.
 - **Interactive navigation** — Crosshair drag, mouse wheel, and keyboard (↑ / ↓ / PageUp / PageDown).
 - **Window / level adjustment** — Right-click drag: horizontal → window width (WW), vertical → window centre (WL).
 - **RT-STRUCT support** — ROI masks stored in `StructureSet` (keyed by integer ROI number); contour overlay with optional semi-transparent fill; brush tool for mask editing.
-- **Bounding box tool** — Create, move, and resize an bounding box with click-drag interactions.
+- **Bounding box tool** — Create, move, and resize a bounding box with click-drag interactions.
 
 ## Requirements
 
@@ -24,12 +24,6 @@ A SimpleITK-based DICOM MPR viewer widget for Tkinter.
 - scipy ≥ 1.11
 
 ## Installation
-
-Install from PyPI *(once published)*:
-
-```bash
-pip install dicom-viewer
-```
 
 Install directly from source (editable mode — changes take effect immediately):
 
@@ -121,7 +115,7 @@ state.set_brush_tool_active(False)
 # Set a bounding box programmatically (physical coords: x_min, y_min, w, h)
 state.set_bounding_box("axial", (x_min, y_min, width, height))
 
-# Retrieve as pixel indices
+# Retrieve as pixel indices (works for any view axis)
 x, y, w, h = state.get_bbox_pixel_coords("axial")
 
 # Clear

@@ -8,7 +8,7 @@ Event priority for ``on_press`` / ``on_motion``:
     1. Crosshair drag (highest priority)
     2. Brush tool (left / right button)
     3. Window / level adjustment (right-click drag)
-    4. Bounding box interaction (axial only)
+    4. Bounding box interaction
 """
 
 from typing import TYPE_CHECKING
@@ -50,6 +50,10 @@ class ViewerEventHandler:
     def _on_brush_tool_active_changed(self, is_active: bool) -> None:
         if is_active:
             self.brush_handler.activate()
+            # Cancel any in-progress WL drag immediately
+            self._dragging_wl = False
+            self._wl_start_pos = None
+            self._wl_initial = None
         else:
             self.brush_handler.deactivate()
 
@@ -96,12 +100,13 @@ class ViewerEventHandler:
         if self.viewer.toolbar.mode not in ("", None):
             return
 
-        # Priority 1: crosshair drag
-        if self.crosshair_handler.handle_press(event):
+        # Priority 1: brush tool (exclusive — blocks crosshair, WL, bbox)
+        if self.state.brush_tool_active:
+            self.brush_handler.handle_press(event)
             return
 
-        # Priority 2: brush tool
-        if self.state.brush_tool_active and self.brush_handler.handle_press(event):
+        # Priority 2: crosshair drag
+        if self.crosshair_handler.handle_press(event):
             return
 
         # Priority 3: window / level (right-click)
@@ -111,21 +116,23 @@ class ViewerEventHandler:
             self._wl_initial = self.state.window_level
             return
 
-        # Priority 4: bounding box (axial view only)
-        if self.bbox_handler.handle_press(event):
-            return
+        # Priority 4: bounding box (all views)
+        if event.button == 1 and self.state.current_axis:
+            self.bbox_handler.handle_press(event)
 
     # ------------------------------------------------------------------
     # Mouse motion
     # ------------------------------------------------------------------
     def on_motion(self, event) -> None:
         """Route mouse-motion events while a drag is in progress."""
-        # Priority 1: crosshair drag
-        if self.crosshair_handler.handle_motion(event):
+        # Priority 1: brush tool (exclusive)
+        if self.state.brush_tool_active:
+            self.brush_handler.handle_motion(event)
             return
 
-        # Priority 2: brush tool
-        if self.state.brush_tool_active and self.brush_handler.handle_motion(event):
+        # Priority 2: crosshair drag
+        if self.crosshair_handler.is_dragging():
+            self.crosshair_handler.handle_motion(event)
             return
 
         # Priority 3: window / level
@@ -133,34 +140,34 @@ class ViewerEventHandler:
             dx = event.x - self._wl_start_pos[0]
             dy = event.y - self._wl_start_pos[1]
             init_w, init_l = self._wl_initial
+            # Horizontal drag → window width; vertical drag → window level
             new_w = max(1, int(init_w + dx * 1.0))
             new_l = int(init_l - dy * 0.2)
             self.state.set_window_level(new_w, new_l)
             return
 
         # Priority 4: bounding box
-        if self.bbox_handler.handle_motion(event):
-            return
+        if self.bbox_handler.is_dragging:
+            self.bbox_handler.handle_motion(event)
 
     # ------------------------------------------------------------------
     # Mouse release
     # ------------------------------------------------------------------
     def on_release(self, event) -> None:
         """Release all in-progress drag operations."""
-        if self.crosshair_handler.handle_release(event):
+        if self.state.brush_tool_active:
+            self.brush_handler.handle_release(event)
             return
 
-        if self.state.brush_tool_active and self.brush_handler.handle_release(event):
-            return
+        self.crosshair_handler.handle_release(event)
 
-        if self.bbox_handler.handle_release(event):
-            return
+        if self.bbox_handler.is_dragging:
+            self.bbox_handler.handle_release(event)
 
         if self._dragging_wl:
             self._dragging_wl = False
             self._wl_start_pos = None
             self._wl_initial = None
-            return
 
     # ------------------------------------------------------------------
     # Keyboard

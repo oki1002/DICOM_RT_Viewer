@@ -10,6 +10,7 @@ Public API:
         SimpleITK physical-coordinate API; no NumPy transposition is performed
         here — callers should use ``sitk.GetArrayViewFromImage()``.
 """
+
 import logging
 import pathlib
 
@@ -78,6 +79,8 @@ def load_ct_sitk(ct_dir) -> sitk.Image:
     image = reader.Execute()
     logger.info(
         "Loaded CT — size=%s  spacing=%s  origin=%s",
-        image.GetSize(), image.GetSpacing(), image.GetOrigin(),
+        image.GetSize(),
+        image.GetSpacing(),
+        image.GetOrigin(),
     )
     return image

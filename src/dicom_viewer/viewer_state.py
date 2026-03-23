@@ -8,8 +8,12 @@ Design notes:
       emit events via :meth:`SliceViewerState._notify`.
     - ROI masks are managed by :class:`StructureSet`, keyed by integer ROI
       number (auto-assigned on :meth:`StructureSet.add`).
-    - Secondary-image and 4DCT fields are reserved for future use and are
-      not yet active.
+
+Secondary image & 4DCT:
+    The state supports an optional secondary image that is blended over the
+    primary image.  4DCT phase data can be loaded via
+    :meth:`set_all_phases`; individual phases are activated as the secondary
+    image with :meth:`set_active_phase_as_secondary`.
 
 Coordinate system:
     SimpleITK uses the LPS (Left-Posterior-Superior) physical coordinate
@@ -132,6 +136,11 @@ class SliceViewerState:
 
     Event types and callback signatures:
         ``"primary_image_data_changed"``   — ``(image: sitk.Image | None)``
+        ``"secondary_image_data_changed"`` — ``(image: sitk.Image | None)``
+        ``"blend_alpha_changed"``          — ``(alpha: float)``
+        ``"secondary_image_cmap_changed"`` — ``(cmap_name: str)``
+        ``"phases_data_loaded"``           — ``(phases_data: dict)``
+        ``"phase_changed"``                — ``(phase_name: str)``
         ``"index_changed"``                — ``(axis: str, new_idx: int)``
         ``"window_level_changed"``         — ``(window: int, level: int)``
         ``"crosshair_changed"``            — ``()``
@@ -142,17 +151,18 @@ class SliceViewerState:
         ``"overlay_contours_changed"``     — ``(enable: bool)``
         ``"brush_tool_active_changed"``    — ``(is_active: bool)``
         ``"brush_size_mm_changed"``        — ``(size_mm: float)``
-
-    Reserved for future use (currently unused):
-        ``secondary_image``, ``all_phases_data``, ``current_phase``
     """
 
-    # --- Image data ---
+    # --- Primary image ---
     primary_image_dir: pathlib.Path | None = None
     primary_image: sitk.Image | None = field(repr=False, default=None)
 
-    # Future: secondary image overlay and 4DCT phase support
+    # --- Secondary image & blend ---
     secondary_image: sitk.Image | None = field(repr=False, default=None)
+    blend_alpha: float = 1.0
+    secondary_image_cmap: str = "gray"
+
+    # --- 4DCT phases ---
     all_phases_data: Dict[str, Any] = field(default_factory=dict, repr=False)
     current_phase: str | None = None
 
@@ -173,20 +183,22 @@ class SliceViewerState:
     brush_fill_inside: bool = True
 
     # --- Crosshair ---
-    crosshair_visible: bool = True
+    crosshair_visible: bool = False
     crosshair_pos: Dict[str, tuple[float, float] | None] = field(
         default_factory=lambda: {axis: None for axis in AXES}
     )
 
     # --- Bounding box (physical coords: x_min, y_min, width, height) ---
-    bbox_visible: bool = True
+    bbox_visible: bool = False
     bounding_boxes: Dict[str, tuple[float, float, float, float] | None] = field(
         default_factory=lambda: {axis: None for axis in AXES}
     )
 
     # --- Observer ---
     _listeners: Dict[str, Set[Callable]] = field(
-        default_factory=lambda: defaultdict(set)
+        default_factory=lambda: defaultdict(set),
+        compare=False,
+        repr=False,
     )
 
     # =========================================================
@@ -230,11 +242,7 @@ class SliceViewerState:
     # Physical ↔ index conversion
     # =========================================================
     def index_to_physical(self, axis: str, index: int) -> float:
-        """Convert a slice index along *axis* to a physical LPS coordinate.
-
-        The other two axes are fixed at their current indices.
-        Returns ``0.0`` if no image is loaded.
-        """
+        """Convert a slice index along *axis* to a physical LPS coordinate."""
         if self.primary_image is None:
             return 0.0
         numpy_indices = [
@@ -248,11 +256,7 @@ class SliceViewerState:
         return phys_point[self._axis_to_xyz_index(axis)]
 
     def physical_to_index(self, axis: str, coord: float) -> int:
-        """Convert a physical LPS coordinate along *axis* to the nearest index.
-
-        The result is clamped to the valid index range.
-        Returns ``0`` if no image is loaded.
-        """
+        """Convert a physical LPS coordinate along *axis* to the nearest index."""
         if self.primary_image is None:
             return 0
         x = self.index_to_physical("sagittal", self.indices["sagittal"])
@@ -276,17 +280,7 @@ class SliceViewerState:
     # Slice data access
     # =========================================================
     def get_slice_data(self, volume: sitk.Image, axis: str) -> np.ndarray:
-        """Extract the 2-D slice at the current index along *axis*.
-
-        Args:
-            volume: A ``sitk.Image`` to slice (must share geometry with the
-                primary image).
-            axis:   One of ``"axial"``, ``"coronal"``, ``"sagittal"``.
-
-        Returns:
-            A 2-D NumPy view (zero-copy). Returns an empty array if *volume*
-            is ``None`` or has no pixels.
-        """
+        """Extract the 2-D slice at the current index along *axis*."""
         if volume is None:
             return np.array([])
         arr = sitk.GetArrayViewFromImage(volume)
@@ -297,11 +291,7 @@ class SliceViewerState:
         return arr[tuple(slobj)]
 
     def get_extent(self, axis: str) -> list[float]:
-        """Return the physical coordinate extent for *axis* as
-        ``[left, right, bottom, top]`` suitable for ``imshow(extent=...)``.
-
-        Returns ``[0.0, 1.0, 0.0, 1.0]`` if no image is loaded.
-        """
+        """Return ``[left, right, bottom, top]`` in physical coordinates."""
         if self.primary_image is None:
             return [0.0, 1.0, 0.0, 1.0]
         size = self.primary_image.GetSize()
@@ -333,14 +323,7 @@ class SliceViewerState:
     # Index manipulation
     # =========================================================
     def set_index(self, axis: str, value: int, update_crosshair: bool = True) -> None:
-        """Set the slice index for *axis* and notify listeners.
-
-        Args:
-            axis:             Target view axis.
-            value:            New index value (not range-checked here).
-            update_crosshair: If ``True``, recompute crosshair physical
-                coordinates after updating the index.
-        """
+        """Set the slice index for *axis* and notify listeners."""
         if self.indices.get(axis) != value:
             self.indices[axis] = value
             self._notify("index_changed", axis, value)
@@ -348,7 +331,38 @@ class SliceViewerState:
                 self._update_crosshair_by_index()
 
     # =========================================================
-    # Image loading
+    # Image resampling helper
+    # =========================================================
+    def get_resampled_image(
+        self,
+        image: sitk.Image,
+        transform: sitk.Transform | None = None,
+    ) -> sitk.Image:
+        """Resample *image* to match the primary image geometry.
+
+        If *transform* is provided it is applied before resampling (useful
+        for 4DCT phase registration).  Otherwise an identity transform is
+        used.
+
+        Args:
+            image:     The source image to resample.
+            transform: Optional pre-registered transform.  When ``None`` an
+                identity transform is assumed.
+
+        Returns:
+            A ``sitk.Image`` resampled to the primary image grid.
+        """
+        resample = sitk.ResampleImageFilter()
+        resample.SetReferenceImage(self.primary_image)
+        resample.SetInterpolator(sitk.sitkLinear)
+        resample.SetTransform(
+            transform if transform is not None else sitk.Transform(3, sitk.sitkIdentity)
+        )
+        resample.SetDefaultPixelValue(-2048)
+        return resample.Execute(image)
+
+    # =========================================================
+    # Primary image
     # =========================================================
     def set_primary_image_data(
         self,
@@ -356,9 +370,6 @@ class SliceViewerState:
         image_dir: pathlib.Path | None = None,
     ) -> None:
         """Set the primary CT image and reset all derived state.
-
-        Slice indices are initialised to the centre of the volume.
-        Notifies listeners with event ``"primary_image_data_changed"``.
 
         Args:
             image:     The CT volume as a ``sitk.Image``.
@@ -373,6 +384,11 @@ class SliceViewerState:
         self.selected_roi_number = None
         self.bounding_boxes = {axis: None for axis in AXES}
         self.secondary_image = None
+        self.blend_alpha = 1.0
+        self.all_phases_data = {}
+        self.current_phase = None
+
+        self._notify("secondary_image_data_changed", None)
 
         if image is not None:
             x_dim, y_dim, z_dim = image.GetSize()
@@ -385,15 +401,105 @@ class SliceViewerState:
         self._notify("primary_image_data_changed", image)
 
     # =========================================================
+    # Secondary image & blend
+    # =========================================================
+    def set_secondary_image_data(self, image: sitk.Image | None) -> None:
+        """Set (or clear) the secondary overlay image.
+
+        The image is automatically resampled to the primary image grid.
+        Setting ``image=None`` hides the overlay.  When a new image is
+        provided, :attr:`blend_alpha` is set to ``0.5`` so both images are
+        visible immediately.
+
+        Args:
+            image: Secondary ``sitk.Image`` to overlay, or ``None`` to clear.
+        """
+        if image is None:
+            self.secondary_image = None
+        else:
+            self.secondary_image = self.get_resampled_image(image)
+            self.set_blend_alpha(0.5)
+        self._notify("secondary_image_data_changed", self.secondary_image)
+
+    def set_blend_alpha(self, alpha: float) -> None:
+        """Set the primary-image opacity for the blend slider (0.0–1.0).
+
+        A value of ``1.0`` means only the primary image is visible; ``0.0``
+        shows only the secondary image.
+
+        Args:
+            alpha: Opacity of the primary image layer.
+        """
+        if self.blend_alpha != alpha:
+            self.blend_alpha = alpha
+            self._notify("blend_alpha_changed", alpha)
+
+    def set_secondary_image_cmap(self, cmap_name: str) -> None:
+        """Change the colourmap used to display the secondary image.
+
+        Args:
+            cmap_name: A Matplotlib-compatible colourmap name (e.g.
+                ``"hot"``, ``"jet"``).
+        """
+        if self.secondary_image_cmap != cmap_name:
+            self.secondary_image_cmap = cmap_name
+            self._notify("secondary_image_cmap_changed", cmap_name)
+
+    # =========================================================
+    # 4DCT phases
+    # =========================================================
+    def set_all_phases(self, phases_data: Dict[str, Any]) -> None:
+        """Store all 4DCT phase images, resampled to the primary image grid.
+
+        Each entry in *phases_data* must be a dict containing at minimum:
+
+        - ``"sitk_image"`` — the raw phase ``sitk.Image``
+        - ``"transform"`` — a ``sitk.Transform | None`` for registration
+
+        After resampling the images are cached in :attr:`all_phases_data` and
+        listeners are notified with ``"phases_data_loaded"``.
+
+        Args:
+            phases_data: Mapping of phase label → series info dict, as
+                returned by ``load_all_series()``.
+        """
+        if not self.primary_image:
+            logger.error("Cannot set phases: primary image not loaded.")
+            return
+
+        self.all_phases_data = {
+            phase: {
+                **series_dict,
+                "sitk_image": self.get_resampled_image(
+                    series_dict["sitk_image"],
+                    transform=series_dict.get("transform"),
+                ),
+            }
+            for phase, series_dict in phases_data.items()
+        }
+        self.current_phase = None
+        self._notify("phases_data_loaded", self.all_phases_data)
+
+    def set_active_phase_as_secondary(self, phase_name: str) -> None:
+        """Activate a 4DCT phase as the secondary overlay image.
+
+        Args:
+            phase_name: Key in :attr:`all_phases_data` to activate.
+        """
+        if phase_name not in self.all_phases_data:
+            logger.warning("Phase '%s' not found in loaded phases.", phase_name)
+            return
+
+        self.current_phase = phase_name
+        phase_image = self.all_phases_data[phase_name]["sitk_image"]
+        self.set_secondary_image_data(phase_image)
+        self._notify("phase_changed", phase_name)
+
+    # =========================================================
     # Window / level
     # =========================================================
     def set_window_level(self, window: int, level: int) -> None:
-        """Update the display window width and level.
-
-        Args:
-            window: Window width (WW) in HU.
-            level:  Window centre (WL) in HU.
-        """
+        """Update the display window width and level (in HU)."""
         if self.window_level != (window, level):
             self.window_level = (window, level)
             self._notify("window_level_changed", window, level)
@@ -401,9 +507,20 @@ class SliceViewerState:
     # =========================================================
     # Crosshair
     # =========================================================
+    def refresh_crosshair(self) -> None:
+        """Recompute crosshair physical coordinates from the current indices.
+
+        Call this after externally changing slice indices without triggering
+        an automatic crosshair update (e.g. after loading a new image).
+        """
+        self._update_crosshair_by_index()
+
     def _update_crosshair_by_index(self) -> None:
-        """Recompute crosshair physical coordinates from the current indices
-        and fire ``"crosshair_changed"`` if the position changed.
+        """Recompute crosshair positions from current indices and notify listeners.
+
+        For coronal/sagittal views the physical z coordinate is passed directly
+        as the y data value; the display_extent in the viewer already maps
+        physical z to the correct screen position without further adjustment.
         """
         x = self.index_to_physical("sagittal", self.indices["sagittal"])
         y = self.index_to_physical("coronal", self.indices["coronal"])
@@ -431,16 +548,27 @@ class SliceViewerState:
         axis: str,
         bbox: tuple[float, float, float, float] | None,
     ) -> None:
-        """Set the bounding box for *axis* in physical coordinates.
+        """Set or clear the bounding box for *axis*.
+
+        Only one bounding box can exist across all views at a time.
+        When a non-``None`` box is set for *axis*, any existing box on
+        another axis is cleared automatically.
 
         Args:
-            axis: View axis (currently only ``"axial"`` is rendered).
+            axis: View axis (``"axial"``, ``"coronal"``, or ``"sagittal"``).
             bbox: ``(x_min, y_min, width, height)`` in physical units, or
                 ``None`` to clear.
         """
-        if self.bounding_boxes.get(axis) != bbox:
-            self.bounding_boxes[axis] = bbox
-            self._notify("bounding_boxes_changed", axis, bbox)
+        if self.bounding_boxes.get(axis) == bbox:
+            return
+        # Clear boxes on all other axes when placing a new box.
+        if bbox is not None:
+            for other in AXES:
+                if other != axis and self.bounding_boxes.get(other) is not None:
+                    self.bounding_boxes[other] = None
+                    self._notify("bounding_boxes_changed", other, None)
+        self.bounding_boxes[axis] = bbox
+        self._notify("bounding_boxes_changed", axis, bbox)
 
     def set_bbox_visible(self, visible: bool) -> None:
         """Show or hide the bounding-box overlay."""
@@ -483,14 +611,10 @@ class SliceViewerState:
         return min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y0)
 
     # =========================================================
-    # ROI / contour management  (delegates to StructureSet + notifies)
+    # ROI / contour management (delegates to StructureSet + notifies)
     # =========================================================
     def set_active_contours(self, active_roi_numbers: Set[int]) -> None:
-        """Set which ROIs are displayed.
-
-        Args:
-            active_roi_numbers: Set of ROI numbers to render.
-        """
+        """Set which ROIs are displayed."""
         if self.active_contours != active_roi_numbers:
             self.active_contours = active_roi_numbers
             self._notify("active_contours_changed", active_roi_numbers)
@@ -508,13 +632,7 @@ class SliceViewerState:
             self._notify("overlay_contours_changed", enable)
 
     def add_contour(self, name: str, mask: sitk.Image, color: str) -> int:
-        """Add an ROI to the :class:`StructureSet` and return its ROI number.
-
-        Args:
-            name:  Structure name.
-            mask:  Binary ``sitk.Image`` mask.
-            color: Hex colour string.
-        """
+        """Add an ROI to the :class:`StructureSet` and return its ROI number."""
         roi_number = self.structure_set.add(name, mask, color)
         self._notify("all_contours_changed", self.structure_set)
         return roi_number
@@ -556,12 +674,10 @@ class SliceViewerState:
     # Utilities
     # =========================================================
     def create_image_from_numpy(self, array: np.ndarray) -> sitk.Image | None:
-        """Wrap a NumPy array in a ``sitk.Image`` that shares the primary
-        image's spatial metadata (origin, spacing, direction).
+        """Wrap a NumPy array in a ``sitk.Image`` sharing the primary image metadata.
 
         Returns:
-            A new ``sitk.Image``, or ``None`` if the primary image is not
-            loaded.
+            A new ``sitk.Image``, or ``None`` if the primary image is not loaded.
         """
         if self.primary_image is None:
             logger.error("Cannot create image: primary image not loaded.")

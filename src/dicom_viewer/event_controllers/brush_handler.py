@@ -31,8 +31,13 @@ class BrushEventHandler:
         self.brush_circle: Circle | None = None
         self._is_dragging: bool = False
         self._button: int | None = None  # 1 = paint, 3 = erase
+        self._active_axis: str | None = None  # axis on which the stroke was started
         self._last_pos_px: tuple[int, int] | None = None
         self._stroke_mask: np.ndarray | None = None
+        # Cursor circle is shown only after the first real mouse-move inside
+        # a view, to prevent a stale circle appearing at activation time.
+        self._cursor_ready: bool = False
+        self._cursor_last_axis: str = ""
 
     # ------------------------------------------------------------------
     # Activation
@@ -40,10 +45,14 @@ class BrushEventHandler:
     def activate(self) -> None:
         """Enable the brush tool."""
         self.is_active = True
+        self._cursor_ready = False
+        self._cursor_last_axis = ""
 
     def deactivate(self) -> None:
         """Disable the brush tool and remove the cursor circle."""
         self.is_active = False
+        self._cursor_ready = False
+        self._cursor_last_axis = ""
         self._remove_brush_cursor()
         self.viewer.canvas.draw_idle()
 
@@ -54,52 +63,75 @@ class BrushEventHandler:
         """Begin a paint or erase stroke on left / right button press."""
         roi_number = self.state.selected_roi_number
         if roi_number is None or roi_number not in self.state.structure_set:
-            return False
+            return
 
         self._is_dragging = True
         self._button = event.button
+        self._active_axis = self.state.current_axis
 
         mask_image = self.state.structure_set.get_mask(roi_number)
-        mask_slice = self.state.get_slice_data(mask_image, self.state.current_axis)
+        mask_slice = self.state.get_slice_data(mask_image, self._active_axis)
         self._stroke_mask = np.zeros_like(mask_slice, dtype=bool)
 
         self._last_pos_px = None
         self._paint_at(event)
-        return True
 
     def handle_motion(self, event) -> None:
         """Continue the stroke or update the brush cursor position."""
         if not self.is_active or not self.state.current_axis:
             if self.brush_circle:
                 self._remove_brush_cursor()
-            return False
+            return
 
-        self._update_brush_cursor(event)
+        # Reset cursor readiness when the pointer enters a different axis,
+        # or when xdata/ydata is not yet valid (spurious event at activation).
+        current = self.state.current_axis
+        if event.xdata is not None and event.ydata is not None:
+            if current != self._cursor_last_axis:
+                self._cursor_ready = False
+                self._cursor_last_axis = current
+            self._cursor_ready = True
+
+        if self._cursor_ready:
+            self._update_brush_cursor(event)
 
         if self._is_dragging:
             pos_px = self._physical_to_slice_pixel(
                 self.state.current_axis, (event.xdata, event.ydata)
             )
             if pos_px == self._last_pos_px:
-                return False
+                return
             self._paint_at(event, interpolate=True)
-            return True
 
     def handle_release(self, event) -> None:
-        """Commit the completed stroke to the ROI mask volume."""
+        """Commit the completed stroke to the ROI mask volume.
+
+        During the drag, _apply_stroke_to_mask() writes incremental preview
+        updates without hole-filling (fast path).  On release this method
+        performs the authoritative commit: it re-applies the accumulated
+        stroke mask against the current volume slice and optionally runs
+        binary_fill_holes, producing the final clean result.
+        """
         if not self._is_dragging:
-            return False
+            return
         self._is_dragging = False
+
+        axis = self._active_axis
+        self._active_axis = None
+
+        if not axis:
+            self._stroke_mask = None
+            return
 
         roi_number = self.state.selected_roi_number
         if roi_number is None or roi_number not in self.state.structure_set:
             self._stroke_mask = None
-            return True
+            return
 
         mask_image = self.state.structure_set.get_mask(roi_number)
         mask_volume = sitk.GetArrayFromImage(mask_image)
-        numpy_idx = self.state._axis_to_numpy_index(self.state.current_axis)
-        slice_idx = self.state.indices[self.state.current_axis]
+        numpy_idx = self.state._axis_to_numpy_index(axis)
+        slice_idx = self.state.indices[axis]
 
         slobj: list = [slice(None)] * 3
         slobj[numpy_idx] = slice_idx

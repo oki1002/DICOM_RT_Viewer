@@ -1,28 +1,34 @@
 """viewer.py — DicomViewer: Tkinter-embeddable MPR viewer widget.
 
 Architecture:
-    - Rendering uses :class:`DrawingManager` with ~60 FPS blit-based updates.
+    - Rendering uses DrawingManager with ~60 FPS blit-based updates.
     - State changes are received through the Observer callbacks on
-      :class:`SliceViewerState`; the viewer never mutates state directly.
-    - All input events are delegated to :class:`ViewerEventHandler`.
+      SliceViewerState; the viewer never mutates state directly.
+    - All input events are delegated to ViewerEventHandler.
     - Layout is a fixed 2x2 GridSpec: axial (large, left) + coronal and
       sagittal (right column, top/bottom).
 
 Slice navigation:
     - Drag a crosshair line.
     - Mouse wheel over any view.
-    - Up / Down / PageUp / PageDown keys (while cursor is inside a view).
+    - Up / Down / PageUp / PageDown keys.
 
 Window / level adjustment:
-    - Right-click drag: horizontal motion → window width (WW),
-      vertical motion → window centre (WL).
+    - Right-click drag: horizontal → window width (WW), vertical → window centre (WL).
+
+Secondary image & blend:
+    When a secondary image is loaded (e.g. a 4DCT phase or MAR-corrected
+    volume), it is displayed as a semi-transparent overlay controlled by a
+    blend slider embedded below the canvas.  The slider maps to
+    SliceViewerState.blend_alpha (1.0 = primary only, 0.0 = secondary only).
+    The slider is hidden when no secondary image is loaded.
 """
 
 import collections
 import logging
 import tkinter as tk
 from tkinter import ttk
-from typing import Any, Dict, Set, Tuple
+from typing import Any, Dict, Set
 
 import matplotlib.gridspec as gridspec
 import numpy as np
@@ -44,12 +50,7 @@ logger = logging.getLogger(__name__)
 # DrawingManager
 # ---------------------------------------------------------------------------
 class DrawingManager:
-    """Throttled redraw manager for blit-based rendering.
-
-    Incoming redraw requests are queued; a 16 ms timer (~60 FPS) fires
-    :meth:`process_queue`, which deduplicates requests per axis and issues a
-    single blit per axis per frame.
-    """
+    """Throttled redraw manager for blit-based rendering (~60 FPS)."""
 
     def __init__(self, viewer: "DicomViewer") -> None:
         self.viewer = viewer
@@ -59,12 +60,10 @@ class DrawingManager:
         self.timer.start()
 
     def add_request(self, axis: str) -> None:
-        """Queue a redraw request for *axis*."""
         if axis and axis in self.viewer.axs:
             self.request_queue.append(axis)
 
     def process_queue(self) -> None:
-        """Flush the queue, drawing each axis at most once per frame."""
         if not self.request_queue:
             return
         axes_to_redraw = set(self.request_queue)
@@ -79,9 +78,9 @@ class DrawingManager:
 class DicomViewer(ttk.Frame):
     """Three-plane MPR viewer widget for Tkinter.
 
-    The widget embeds a Matplotlib figure (axial large left, coronal and
-    sagittal stacked right) into a ``ttk.Frame`` and synchronises with a
-    :class:`SliceViewerState` instance via the Observer pattern.
+    Embeds a Matplotlib figure (axial large-left, coronal/sagittal stacked-right)
+    into a ttk.Frame and synchronises with SliceViewerState via the Observer pattern.
+    A blend slider is shown automatically when a secondary image is loaded.
 
     Example::
 
@@ -117,10 +116,24 @@ class DicomViewer(ttk.Frame):
         self.toolbar.update()
         self.toolbar.pack(side=tk.BOTTOM, fill=tk.X)
 
+        # --- Blend slider (hidden until secondary image is loaded) ---
+        self._blend_frame = ttk.Frame(self)
+        ttk.Label(self._blend_frame, text="Blend Alpha").pack(side=tk.LEFT, padx=5)
+        self.blend_slider = ttk.Scale(
+            self._blend_frame,
+            from_=1.0,
+            to=0.0,
+            orient=tk.HORIZONTAL,
+            command=self._on_blend_slider_change,
+        )
+        self.blend_slider.set(self.state.blend_alpha)
+        self.blend_slider.pack(side=tk.LEFT, padx=5)
+        self._blend_frame.pack_forget()  # hidden by default
+
         # DrawingManager must be created after the Figure exists
         self.drawing_manager = DrawingManager(self)
 
-        # --- Layout: axial (left, spans 2 rows) / coronal (top-right) / sagittal (bottom-right) ---
+        # --- Layout ---
         gs = gridspec.GridSpec(2, 2, figure=self.fig, width_ratios=[2, 1])
         self.axs: Dict[str, Any] = {
             "axial": self.fig.add_subplot(gs[:, 0]),
@@ -136,11 +149,11 @@ class DicomViewer(ttk.Frame):
         self._last_axis_limits: Dict[str, Any] = {}
         self._backgrounds: Dict[str, Any] = {axis: None for axis in AXES}
         self.img_displays: Dict[str, Any] = {axis: None for axis in AXES}
+        self.secondary_img_displays: Dict[str, Any] = {axis: None for axis in AXES}
         self.crosshairs: Dict[str, Dict[str, Any]] = {
             axis: {"h": None, "v": None} for axis in AXES
         }
         self.bbox_patches: Dict[str, Any] = {axis: None for axis in AXES}
-        # contour_patches[axis][roi_number] -> PathPatch
         self.contour_patches: Dict[str, Dict[int, Any]] = {axis: {} for axis in AXES}
 
         # --- Event handling ---
@@ -154,7 +167,6 @@ class DicomViewer(ttk.Frame):
     # Event binding
     # ------------------------------------------------------------------
     def _bind_events(self) -> None:
-        """Connect matplotlib canvas events and State listeners."""
         eh = self.event_handler
         self.canvas.mpl_connect("axes_enter_event", eh.on_enter_axes)
         self.canvas.mpl_connect("axes_leave_event", eh.on_leave_axes)
@@ -169,6 +181,11 @@ class DicomViewer(ttk.Frame):
         s.add_listener(
             "primary_image_data_changed", self._on_primary_image_data_changed
         )
+        s.add_listener(
+            "secondary_image_data_changed", self._on_secondary_image_data_changed
+        )
+        s.add_listener("blend_alpha_changed", self._on_blend_alpha_changed)
+        s.add_listener("secondary_image_cmap_changed", self._on_secondary_cmap_changed)
         s.add_listener("index_changed", self._on_index_changed)
         s.add_listener("window_level_changed", self._on_window_level_changed)
         s.add_listener("crosshair_changed", self._on_crosshair_changed)
@@ -179,15 +196,9 @@ class DicomViewer(ttk.Frame):
         s.add_listener("overlay_contours_changed", self._on_overlay_contours_changed)
 
     # ------------------------------------------------------------------
-    # Background cache (blit acceleration)
+    # Background cache
     # ------------------------------------------------------------------
     def _cache_backgrounds(self) -> None:
-        """Capture the static background of every subplot for blit rendering.
-
-        Dynamic artists (crosshairs, bounding box) are hidden before the
-        capture and restored immediately after, so they are drawn on top
-        during each blit without being baked into the background.
-        """
         artists_to_hide = []
         for axis in AXES:
             for line in self.crosshairs[axis].values():
@@ -195,6 +206,10 @@ class DicomViewer(ttk.Frame):
                     artists_to_hide.append(line)
             if self.bbox_patches.get(axis):
                 artists_to_hide.append(self.bbox_patches[axis])
+            # Contour patches are drawn in the blit layer, so they must be hidden
+            # during background caching to prevent them from being baked into the bitmap.
+            for patch in self.contour_patches.get(axis, {}).values():
+                artists_to_hide.append(patch)
 
         original_vis = {a: a.get_visible() for a in artists_to_hide}
         for a in artists_to_hide:
@@ -211,15 +226,11 @@ class DicomViewer(ttk.Frame):
             self.drawing_manager.add_request(axis)
 
     def _on_draw(self, event) -> None:
-        """Detect zoom/pan axis-limit changes and refresh the background cache."""
         for axis, ax in self.axs.items():
-            cur_xlim, cur_ylim = ax.get_xlim(), ax.get_ylim()
-            last = self._last_axis_limits.get(axis, ((None, None), (None, None)))
-            if (cur_xlim, cur_ylim) != last:
-                logger.debug(
-                    "Axis limits changed for '%s'; recaching background.", axis
-                )
-                self._last_axis_limits[axis] = (cur_xlim, cur_ylim)
+            cur = (ax.get_xlim(), ax.get_ylim())
+            if cur != self._last_axis_limits.get(axis, ((None, None), (None, None))):
+                logger.debug("Axis limits changed for '%s'; recaching.", axis)
+                self._last_axis_limits[axis] = cur
                 self._cache_backgrounds()
                 break
 
@@ -227,7 +238,6 @@ class DicomViewer(ttk.Frame):
     # Blit redraw
     # ------------------------------------------------------------------
     def _redraw_axis_blit(self, axis: str) -> None:
-        """Restore the cached background for *axis* and blit all dynamic artists."""
         if self._backgrounds.get(axis) is None:
             return
 
@@ -236,6 +246,11 @@ class DicomViewer(ttk.Frame):
         artists: list = []
         if self.img_displays.get(axis):
             artists.append(self.img_displays[axis])
+        if (
+            self.secondary_img_displays.get(axis)
+            and self.secondary_img_displays[axis].get_visible()
+        ):
+            artists.append(self.secondary_img_displays[axis])
         artists.extend(self.contour_patches[axis].values())
         if self.bbox_patches.get(axis) and self.bbox_patches[axis].get_visible():
             artists.append(self.bbox_patches[axis])
@@ -243,7 +258,6 @@ class DicomViewer(ttk.Frame):
             if line and line.get_visible():
                 artists.append(line)
 
-        # Brush cursor (if active in this view)
         brush_circle = getattr(self.event_handler.brush_handler, "brush_circle", None)
         if brush_circle and brush_circle.axes == self.axs[axis]:
             artists.append(brush_circle)
@@ -256,20 +270,39 @@ class DicomViewer(ttk.Frame):
     # Slice display
     # ------------------------------------------------------------------
     def _update_slice_display(self, axis: str) -> None:
-        """Refresh the image data for *axis* at the current slice index."""
-        slice_data = self.state.get_slice_data(self.state.primary_image, axis)
-        if slice_data.size == 0:
+        primary_data = self.state.get_slice_data(self.state.primary_image, axis)
+        secondary_data = self.state.get_slice_data(self.state.secondary_image, axis)
+
+        if primary_data.size == 0:
             if self.img_displays[axis]:
                 self.img_displays[axis].set_data(np.array([[]]))
+            if self.secondary_img_displays[axis]:
+                self.secondary_img_displays[axis].set_visible(False)
             return
 
         window, level = self.state.window_level
         extent = self.state.get_extent(axis)
         clim = (level - window / 2, level + window / 2)
 
+        # coronal/sagittal: increasing row index = increasing z (inferior → superior).
+        # With origin="lower", large-z (superior) naturally appears at the top.
+        # Pass extent as-is and set ylim so that small-z (inferior) is at the bottom.
+        #
+        # axial: x-y plane. With origin="lower", large-y (anterior) would be at the top,
+        # which matches the radiological convention — but we invert ylim explicitly to
+        # make the intent clear and guard against future extent changes.
+        if axis in ("coronal", "sagittal"):
+            y_bottom, y_top = (
+                extent[2],
+                extent[3],
+            )  # inferior at bottom, superior at top
+        else:  # axial: invert y so anterior (large-y) is at top
+            y_bottom, y_top = extent[3], extent[2]
+
+        # Primary image
         if self.img_displays[axis] is None:
             self.img_displays[axis] = self.axs[axis].imshow(
-                slice_data,
+                primary_data,
                 cmap="gray",
                 origin="lower",
                 vmin=clim[0],
@@ -278,16 +311,40 @@ class DicomViewer(ttk.Frame):
                 interpolation="bilinear",
             )
             self.axs[axis].set_xlim(extent[0], extent[1])
-            # Axial view: invert y so that superior is up
-            if axis == "axial":
-                self.axs[axis].set_ylim(extent[3], extent[2])
-            else:
-                self.axs[axis].set_ylim(extent[2], extent[3])
+            self.axs[axis].set_ylim(y_bottom, y_top)
             self.axs[axis].set_aspect("equal", adjustable="box")
         else:
-            self.img_displays[axis].set_data(slice_data)
+            self.img_displays[axis].set_data(primary_data)
             self.img_displays[axis].set_extent(extent)
             self.img_displays[axis].set_clim(clim)
+
+        # Secondary image overlay
+        if secondary_data.size > 0:
+            if self.secondary_img_displays[axis] is None:
+                self.secondary_img_displays[axis] = self.axs[axis].imshow(
+                    secondary_data,
+                    cmap=self.state.secondary_image_cmap,
+                    origin="lower",
+                    vmin=clim[0],
+                    vmax=clim[1],
+                    extent=extent,
+                    interpolation="bilinear",
+                    alpha=1.0 - self.state.blend_alpha,
+                )
+            else:
+                self.secondary_img_displays[axis].set_data(secondary_data)
+                self.secondary_img_displays[axis].set_extent(extent)
+                self.secondary_img_displays[axis].set_clim(clim)
+                self.secondary_img_displays[axis].set_alpha(
+                    1.0 - self.state.blend_alpha
+                )
+                self.secondary_img_displays[axis].set_cmap(
+                    self.state.secondary_image_cmap
+                )
+            self.secondary_img_displays[axis].set_visible(True)
+        else:
+            if self.secondary_img_displays[axis]:
+                self.secondary_img_displays[axis].set_visible(False)
 
         self.drawing_manager.add_request(axis)
 
@@ -295,9 +352,8 @@ class DicomViewer(ttk.Frame):
     # Crosshair display
     # ------------------------------------------------------------------
     def _update_crosshairs_display(
-        self, axis: str, pos: Tuple[float, float] | None
+        self, axis: str, pos: tuple[float, float] | None
     ) -> None:
-        """Update or hide the crosshair lines for *axis*."""
         ax = self.axs[axis]
         for line in self.crosshairs[axis].values():
             if line:
@@ -326,20 +382,17 @@ class DicomViewer(ttk.Frame):
     # Contour rendering
     # ------------------------------------------------------------------
     def _draw_axis_contours(self, axis: str) -> None:
-        """Render all active ROI contours as ``PathPatch`` objects for *axis*.
-
-        Existing patches are updated in-place where possible; stale patches
-        (ROIs no longer in :attr:`active_contours`) are removed.
-        """
         ax = self.axs[axis]
         existing = self.contour_patches[axis]
-        used_numbers: Set[int] = set()
+        used: Set[int] = set()
 
         for roi_number in self.state.active_contours:
             mask_sitk = self.state.structure_set.get_mask(roi_number)
             if mask_sitk is None:
                 continue
             mask_slice = self.state.get_slice_data(mask_sitk, axis)
+            if mask_slice.shape[0] < 2 or mask_slice.shape[1] < 2:
+                continue
             extent = self.state.get_extent(axis)
             color = self.state.structure_set.get_color(roi_number) or "white"
 
@@ -376,30 +429,28 @@ class DicomViewer(ttk.Frame):
                 patch = PathPatch(combined, edgecolor=color, facecolor=face, lw=1.0)
                 ax.add_patch(patch)
                 existing[roi_number] = patch
-            used_numbers.add(roi_number)
+            used.add(roi_number)
 
-        # Remove patches for ROIs that are no longer active
-        for num in set(existing.keys()) - used_numbers:
+        for num in set(existing.keys()) - used:
             existing.pop(num).remove()
         self.contour_patches[axis] = existing
 
     def _update_all_contours(self) -> None:
-        """Redraw contours for all three views."""
         for axis in AXES:
             self._draw_axis_contours(axis)
-        self.canvas.draw_idle()
+        self._cache_backgrounds()
 
     # ------------------------------------------------------------------
     # Artist reset
     # ------------------------------------------------------------------
     def _reset_artists(self) -> None:
-        """Clear all axes and reset every artist reference to its initial state."""
         for axis, ax in self.axs.items():
             ax.clear()
             ax.set_facecolor("black")
             ax.tick_params(colors="white")
             ax.set_axis_off()
         self.img_displays = {axis: None for axis in AXES}
+        self.secondary_img_displays = {axis: None for axis in AXES}
         self.crosshairs = {axis: {"h": None, "v": None} for axis in AXES}
         self.bbox_patches = {axis: None for axis in AXES}
         self.contour_patches: Dict[str, Dict[int, Any]] = {axis: {} for axis in AXES}
@@ -414,10 +465,37 @@ class DicomViewer(ttk.Frame):
             for axis in AXES:
                 self._update_slice_display(axis)
             self._update_all_contours()
-            self.state._update_crosshair_by_index()
+            self.state.refresh_crosshair()
             self._cache_backgrounds()
         else:
             self.canvas.draw()
+
+    def _on_secondary_image_data_changed(self, image: sitk.Image | None) -> None:
+        """Show blend slider when secondary image is present; hide otherwise."""
+        if image is not None:
+            self._blend_frame.pack(side=tk.BOTTOM, pady=5)
+        else:
+            self._blend_frame.pack_forget()
+        for axis in AXES:
+            self._update_slice_display(axis)
+        self._cache_backgrounds()
+
+    def _on_blend_alpha_changed(self, alpha: float) -> None:
+        self.blend_slider.set(alpha)
+        for axis in AXES:
+            if (
+                self.secondary_img_displays.get(axis)
+                and self.secondary_img_displays[axis].get_visible()
+            ):
+                self.secondary_img_displays[axis].set_alpha(1.0 - alpha)
+            self.drawing_manager.add_request(axis)
+
+    def _on_secondary_cmap_changed(self, cmap_name: str) -> None:
+        for axis in AXES:
+            if self.secondary_img_displays[axis]:
+                self.secondary_img_displays[axis].set_cmap(cmap_name)
+            self._update_slice_display(axis)
+        self._cache_backgrounds()
 
     def _on_index_changed(self, axis: str, new_idx: int) -> None:
         self._update_slice_display(axis)
@@ -429,12 +507,13 @@ class DicomViewer(ttk.Frame):
         for axis in AXES:
             if self.img_displays.get(axis):
                 self.img_displays[axis].set_clim(clim)
+            if self.secondary_img_displays.get(axis):
+                self.secondary_img_displays[axis].set_clim(clim)
         self._cache_backgrounds()
 
     def _on_crosshair_changed(self) -> None:
         for axis in AXES:
-            pos = self.state.crosshair_pos.get(axis)
-            self._update_crosshairs_display(axis, pos)
+            self._update_crosshairs_display(axis, self.state.crosshair_pos.get(axis))
             self.drawing_manager.add_request(axis)
 
     def _on_crosshair_visible_changed(self, visible: bool) -> None:
@@ -443,6 +522,8 @@ class DicomViewer(ttk.Frame):
         self._cache_backgrounds()
 
     def _on_bounding_boxes_changed(self, axis: str, bbox: tuple | None) -> None:
+        if axis not in self.axs:
+            return
         ax = self.axs[axis]
         patch = self.bbox_patches[axis]
         if patch is None:
@@ -480,63 +561,42 @@ class DicomViewer(ttk.Frame):
     def _on_overlay_contours_changed(self, enable: bool) -> None:
         self._update_all_contours()
 
+    def _on_blend_slider_change(self, value: str) -> None:
+        self.state.set_blend_alpha(float(value))
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def load_ct(self, ct_dir: Any, window: tuple[int, int] | None = None) -> None:
-        """Load a DICOM CT series from *ct_dir* and display it.
+    def destroy(self) -> None:
+        """Stop the render timer before destroying the widget."""
+        self.drawing_manager.timer.stop()
+        super().destroy()
 
-        Args:
-            ct_dir: Path to the DICOM folder (``str`` or ``pathlib.Path``).
-            window: Optional ``(window_width, window_level)`` in HU to apply
-                after loading.  The existing window setting is preserved when
-                ``None``.
-        """
+    def load_ct(self, ct_dir: Any, window: tuple[int, int] | None = None) -> None:
+        """Load a DICOM CT series from *ct_dir* and display it."""
         from .io import load_ct_sitk
 
-        sitk_image = load_ct_sitk(ct_dir)
-        self.state.set_primary_image_data(sitk_image, image_dir=ct_dir)
+        image = load_ct_sitk(ct_dir)
+        self.state.set_primary_image_data(image, image_dir=ct_dir)
         if window is not None:
             self.state.set_window_level(window[0], window[1])
 
     def set_window(self, vmin: float, vmax: float) -> None:
-        """Set the display window using vmin / vmax values (HU).
-
-        This is a convenience wrapper around
-        :meth:`SliceViewerState.set_window_level` provided for backward
-        compatibility.
-
-        Args:
-            vmin: Lower HU boundary (= level - window/2).
-            vmax: Upper HU boundary (= level + window/2).
-        """
-        window = int(vmax - vmin)
-        level = int((vmax + vmin) / 2)
-        self.state.set_window_level(window, level)
+        """Set the display window using vmin / vmax HU values."""
+        self.state.set_window_level(int(vmax - vmin), int((vmax + vmin) / 2))
 
     def get_slice(self, view: str) -> np.ndarray:
-        """Return the current 2-D slice for *view* as a NumPy array.
-
-        Args:
-            view: One of ``"axial"``, ``"coronal"``, ``"sagittal"``.
-
-        Raises:
-            RuntimeError: If no image is loaded.
-        """
+        """Return the current 2-D slice for *view* as a NumPy array."""
         if self.state.primary_image is None:
             raise RuntimeError("No image loaded.")
         return self.state.get_slice_data(self.state.primary_image, view)
 
     @property
     def axis_vars(self) -> Dict[str, Any]:
-        """Backward-compatible proxy exposing ``axis_vars["z"].get()`` /
-        ``.set()`` semantics used by the original ``mvct_plotter``."""
         return _IndexVarProxy(self.state)
 
     @property
     def metadata(self) -> Dict[str, Any]:
-        """Backward-compatible dict containing ``spacing``, ``origin``,
-        ``size`` from the loaded image, or ``{"spacing": None}`` if empty."""
         img = self.state.primary_image
         if img is None:
             return {"spacing": None}
@@ -551,21 +611,19 @@ class DicomViewer(ttk.Frame):
 # Backward-compatibility helpers
 # ---------------------------------------------------------------------------
 class _IndexVarProxy:
-    """Adapter that maps ``axis_vars["x" | "y" | "z"]`` to
-    :class:`_SingleVar` objects compatible with the legacy interface."""
-
     def __init__(self, state: SliceViewerState) -> None:
         self._state = state
 
     def __getitem__(self, axis_char: str) -> "_SingleVar":
-        _map = {"x": "sagittal", "y": "coronal", "z": "axial"}
-        return _SingleVar(self._state, _map[axis_char])
+        mapping = {"x": "sagittal", "y": "coronal", "z": "axial"}
+        if axis_char not in mapping:
+            raise KeyError(
+                f"Unknown axis character '{axis_char}'. Expected one of: {list(mapping)}"
+            )
+        return _SingleVar(self._state, mapping[axis_char])
 
 
 class _SingleVar:
-    """Minimal ``.get()`` / ``.set()`` interface matching the removed
-    Tkinter ``IntVar`` used in the original slice slider code."""
-
     def __init__(self, state: SliceViewerState, axis: str) -> None:
         self._state = state
         self._axis = axis
