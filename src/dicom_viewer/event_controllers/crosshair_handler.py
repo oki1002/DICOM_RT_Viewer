@@ -29,8 +29,9 @@ class CrosshairEventHandler:
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
+    @property
     def is_dragging(self) -> bool:
-        """Return ``True`` while a crosshair drag is in progress."""
+        """``True`` while a crosshair drag is in progress."""
         return self._is_dragging
 
     def handle_press(self, event) -> bool:

@@ -41,10 +41,6 @@ class BboxEventHandler:
         """``True`` while a bounding-box interaction is in progress."""
         return self._is_dragging
 
-    @is_dragging.setter
-    def is_dragging(self, value: bool) -> None:
-        self._is_dragging = value
-
     # ------------------------------------------------------------------
     # Event handlers
     # ------------------------------------------------------------------

@@ -26,7 +26,7 @@ import logging
 import pathlib
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Set
+from typing import Any, Callable
 
 import numpy as np
 import SimpleITK as sitk
@@ -57,7 +57,7 @@ class StructureSet:
 
     def __init__(self) -> None:
         # { roi_number: {"name": str, "mask": sitk.Image, "color": "#RRGGBB"} }
-        self._data: Dict[int, Dict[str, Any]] = {}
+        self._data: dict[int, dict[str, Any]] = {}
         self._next_number: int = 1
 
     # ------------------------------------------------------------------
@@ -83,7 +83,7 @@ class StructureSet:
         """Remove the ROI identified by *roi_number*. No-op if not found."""
         self._data.pop(roi_number, None)
 
-    def update(self, roi_number: int, props: Dict[str, Any]) -> None:
+    def update(self, roi_number: int, props: dict[str, Any]) -> None:
         """Update properties (``name``, ``mask``, ``color``) for *roi_number*."""
         if roi_number in self._data:
             self._data[roi_number].update(props)
@@ -107,7 +107,7 @@ class StructureSet:
         """Return a list of all ROI numbers in insertion order."""
         return list(self._data.keys())
 
-    def get_all(self) -> Dict[int, Dict[str, Any]]:
+    def get_all(self) -> dict[int, dict[str, Any]]:
         """Return a shallow copy of the internal data dict."""
         return dict(self._data)
 
@@ -163,17 +163,17 @@ class SliceViewerState:
     secondary_image_cmap: str = "gray"
 
     # --- 4DCT phases ---
-    all_phases_data: Dict[str, Any] = field(default_factory=dict, repr=False)
+    all_phases_data: dict[str, Any] = field(default_factory=dict, repr=False)
     current_phase: str | None = None
 
     # --- Slice state ---
     current_axis: str = ""
     window_level: tuple[int, int] = (300, 25)  # (window_width, window_level)
-    indices: Dict[str, int] = field(default_factory=lambda: {axis: 0 for axis in AXES})
+    indices: dict[str, int] = field(default_factory=lambda: {axis: 0 for axis in AXES})
 
     # --- ROI ---
     structure_set: StructureSet = field(default_factory=StructureSet)
-    active_contours: Set[int] = field(default_factory=set)  # set of ROI numbers
+    active_contours: set[int] = field(default_factory=set)  # set of ROI numbers
     overlay_contours: bool = True
     selected_roi_number: int | None = None
 
@@ -184,18 +184,18 @@ class SliceViewerState:
 
     # --- Crosshair ---
     crosshair_visible: bool = False
-    crosshair_pos: Dict[str, tuple[float, float] | None] = field(
+    crosshair_pos: dict[str, tuple[float, float] | None] = field(
         default_factory=lambda: {axis: None for axis in AXES}
     )
 
     # --- Bounding box (physical coords: x_min, y_min, width, height) ---
     bbox_visible: bool = False
-    bounding_boxes: Dict[str, tuple[float, float, float, float] | None] = field(
+    bounding_boxes: dict[str, tuple[float, float, float, float] | None] = field(
         default_factory=lambda: {axis: None for axis in AXES}
     )
 
     # --- Observer ---
-    _listeners: Dict[str, Set[Callable]] = field(
+    _listeners: dict[str, set[Callable]] = field(
         default_factory=lambda: defaultdict(set),
         compare=False,
         repr=False,
@@ -218,7 +218,7 @@ class SliceViewerState:
             try:
                 listener(*args, **kwargs)
             except Exception as exc:
-                logger.error("Listener error for '%s': %s", event_type, exc)
+                logger.error(f"Listener error for '{event_type}': {exc}")
 
     # =========================================================
     # Axis index helpers
@@ -259,10 +259,11 @@ class SliceViewerState:
         """Convert a physical LPS coordinate along *axis* to the nearest index."""
         if self.primary_image is None:
             return 0
-        x = self.index_to_physical("sagittal", self.indices["sagittal"])
-        y = self.index_to_physical("coronal", self.indices["coronal"])
-        z = self.index_to_physical("axial", self.indices["axial"])
-        phys = [x, y, z]
+        phys = [
+            self.index_to_physical("sagittal", self.indices["sagittal"]),
+            self.index_to_physical("coronal", self.indices["coronal"]),
+            self.index_to_physical("axial", self.indices["axial"]),
+        ]
         phys[self._axis_to_xyz_index(axis)] = coord
         idx_point = self.primary_image.TransformPhysicalPointToIndex(phys)
         numpy_idx = self._axis_to_numpy_index(axis)
@@ -448,7 +449,7 @@ class SliceViewerState:
     # =========================================================
     # 4DCT phases
     # =========================================================
-    def set_all_phases(self, phases_data: Dict[str, Any]) -> None:
+    def set_all_phases(self, phases_data: dict[str, Any]) -> None:
         """Store all 4DCT phase images, resampled to the primary image grid.
 
         Each entry in *phases_data* must be a dict containing at minimum:
@@ -487,7 +488,7 @@ class SliceViewerState:
             phase_name: Key in :attr:`all_phases_data` to activate.
         """
         if phase_name not in self.all_phases_data:
-            logger.warning("Phase '%s' not found in loaded phases.", phase_name)
+            logger.warning(f"Phase '{phase_name}' not found in loaded phases.")
             return
 
         self.current_phase = phase_name
@@ -613,7 +614,7 @@ class SliceViewerState:
     # =========================================================
     # ROI / contour management (delegates to StructureSet + notifies)
     # =========================================================
-    def set_active_contours(self, active_roi_numbers: Set[int]) -> None:
+    def set_active_contours(self, active_roi_numbers: set[int]) -> None:
         """Set which ROIs are displayed."""
         if self.active_contours != active_roi_numbers:
             self.active_contours = active_roi_numbers
@@ -644,7 +645,7 @@ class SliceViewerState:
         self._notify("all_contours_changed", self.structure_set)
         self._notify("active_contours_changed", self.active_contours)
 
-    def update_contour_properties(self, roi_number: int, props: Dict[str, Any]) -> None:
+    def update_contour_properties(self, roi_number: int, props: dict[str, Any]) -> None:
         """Update properties (``name``, ``mask``, ``color``) for *roi_number*."""
         self.structure_set.update(roi_number, props)
         self._notify("all_contours_changed", self.structure_set)

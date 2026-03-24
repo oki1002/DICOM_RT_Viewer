@@ -20,6 +20,7 @@ A SimpleITK-based DICOM MPR viewer widget for Tkinter.
 - matplotlib ≥ 3.7
 - numpy ≥ 1.24
 - pydicom ≥ 2.4
+- rt-utils>=1.2
 - scikit-image ≥ 0.21
 - scipy ≥ 1.11
 
@@ -54,10 +55,11 @@ root.mainloop()
 ## Loading a DICOM series
 
 ```python
-from dicom_viewer.io import load_ct_sitk, validate_dicom_files
+from dicom_viewer.io import load_dcm_series, validate_dicom_files
 
 if validate_dicom_files("/path/to/dicom"):
-    image = load_ct_sitk("/path/to/dicom")
+    info = load_dcm_series("/path/to/dicom")
+    image = info["sitk_image"]
     print(image.GetSize())      # e.g. (512, 512, 120)
     print(image.GetSpacing())   # e.g. (0.977, 0.977, 3.0)
 ```

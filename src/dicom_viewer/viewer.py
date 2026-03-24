@@ -28,7 +28,7 @@ import collections
 import logging
 import tkinter as tk
 from tkinter import ttk
-from typing import Any, Dict, Set
+from typing import Any
 
 import matplotlib.gridspec as gridspec
 import numpy as np
@@ -135,7 +135,7 @@ class DicomViewer(ttk.Frame):
 
         # --- Layout ---
         gs = gridspec.GridSpec(2, 2, figure=self.fig, width_ratios=[2, 1])
-        self.axs: Dict[str, Any] = {
+        self.axs: dict[str, Any] = {
             "axial": self.fig.add_subplot(gs[:, 0]),
             "coronal": self.fig.add_subplot(gs[0, 1]),
             "sagittal": self.fig.add_subplot(gs[1, 1]),
@@ -146,15 +146,15 @@ class DicomViewer(ttk.Frame):
             ax.set_axis_off()
 
         # --- Artist containers ---
-        self._last_axis_limits: Dict[str, Any] = {}
-        self._backgrounds: Dict[str, Any] = {axis: None for axis in AXES}
-        self.img_displays: Dict[str, Any] = {axis: None for axis in AXES}
-        self.secondary_img_displays: Dict[str, Any] = {axis: None for axis in AXES}
-        self.crosshairs: Dict[str, Dict[str, Any]] = {
+        self._last_axis_limits: dict[str, Any] = {}
+        self._backgrounds: dict[str, Any] = {axis: None for axis in AXES}
+        self.img_displays: dict[str, Any] = {axis: None for axis in AXES}
+        self.secondary_img_displays: dict[str, Any] = {axis: None for axis in AXES}
+        self.crosshairs: dict[str, dict[str, Any]] = {
             axis: {"h": None, "v": None} for axis in AXES
         }
-        self.bbox_patches: Dict[str, Any] = {axis: None for axis in AXES}
-        self.contour_patches: Dict[str, Dict[int, Any]] = {axis: {} for axis in AXES}
+        self.bbox_patches: dict[str, Any] = {axis: None for axis in AXES}
+        self.contour_patches: dict[str, dict[int, Any]] = {axis: {} for axis in AXES}
 
         # --- Event handling ---
         self.event_handler = ViewerEventHandler(self.state, self)
@@ -229,7 +229,7 @@ class DicomViewer(ttk.Frame):
         for axis, ax in self.axs.items():
             cur = (ax.get_xlim(), ax.get_ylim())
             if cur != self._last_axis_limits.get(axis, ((None, None), (None, None))):
-                logger.debug("Axis limits changed for '%s'; recaching.", axis)
+                logger.debug(f"Axis limits changed for '{axis}'; recaching.")
                 self._last_axis_limits[axis] = cur
                 self._cache_backgrounds()
                 break
@@ -319,8 +319,22 @@ class DicomViewer(ttk.Frame):
             self.img_displays[axis].set_clim(clim)
 
         # Secondary image overlay
+        self._update_secondary_display(axis, secondary_data, clim, extent)
+
+        self.drawing_manager.add_request(axis)
+
+    def _update_secondary_display(
+        self,
+        axis: str,
+        secondary_data: np.ndarray,
+        clim: tuple[float, float],
+        extent: list[float],
+    ) -> None:
+        """Create or update the secondary image overlay artist for *axis*."""
+        alpha = 1.0 - self.state.blend_alpha
         if secondary_data.size > 0:
-            if self.secondary_img_displays[axis] is None:
+            disp = self.secondary_img_displays[axis]
+            if disp is None:
                 self.secondary_img_displays[axis] = self.axs[axis].imshow(
                     secondary_data,
                     cmap=self.state.secondary_image_cmap,
@@ -329,24 +343,17 @@ class DicomViewer(ttk.Frame):
                     vmax=clim[1],
                     extent=extent,
                     interpolation="bilinear",
-                    alpha=1.0 - self.state.blend_alpha,
+                    alpha=alpha,
                 )
             else:
-                self.secondary_img_displays[axis].set_data(secondary_data)
-                self.secondary_img_displays[axis].set_extent(extent)
-                self.secondary_img_displays[axis].set_clim(clim)
-                self.secondary_img_displays[axis].set_alpha(
-                    1.0 - self.state.blend_alpha
-                )
-                self.secondary_img_displays[axis].set_cmap(
-                    self.state.secondary_image_cmap
-                )
+                disp.set_data(secondary_data)
+                disp.set_extent(extent)
+                disp.set_clim(clim)
+                disp.set_alpha(alpha)
+                disp.set_cmap(self.state.secondary_image_cmap)
             self.secondary_img_displays[axis].set_visible(True)
-        else:
-            if self.secondary_img_displays[axis]:
-                self.secondary_img_displays[axis].set_visible(False)
-
-        self.drawing_manager.add_request(axis)
+        elif self.secondary_img_displays[axis]:
+            self.secondary_img_displays[axis].set_visible(False)
 
     # ------------------------------------------------------------------
     # Crosshair display
@@ -398,7 +405,7 @@ class DicomViewer(ttk.Frame):
         """
         ax = self.axs[axis]
         existing = self.contour_patches[axis]
-        used: Set[int] = set()
+        used: set[int] = set()
         effective_override = override_mask or {}
 
         for roi_number in self.state.active_contours:
@@ -471,7 +478,7 @@ class DicomViewer(ttk.Frame):
         self.secondary_img_displays = {axis: None for axis in AXES}
         self.crosshairs = {axis: {"h": None, "v": None} for axis in AXES}
         self.bbox_patches = {axis: None for axis in AXES}
-        self.contour_patches: Dict[str, Dict[int, Any]] = {axis: {} for axis in AXES}
+        self.contour_patches: dict[str, dict[int, Any]] = {axis: {} for axis in AXES}
         self._backgrounds = {axis: None for axis in AXES}
 
     # ------------------------------------------------------------------
@@ -501,11 +508,9 @@ class DicomViewer(ttk.Frame):
     def _on_blend_alpha_changed(self, alpha: float) -> None:
         self.blend_slider.set(alpha)
         for axis in AXES:
-            if (
-                self.secondary_img_displays.get(axis)
-                and self.secondary_img_displays[axis].get_visible()
-            ):
-                self.secondary_img_displays[axis].set_alpha(1.0 - alpha)
+            disp = self.secondary_img_displays.get(axis)
+            if disp and disp.get_visible():
+                disp.set_alpha(1.0 - alpha)
             self.drawing_manager.add_request(axis)
 
     def _on_secondary_cmap_changed(self, cmap_name: str) -> None:
@@ -573,7 +578,7 @@ class DicomViewer(ttk.Frame):
     def _on_all_contours_changed(self, structure_set) -> None:
         self._update_all_contours()
 
-    def _on_active_contours_changed(self, active_roi_numbers: Set[int]) -> None:
+    def _on_active_contours_changed(self, active_roi_numbers: set[int]) -> None:
         self._update_all_contours()
 
     def _on_overlay_contours_changed(self, enable: bool) -> None:
@@ -591,13 +596,21 @@ class DicomViewer(ttk.Frame):
         super().destroy()
 
     def load_ct(self, ct_dir: Any, window: tuple[int, int] | None = None) -> None:
-        """Load a DICOM CT series from *ct_dir* and display it."""
-        from .io import load_ct_sitk
+        """Load a DICOM CT series from *ct_dir* and display it.
 
-        image = load_ct_sitk(ct_dir)
-        self.state.set_primary_image_data(image, image_dir=ct_dir)
-        if window is not None:
-            self.state.set_window_level(window[0], window[1])
+        Window / level is taken from the DICOM metadata via
+        :func:`~dicom_viewer.io.load_dcm_series`.  Pass *window* to override.
+
+        Args:
+            ct_dir: Path to the DICOM folder.
+            window: Optional ``(window_width, window_level)`` override.
+        """
+        from .io import load_dcm_series
+
+        info = load_dcm_series(ct_dir)
+        self.state.set_primary_image_data(info["sitk_image"], image_dir=ct_dir)
+        ww, wl = window if window is not None else info["window_level"]
+        self.state.set_window_level(int(ww), int(wl))
 
     def set_window(self, vmin: float, vmax: float) -> None:
         """Set the display window using vmin / vmax HU values."""
@@ -610,11 +623,11 @@ class DicomViewer(ttk.Frame):
         return self.state.get_slice_data(self.state.primary_image, view)
 
     @property
-    def axis_vars(self) -> Dict[str, Any]:
+    def axis_vars(self) -> dict[str, Any]:
         return _IndexVarProxy(self.state)
 
     @property
-    def metadata(self) -> Dict[str, Any]:
+    def metadata(self) -> dict[str, Any]:
         img = self.state.primary_image
         if img is None:
             return {"spacing": None}

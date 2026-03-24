@@ -17,6 +17,13 @@ StructureSet
     ``SliceViewerState``; exposed here for callers that build structure sets
     directly.
 
+I/O helpers (``dicom_viewer.io``)
+    validate_dicom_files, find_reg_matrices,
+    load_all_series, load_dcm_series
+
+RT-STRUCT helpers (``dicom_viewer.rtstruct_io``)
+    load_rt_struct, mask2rtstruct, resample_mask_to_original_space
+
 Quick start::
 
     import tkinter as tk
@@ -34,4 +41,4 @@ from .viewer import DicomViewer
 from .viewer_state import SliceViewerState, StructureSet
 
 __all__ = ["DicomViewer", "SliceViewerState", "StructureSet"]
-__version__ = "0.2.0"
+__version__ = "0.2.1"

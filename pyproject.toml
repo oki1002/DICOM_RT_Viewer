@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dicom-viewer"
-version = "0.1.0"
+version = "0.2.1"
 description = "SimpleITK-based DICOM MPR viewer widget for Tkinter"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -15,6 +15,7 @@ dependencies = [
     "matplotlib>=3.7",
     "numpy>=1.24",
     "pydicom>=2.4",
+    "rt-utils>=1.2",
     "scikit-image>=0.21",
     "scipy>=1.11",
 ]

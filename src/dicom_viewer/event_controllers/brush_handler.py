@@ -131,14 +131,10 @@ class BrushEventHandler:
         # _cached_mask_volume already contains every in-stroke write.
         # Apply fill_holes on the final 2-D slice if requested, then commit.
         mask_volume = self._cached_mask_volume
-        numpy_idx = self.state._axis_to_numpy_index(axis)
-        slice_idx = self.state.indices[axis]
-
-        slobj: list = [slice(None)] * 3
-        slobj[numpy_idx] = slice_idx
+        slobj = self._make_slobj(axis)
 
         if self._button == 1 and self.state.brush_fill_inside:
-            mask_volume[tuple(slobj)] = binary_fill_holes(mask_volume[tuple(slobj)])
+            mask_volume[slobj] = binary_fill_holes(mask_volume[slobj])
 
         new_mask = sitk.GetImageFromArray(mask_volume.astype(np.uint8))
         new_mask.CopyInformation(self.state.primary_image)
@@ -282,17 +278,13 @@ class BrushEventHandler:
         if axis is None:
             return
 
-        numpy_idx = self.state._axis_to_numpy_index(axis)
-        slobj: list = [slice(None)] * 3
-        slobj[numpy_idx] = self.state.indices[axis]
-        original = self._cached_mask_volume[tuple(slobj)]
+        slobj = self._make_slobj(axis)
+        original = self._cached_mask_volume[slobj]
 
         if self._button == 1:
-            self._cached_mask_volume[tuple(slobj)] = np.logical_or(
-                original, self._stroke_mask
-            )
+            self._cached_mask_volume[slobj] = np.logical_or(original, self._stroke_mask)
         else:
-            self._cached_mask_volume[tuple(slobj)] = np.logical_and(
+            self._cached_mask_volume[slobj] = np.logical_and(
                 original, np.logical_not(self._stroke_mask)
             )
 
@@ -311,16 +303,24 @@ class BrushEventHandler:
             return
 
         roi_number = self._cached_roi_number
-        numpy_idx = self.state._axis_to_numpy_index(axis)
-        slobj: list = [slice(None)] * 3
-        slobj[numpy_idx] = self.state.indices[axis]
-        cached_slice = self._cached_mask_volume[tuple(slobj)]
+        slobj = self._make_slobj(axis)
+        cached_slice = self._cached_mask_volume[slobj]
 
         self.viewer._draw_axis_contours(axis, override_mask={roi_number: cached_slice})
 
     # ------------------------------------------------------------------
     # Cache helpers
     # ------------------------------------------------------------------
+    def _make_slobj(self, axis: str) -> tuple:
+        """Return a 3-D index tuple that selects the current slice along *axis*.
+
+        Equivalent to ``[slice(None), slice(None), slice(None)]`` with the
+        dimension for *axis* replaced by the current slice index.
+        """
+        slobj: list = [slice(None)] * 3
+        slobj[self.state._axis_to_numpy_index(axis)] = self.state.indices[axis]
+        return tuple(slobj)
+
     def _discard_cache(self) -> None:
         """Release the cached NumPy volume and associated metadata."""
         self._cached_mask_volume = None
@@ -331,19 +331,35 @@ class BrushEventHandler:
         """Composite the current stroke mask into the ROI volume.
 
         .. deprecated::
-            In-stroke writes now go through ``_apply_stroke_to_mask_cached``.
-            This method is retained for external callers only.
+            Use :meth:`_apply_stroke_to_mask_cached` instead.
+            This method is retained for external callers only and will be
+            removed in a future release.
         """
+        import warnings
+
+        warnings.warn(
+            "_apply_stroke_to_mask is deprecated; use _apply_stroke_to_mask_cached.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._apply_stroke_to_mask_cached()
 
     def _apply_mask_to_volume(self, new_slice_mask: np.ndarray) -> None:
         """Merge a 2-D mask into the 3-D ROI volume and write back to State.
 
         .. deprecated::
-            In-stroke writes now go through ``_apply_stroke_to_mask_cached``
-            and ``handle_release``.  This method is retained for external
-            callers only.
+            Use :meth:`_apply_stroke_to_mask_cached` and
+            :meth:`handle_release` instead.  This method is retained for
+            external callers only and will be removed in a future release.
         """
+        import warnings
+
+        warnings.warn(
+            "_apply_mask_to_volume is deprecated; use _apply_stroke_to_mask_cached"
+            " and handle_release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         axis = self.state.current_axis
         roi_number = self.state.selected_roi_number
         if roi_number is None or roi_number not in self.state.structure_set:
@@ -351,17 +367,15 @@ class BrushEventHandler:
 
         mask_image = self.state.structure_set.get_mask(roi_number)
         mask_volume = sitk.GetArrayFromImage(mask_image)
-        numpy_idx = self.state._axis_to_numpy_index(axis)
-        slobj: list = [slice(None)] * 3
-        slobj[numpy_idx] = self.state.indices[axis]
-        original = mask_volume[tuple(slobj)]
+        slobj = self._make_slobj(axis)
+        original = mask_volume[slobj]
 
         if self._button == 1:
             combined = np.logical_or(original, new_slice_mask)
         else:
             combined = np.logical_and(original, np.logical_not(new_slice_mask))
 
-        mask_volume[tuple(slobj)] = combined
+        mask_volume[slobj] = combined
         new_mask = sitk.GetImageFromArray(mask_volume.astype(np.uint8))
         new_mask.CopyInformation(self.state.primary_image)
         self.state.update_contour_properties(roi_number, {"mask": new_mask})

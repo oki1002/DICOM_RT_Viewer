@@ -131,7 +131,7 @@ class ViewerEventHandler:
             return
 
         # Priority 2: crosshair drag
-        if self.crosshair_handler.is_dragging():
+        if self.crosshair_handler.is_dragging:
             self.crosshair_handler.handle_motion(event)
             return
 
