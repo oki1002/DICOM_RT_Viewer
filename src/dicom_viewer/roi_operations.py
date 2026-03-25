@@ -153,7 +153,7 @@ def apply_margin(mask_image: sitk.Image, config: MarginConfig) -> sitk.Image:
 
     # Conversion to number of voxels (rounding up)
     def to_voxels(mm: float, sp: float) -> int:
-        return max(0, int(np.ceil(abs(mm) / sp)))
+        return max(0, round(abs(mm) / sp))
 
     # Margin amounts in voxels for each direction
     n_sup = to_voxels(config.superior, sp_z)
@@ -170,27 +170,42 @@ def apply_margin(mask_image: sitk.Image, config: MarginConfig) -> sitk.Image:
 
     result = arr.copy()
 
-    # Expansion: Shift in each direction and take OR
-    result = _expand_direction(result, n_sup, axis=0, positive=True)  # Superior (+z)
-    result = _expand_direction(result, n_inf, axis=0, positive=False)  # Inferior (-z)
-    result = _expand_direction(result, n_ant, axis=1, positive=False)  # Anterior (-y)
-    result = _expand_direction(result, n_pos, axis=1, positive=True)  # Posterior (+y)
-    result = _expand_direction(result, n_lft, axis=2, positive=False)  # Left (-x)
-    result = _expand_direction(result, n_rgt, axis=2, positive=True)  # Right (+x)
-
-    # Contraction: The opposite direction of positive margins is already expanded.
-    # If a contraction (negative value) is specified, apply erosion.
-    if config.superior < 0:
+    if config.superior >= 0:
+        result = _expand_direction(
+            result, n_sup, axis=0, positive=True
+        )  # Superior (+z)
+    else:
         result = _erode_direction(result, n_sup, axis=0, positive=True)
-    if config.inferior < 0:
+
+    if config.inferior >= 0:
+        result = _expand_direction(
+            result, n_inf, axis=0, positive=False
+        )  # Inferior (-z)
+    else:
         result = _erode_direction(result, n_inf, axis=0, positive=False)
-    if config.anterior < 0:
+
+    if config.anterior >= 0:
+        result = _expand_direction(
+            result, n_ant, axis=1, positive=False
+        )  # Anterior (-y)
+    else:
         result = _erode_direction(result, n_ant, axis=1, positive=False)
-    if config.posterior < 0:
+
+    if config.posterior >= 0:
+        result = _expand_direction(
+            result, n_pos, axis=1, positive=True
+        )  # Posterior (+y)
+    else:
         result = _erode_direction(result, n_pos, axis=1, positive=True)
-    if config.left < 0:
+
+    if config.left >= 0:
+        result = _expand_direction(result, n_lft, axis=2, positive=False)  # Left (-x)
+    else:
         result = _erode_direction(result, n_lft, axis=2, positive=False)
-    if config.right < 0:
+
+    if config.right >= 0:
+        result = _expand_direction(result, n_rgt, axis=2, positive=True)  # Right (+x)
+    else:
         result = _erode_direction(result, n_rgt, axis=2, positive=True)
 
     out = sitk.GetImageFromArray(result.astype(np.uint8))
