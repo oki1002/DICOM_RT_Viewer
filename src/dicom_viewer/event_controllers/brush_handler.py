@@ -38,8 +38,8 @@ class BrushEventHandler:
         self._cached_mask_volume: np.ndarray | None = None
         self._cached_roi_number: int | None = None
 
-        # Cursor circle is shown only after the first real mouse-move inside
-        # a view, to prevent a stale circle appearing at activation time.
+        # The cursor circle is shown only after the first real mouse-move inside
+        # a view, preventing a stale circle from appearing at activation time.
         self._cursor_ready: bool = False
         self._cursor_last_axis: str = ""
 
@@ -90,7 +90,7 @@ class BrushEventHandler:
                 self._remove_brush_cursor()
             return
 
-        # Reset cursor readiness when the pointer enters a different axis,
+        # Reset cursor readiness when the pointer enters a different axis
         # or when xdata/ydata is not yet valid (spurious event at activation).
         current = self.state.current_axis
         if event.xdata is not None and event.ydata is not None:
@@ -128,8 +128,7 @@ class BrushEventHandler:
             self._discard_cache()
             return
 
-        # _cached_mask_volume already contains every in-stroke write.
-        # Apply fill_holes on the final 2-D slice if requested, then commit.
+        # Apply hole-filling on the final 2-D slice if requested, then commit.
         mask_volume = self._cached_mask_volume
         slobj = self._make_slobj(axis)
 
@@ -208,8 +207,11 @@ class BrushEventHandler:
     # Painting logic
     # ------------------------------------------------------------------
     def _paint_at(self, event, interpolate: bool = False) -> None:
-        """Apply the brush at the current event position, optionally
-        interpolating from the previous position to avoid gaps."""
+        """Apply the brush at the current event position.
+
+        When *interpolate* is True, intermediate positions between the
+        previous and current pixel are also painted to avoid gaps in the stroke.
+        """
         axis = self.state.current_axis
         if not (axis and event.xdata is not None and event.ydata is not None):
             return
@@ -222,9 +224,7 @@ class BrushEventHandler:
             self._interpolate_and_draw_stroke(axis, self._last_pos_px, center_px)
 
         self._draw_brush_on_stroke_mask(axis, center_px)
-
         self._apply_stroke_to_mask_cached()
-
         self._last_pos_px = center_px
 
         # Render the contour from the cached slice so the outline reflects the
@@ -236,7 +236,7 @@ class BrushEventHandler:
         self, axis: str, start_px: tuple[int, int], end_px: tuple[int, int]
     ) -> None:
         """Linearly interpolate brush positions between *start_px* and *end_px*
-        to ensure a continuous stroke without gaps."""
+        to produce a continuous stroke without gaps."""
         if self._stroke_mask is None:
             return
         dist = np.linalg.norm(np.array(end_px) - np.array(start_px))
@@ -294,25 +294,27 @@ class BrushEventHandler:
         During dragging the cached volume reflects the latest paint but has
         not yet been written back to State.  This method extracts the current
         2-D slice from ``_cached_mask_volume`` and passes it to the viewer's
-        contour renderer via the ``override_mask`` parameter, bypassing
+        public contour renderer via the ``override_mask`` parameter, bypassing
         ``state.structure_set`` for the active ROI.  The outline therefore
         updates in real time without a sitk round-trip or a State notification.
         """
         if self._cached_mask_volume is None or self._cached_roi_number is None:
-            self.viewer._draw_axis_contours(axis)
+            self.viewer.draw_axis_contours_with_override(axis, override_mask=None)
             return
 
         roi_number = self._cached_roi_number
         slobj = self._make_slobj(axis)
         cached_slice = self._cached_mask_volume[slobj]
 
-        self.viewer._draw_axis_contours(axis, override_mask={roi_number: cached_slice})
+        self.viewer.draw_axis_contours_with_override(
+            axis, override_mask={roi_number: cached_slice}
+        )
 
     # ------------------------------------------------------------------
     # Cache helpers
     # ------------------------------------------------------------------
     def _make_slobj(self, axis: str) -> tuple:
-        """Return a 3-D index tuple that selects the current slice along *axis*.
+        """Return a 3-D index tuple selecting the current slice along *axis*.
 
         Equivalent to ``[slice(None), slice(None), slice(None)]`` with the
         dimension for *axis* replaced by the current slice index.
@@ -325,60 +327,6 @@ class BrushEventHandler:
         """Release the cached NumPy volume and associated metadata."""
         self._cached_mask_volume = None
         self._cached_roi_number = None
-
-    # --- Legacy methods kept for backward compatibility ---
-    def _apply_stroke_to_mask(self) -> None:
-        """Composite the current stroke mask into the ROI volume.
-
-        .. deprecated::
-            Use :meth:`_apply_stroke_to_mask_cached` instead.
-            This method is retained for external callers only and will be
-            removed in a future release.
-        """
-        import warnings
-
-        warnings.warn(
-            "_apply_stroke_to_mask is deprecated; use _apply_stroke_to_mask_cached.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        self._apply_stroke_to_mask_cached()
-
-    def _apply_mask_to_volume(self, new_slice_mask: np.ndarray) -> None:
-        """Merge a 2-D mask into the 3-D ROI volume and write back to State.
-
-        .. deprecated::
-            Use :meth:`_apply_stroke_to_mask_cached` and
-            :meth:`handle_release` instead.  This method is retained for
-            external callers only and will be removed in a future release.
-        """
-        import warnings
-
-        warnings.warn(
-            "_apply_mask_to_volume is deprecated; use _apply_stroke_to_mask_cached"
-            " and handle_release.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        axis = self.state.current_axis
-        roi_number = self.state.selected_roi_number
-        if roi_number is None or roi_number not in self.state.structure_set:
-            return
-
-        mask_image = self.state.structure_set.get_mask(roi_number)
-        mask_volume = sitk.GetArrayFromImage(mask_image)
-        slobj = self._make_slobj(axis)
-        original = mask_volume[slobj]
-
-        if self._button == 1:
-            combined = np.logical_or(original, new_slice_mask)
-        else:
-            combined = np.logical_and(original, np.logical_not(new_slice_mask))
-
-        mask_volume[slobj] = combined
-        new_mask = sitk.GetImageFromArray(mask_volume.astype(np.uint8))
-        new_mask.CopyInformation(self.state.primary_image)
-        self.state.update_contour_properties(roi_number, {"mask": new_mask})
 
     # ------------------------------------------------------------------
     # Coordinate helpers

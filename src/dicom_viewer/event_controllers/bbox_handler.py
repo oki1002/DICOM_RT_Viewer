@@ -6,9 +6,9 @@ mouse events into state updates; rendering is performed by
 :class:`DicomViewer` through the ``"bounding_boxes_changed"`` listener.
 
 Supported interactions:
-    - **Create**: left-click on empty space → drag to define a new box.
-    - **Move**: left-click inside an existing box → drag to reposition.
-    - **Resize**: left-click near an edge or corner handle → drag to resize.
+    - **Create**: left-click on empty space -> drag to define a new box.
+    - **Move**: left-click inside an existing box -> drag to reposition.
+    - **Resize**: left-click near an edge or corner handle -> drag to resize.
       Handle detection tolerance is :attr:`TOLERANCE_PIXELS` pixels.
 """
 
@@ -62,7 +62,7 @@ class BboxEventHandler:
         handle = self._detect_handle(event, axis)
 
         if handle:
-            # Resize an existing box
+            # Resize an existing box.
             self._interaction_mode = "resize"
             self._resize_handle = handle
             self._active_axis = axis
@@ -74,7 +74,7 @@ class BboxEventHandler:
         if bbox and (
             bbox[0] <= px <= bbox[0] + bbox[2] and bbox[1] <= py <= bbox[1] + bbox[3]
         ):
-            # Move the existing box
+            # Move the existing box.
             self._interaction_mode = "move"
             self._active_axis = axis
             self._is_dragging = True
@@ -82,7 +82,7 @@ class BboxEventHandler:
             self._original_pos = list(bbox)
             return True
 
-        # Click outside → clear old box for this axis and start creating a new one
+        # Click outside any existing box: clear and start creating a new one.
         self.state.set_bounding_box(axis, None)
         self._interaction_mode = "create"
         self._active_axis = axis
@@ -212,13 +212,12 @@ class BboxEventHandler:
             "l" = left edge   (x_min)
             "r" = right edge  (x_max = x + w)
 
-        dx/dy are data-coordinate deltas (event.xdata/ydata − drag_start).
+        dx/dy are data-coordinate deltas (event.xdata/ydata - drag_start).
         Because _detect_handle also operates in data coordinates, the dragged
-        edge always moves in the expected direction regardless of ylim
-        orientation:
+        edge always moves in the expected direction regardless of ylim orientation:
 
-            dragging "t" up   (dy > 0) → increase y_max → h += dy
-            dragging "b" down (dy < 0) → decrease y_min → y += dy; h -= dy
+            dragging "t" up   (dy > 0) -> increase y_max -> h += dy
+            dragging "b" down (dy < 0) -> decrease y_min -> y += dy; h -= dy
         """
         handle = self._resize_handle
         x, y, w, h = self._original_pos

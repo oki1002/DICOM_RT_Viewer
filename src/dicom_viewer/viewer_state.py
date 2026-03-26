@@ -20,6 +20,18 @@ Coordinate system:
     system.  NumPy arrays obtained via ``sitk.GetArrayViewFromImage`` are
     indexed as ``(z, y, x)``, while ``sitk.Image.GetSize()`` returns
     ``(x, y, z)``.
+
+Performance:
+    Contour path computation is expensive because ``find_contours`` runs on
+    every slice change.  :class:`ContourPathCache` memoises the result keyed
+    by ``(roi_number, axis, slice_index)`` so that unchanged slices are never
+    re-computed.  The cache is invalidated per-ROI when its mask changes, and
+    fully cleared when the primary image or structure set is replaced.
+
+    The RT-DOSE volume is also pre-normalised to ``float32`` and stored as a
+    NumPy array in :attr:`SliceViewerState.dose_array_cache` so that
+    ``imshow.set_data`` receives a lightweight array on every slice update
+    instead of triggering an internal ``sitk`` round-trip.
 """
 
 import logging
@@ -34,6 +46,54 @@ import SimpleITK as sitk
 logger = logging.getLogger(__name__)
 
 AXES = ("axial", "coronal", "sagittal")
+
+
+# ---------------------------------------------------------------------------
+# ContourPathCache
+# ---------------------------------------------------------------------------
+class ContourPathCache:
+    """Per-slice contour path cache keyed by (roi_number, axis, slice_index).
+
+    Paths are computed by ``find_contours`` inside :meth:`DicomViewer._draw_axis_contours`
+    and stored here so that revisiting the same slice avoids re-computation.
+
+    Invalidation rules:
+        - :meth:`invalidate_roi` removes every entry for a single ROI.
+          Call this when a mask is modified via the brush tool or an ROI operation.
+        - :meth:`clear` removes all entries.
+          Call this when the primary image or the entire structure set is replaced.
+    """
+
+    def __init__(self) -> None:
+        # { (roi_number, axis, slice_index): list[matplotlib.path.Path] }
+        self._cache: dict[tuple[int, str, int], list] = {}
+
+    # ------------------------------------------------------------------
+    # Read / write
+    # ------------------------------------------------------------------
+    def get(self, roi_number: int, axis: str, index: int) -> list | None:
+        """Return cached paths, or ``None`` when the entry is absent."""
+        return self._cache.get((roi_number, axis, index))
+
+    def set(self, roi_number: int, axis: str, index: int, paths: list) -> None:
+        """Store *paths* for the given key."""
+        self._cache[(roi_number, axis, index)] = paths
+
+    # ------------------------------------------------------------------
+    # Invalidation
+    # ------------------------------------------------------------------
+    def invalidate_roi(self, roi_number: int) -> None:
+        """Remove all cached entries for *roi_number*."""
+        keys = [k for k in self._cache if k[0] == roi_number]
+        for k in keys:
+            del self._cache[k]
+
+    def clear(self) -> None:
+        """Remove every cached entry."""
+        self._cache.clear()
+
+    def __len__(self) -> int:
+        return len(self._cache)
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +186,7 @@ class SliceViewerState:
     """Centralised state container for the 3-plane DICOM viewer.
 
     Coordinates are expressed in the SimpleITK physical coordinate system
-    (LPS).  All slice navigation uses integer indices; physical ↔ index
+    (LPS).  All slice navigation uses integer indices; physical <-> index
     conversion is handled by :meth:`index_to_physical` /
     :meth:`physical_to_index`.
 
@@ -139,8 +199,11 @@ class SliceViewerState:
         ``"secondary_image_data_changed"`` — ``(image: sitk.Image | None)``
         ``"blend_alpha_changed"``          — ``(alpha: float)``
         ``"secondary_image_cmap_changed"`` — ``(cmap_name: str)``
+        ``"secondary_clim_changed"``       — ``(clim: tuple[float, float] | None)``
         ``"phases_data_loaded"``           — ``(phases_data: dict)``
         ``"phase_changed"``                — ``(phase_name: str)``
+        ``"rt_dose_changed"``              — ``(image: sitk.Image | None)``
+        ``"layout_mode_changed"``          — ``(mode: str)``
         ``"index_changed"``                — ``(axis: str, new_idx: int)``
         ``"window_level_changed"``         — ``(window: int, level: int)``
         ``"crosshair_changed"``            — ``()``
@@ -161,10 +224,34 @@ class SliceViewerState:
     secondary_image: sitk.Image | None = field(repr=False, default=None)
     blend_alpha: float = 1.0
     secondary_image_cmap: str = "gray"
+    secondary_clim: tuple[float, float] | None = None
 
     # --- 4DCT phases ---
     all_phases_data: dict[str, Any] = field(default_factory=dict, repr=False)
     current_phase: str | None = None
+
+    # --- RT-DOSE ---
+    # Raw dose in LPS (original grid, used for display with correct extent).
+    rt_dose_image: sitk.Image | None = field(repr=False, default=None)
+    # Dose resampled to primary CT grid (used for DVH calculation with ROI masks).
+    rt_dose_resampled: sitk.Image | None = field(repr=False, default=None)
+    prescription_dose: float | None = None
+
+    # --- Performance caches (not part of logical state) ---
+    # Pre-normalised float32 NumPy view of the resampled dose volume.
+    # Populated by _build_dose_array_cache(); cleared on dose change.
+    # { axis: np.ndarray(shape=(slices, H, W), dtype=float32) }
+    dose_array_cache: dict[str, np.ndarray] = field(
+        default_factory=dict, repr=False, compare=False
+    )
+    # Contour path cache shared between DicomViewer instances that share
+    # this state.  Invalidated per-ROI on mask changes.
+    contour_path_cache: ContourPathCache = field(
+        default_factory=ContourPathCache, repr=False, compare=False
+    )
+
+    # --- Layout ---
+    layout_mode: str = "mpr_wide"
 
     # --- Slice state ---
     current_axis: str = ""
@@ -234,12 +321,12 @@ class SliceViewerState:
         """Map a view-axis name to the NumPy array dimension.
 
         NumPy arrays from SimpleITK are ordered ``(z, y, x)``, so:
-        axial → 0, coronal → 1, sagittal → 2.
+        axial -> 0, coronal -> 1, sagittal -> 2.
         """
         return {"axial": 0, "coronal": 1, "sagittal": 2}[axis]
 
     # =========================================================
-    # Physical ↔ index conversion
+    # Physical <-> index conversion
     # =========================================================
     def index_to_physical(self, axis: str, index: int) -> float:
         """Convert a slice index along *axis* to a physical LPS coordinate."""
@@ -280,7 +367,7 @@ class SliceViewerState:
     # =========================================================
     # Slice data access
     # =========================================================
-    def get_slice_data(self, volume: sitk.Image, axis: str) -> np.ndarray:
+    def get_slice_data(self, volume: sitk.Image | None, axis: str) -> np.ndarray:
         """Extract the 2-D slice at the current index along *axis*."""
         if volume is None:
             return np.array([])
@@ -342,8 +429,7 @@ class SliceViewerState:
         """Resample *image* to match the primary image geometry.
 
         If *transform* is provided it is applied before resampling (useful
-        for 4DCT phase registration).  Otherwise an identity transform is
-        used.
+        for 4DCT phase registration).  Otherwise an identity transform is used.
 
         Args:
             image:     The source image to resample.
@@ -372,6 +458,13 @@ class SliceViewerState:
     ) -> None:
         """Set the primary CT image and reset all derived state.
 
+        Event firing order:
+            1. ``secondary_image_data_changed`` (None)
+            2. ``rt_dose_changed`` (None)
+            3. ``primary_image_data_changed`` (image)
+            Listeners for events 1 and 2 may read the new primary image
+            because it is assigned before any notification is fired.
+
         Args:
             image:     The CT volume as a ``sitk.Image``.
             image_dir: Optional path to the source DICOM folder.
@@ -379,17 +472,27 @@ class SliceViewerState:
         self.primary_image = image
         self.primary_image_dir = image_dir
 
-        # Reset derived state
+        # Reset all derived state before firing any notifications so that
+        # listeners always see a consistent state.
         self.structure_set = StructureSet()
         self.active_contours = set()
         self.selected_roi_number = None
         self.bounding_boxes = {axis: None for axis in AXES}
         self.secondary_image = None
         self.blend_alpha = 1.0
+        self.secondary_clim = None
         self.all_phases_data = {}
         self.current_phase = None
+        self.rt_dose_image = None
+        self.rt_dose_resampled = None
+        self.prescription_dose = None
+
+        # Invalidate all performance caches on image change.
+        self.dose_array_cache.clear()
+        self.contour_path_cache.clear()
 
         self._notify("secondary_image_data_changed", None)
+        self._notify("rt_dose_changed", None)
 
         if image is not None:
             x_dim, y_dim, z_dim = image.GetSize()
@@ -423,7 +526,7 @@ class SliceViewerState:
         self._notify("secondary_image_data_changed", self.secondary_image)
 
     def set_blend_alpha(self, alpha: float) -> None:
-        """Set the primary-image opacity for the blend slider (0.0–1.0).
+        """Set the primary-image opacity for the blend slider (0.0-1.0).
 
         A value of ``1.0`` means only the primary image is visible; ``0.0``
         shows only the secondary image.
@@ -446,6 +549,205 @@ class SliceViewerState:
             self.secondary_image_cmap = cmap_name
             self._notify("secondary_image_cmap_changed", cmap_name)
 
+    def set_secondary_clim(self, clim: tuple[float, float] | None) -> None:
+        """Override the colour limits for the secondary image display.
+
+        Set to ``None`` to fall back to the primary window/level.
+
+        Args:
+            clim: ``(vmin, vmax)`` pair, or ``None`` to clear the override.
+        """
+        if self.secondary_clim != clim:
+            self.secondary_clim = clim
+            self._notify("secondary_clim_changed", clim)
+
+    def set_rt_dose_image(self, image: sitk.Image | None) -> None:
+        """Set (or clear) the RT-DOSE volume.
+
+        The raw image is stored in :attr:`rt_dose_image` and used for slice
+        display with the dose's own physical extent.  A version resampled to
+        the primary image grid is stored in :attr:`rt_dose_resampled` for DVH
+        computation (where dose values must align with ROI masks).
+
+        Calling this method also rebuilds :attr:`dose_array_cache` so that
+        subsequent slice updates can read a lightweight pre-cast NumPy array
+        instead of performing a ``sitk`` conversion on every frame.
+
+        Args:
+            image: LPS-oriented RT-DOSE ``sitk.Image``, or ``None`` to clear.
+        """
+        self.rt_dose_image = image
+        if image is not None and self.primary_image is not None:
+            resample = sitk.ResampleImageFilter()
+            resample.SetReferenceImage(self.primary_image)
+            resample.SetInterpolator(sitk.sitkLinear)
+            resample.SetTransform(sitk.Transform(3, sitk.sitkIdentity))
+            resample.SetDefaultPixelValue(0.0)
+            self.rt_dose_resampled = resample.Execute(image)
+        else:
+            self.rt_dose_resampled = None
+
+        # Rebuild the dose NumPy cache after the resample result is ready.
+        self._build_dose_array_cache()
+        self._notify("rt_dose_changed", image)
+
+    def set_prescription_dose(self, dose_gy: float | None) -> None:
+        """Set the prescription dose in Gy.
+
+        When ``None``, the 99th-percentile of the positive dose values is used
+        as the 100% reference for IsoDose rendering.
+
+        Args:
+            dose_gy: Prescription dose in Gy, or ``None``.
+        """
+        if self.prescription_dose != dose_gy:
+            self.prescription_dose = dose_gy
+            self._notify("rt_dose_changed", self.rt_dose_image)
+
+    # =========================================================
+    # Dose performance cache
+    # =========================================================
+    def _build_dose_array_cache(self) -> None:
+        """Pre-cast the resampled dose volume to ``float32`` NumPy arrays.
+
+        All three axes share the same 3-D array object (no copy).  Each axis
+        key stores a reference to the same ``ndarray``; slice retrieval in
+        :meth:`get_dose_slice_cached` selects the appropriate dimension via
+        ``numpy_dim``:
+
+            axial    -> arr[i, :, :]  (dim-0)
+            coronal  -> arr[:, i, :]  (dim-1)
+            sagittal -> arr[:, :, i]  (dim-2)
+
+        Memory consumption is therefore equivalent to one volume regardless of
+        how many axis keys are stored.  When no resampled dose is available the
+        cache is cleared.
+        """
+        self.dose_array_cache.clear()
+        if self.rt_dose_resampled is None:
+            return
+
+        # GetArrayFromImage returns (z, y, x) order.
+        # All three axis keys intentionally reference the same ndarray (no copy).
+        arr = np.asarray(
+            sitk.GetArrayFromImage(self.rt_dose_resampled), dtype=np.float32
+        )
+        for axis in ("axial", "coronal", "sagittal"):
+            self.dose_array_cache[axis] = arr
+
+        logger.info(f"Dose array cache built: shape={arr.shape}, dtype={arr.dtype}.")
+
+    def get_dose_slice_cached(self, axis: str) -> np.ndarray:
+        """Return the dose 2-D slice for the current index along *axis*.
+
+        Uses :attr:`dose_array_cache` when available (avoids a ``sitk``
+        round-trip on every frame).  Falls back to :meth:`get_dose_slice`
+        when the cache has not been populated.
+
+        Args:
+            axis: One of ``"axial"``, ``"coronal"``, or ``"sagittal"``.
+
+        Returns:
+            A 2-D ``float32`` NumPy array, or an empty array when the dose
+            volume is absent or the CT slice lies outside the dose grid.
+        """
+        if axis not in self.dose_array_cache:
+            return self.get_dose_slice(axis)
+
+        arr = self.dose_array_cache[axis]
+        numpy_dim = self._axis_to_numpy_index(axis)
+        idx = self.indices[axis]
+        max_idx = arr.shape[numpy_dim] - 1
+
+        if idx < 0 or idx > max_idx:
+            return np.array([], dtype=np.float32)
+
+        slobj: list = [slice(None)] * 3
+        slobj[numpy_dim] = idx
+        return arr[tuple(slobj)]
+
+    # =========================================================
+    # RT-DOSE geometry helpers
+    # =========================================================
+    def get_dose_extent(self, axis: str) -> list[float]:
+        """Return ``[left, right, bottom, top]`` in physical coordinates for the dose image.
+
+        Uses the dose image's own geometry (not the primary CT geometry).
+        """
+        if self.rt_dose_image is None:
+            return [0.0, 1.0, 0.0, 1.0]
+        dose = self.rt_dose_image
+        size = dose.GetSize()
+        spacing = dose.GetSpacing()
+        origin = dose.GetOrigin()
+        if axis == "axial":
+            return [
+                origin[0],
+                origin[0] + spacing[0] * size[0],
+                origin[1],
+                origin[1] + spacing[1] * size[1],
+            ]
+        elif axis == "coronal":
+            return [
+                origin[0],
+                origin[0] + spacing[0] * size[0],
+                origin[2],
+                origin[2] + spacing[2] * size[2],
+            ]
+        else:  # sagittal
+            return [
+                origin[1],
+                origin[1] + spacing[1] * size[1],
+                origin[2],
+                origin[2] + spacing[2] * size[2],
+            ]
+
+    def get_dose_slice(self, axis: str) -> np.ndarray:
+        """Extract the dose 2-D slice closest to the current CT slice position.
+
+        Finds the dose slice whose physical coordinate along *axis* best
+        matches the physical coordinate of the current CT slice index.
+        Returns an empty array when the CT slice lies outside the dose volume.
+        """
+        if self.rt_dose_image is None:
+            return np.array([])
+
+        dose = self.rt_dose_image
+        physical_coord = self.index_to_physical(axis, self.indices[axis])
+
+        # Axis -> SimpleITK x/y/z dimension; axis -> NumPy (z,y,x) dimension
+        sitk_dim = {"axial": 2, "coronal": 1, "sagittal": 0}[axis]
+        numpy_dim = {"axial": 0, "coronal": 1, "sagittal": 2}[axis]
+
+        dose_origin = dose.GetOrigin()[sitk_dim]
+        dose_spacing = dose.GetSpacing()[sitk_dim]
+        dose_size = dose.GetSize()[sitk_dim]
+
+        dose_idx_f = (physical_coord - dose_origin) / dose_spacing
+
+        # CT slice is outside the dose volume; skip overlay.
+        if dose_idx_f < -0.5 or dose_idx_f >= dose_size - 0.5:
+            return np.array([])
+
+        dose_idx = int(round(dose_idx_f))
+        dose_idx = max(0, min(dose_idx, dose_size - 1))
+
+        arr = sitk.GetArrayViewFromImage(dose)  # (z, y, x)
+        slobj: list = [slice(None)] * 3
+        slobj[numpy_dim] = dose_idx
+        return np.asarray(arr[tuple(slobj)])
+
+    def set_layout_mode(self, mode: str) -> None:
+        """Switch the viewer layout mode.
+
+        Args:
+            mode: ``"mpr"`` (top row: Axial + DVH, bottom row: Coronal + Sagittal)
+                or ``"mpr_wide"`` (left column: large Axial, right column: Coronal / Sagittal).
+        """
+        if self.layout_mode != mode:
+            self.layout_mode = mode
+            self._notify("layout_mode_changed", mode)
+
     # =========================================================
     # 4DCT phases
     # =========================================================
@@ -461,7 +763,7 @@ class SliceViewerState:
         listeners are notified with ``"phases_data_loaded"``.
 
         Args:
-            phases_data: Mapping of phase label → series info dict, as
+            phases_data: Mapping of phase label -> series info dict, as
                 returned by ``load_all_series()``.
         """
         if not self.primary_image:
@@ -509,11 +811,14 @@ class SliceViewerState:
     # Crosshair
     # =========================================================
     def refresh_crosshair(self) -> None:
-        """Recompute crosshair physical coordinates from the current indices.
+        """Recompute the crosshair position from the current indices and notify listeners.
 
-        Call this after externally changing slice indices without triggering
-        an automatic crosshair update (e.g. after loading a new image).
+        Forces a notification even when the physical position has not changed.
+        Call this after a layout rebuild or a dose load to ensure the crosshair
+        artists are repositioned after an artist reset.
         """
+        # Force notification by clearing the previous position first.
+        self.crosshair_pos = {axis: None for axis in AXES}
         self._update_crosshair_by_index()
 
     def _update_crosshair_by_index(self) -> None:
@@ -630,6 +935,9 @@ class SliceViewerState:
         """Enable or disable filled (semi-transparent) contour overlay."""
         if self.overlay_contours != enable:
             self.overlay_contours = enable
+            # Overlay mode change affects facecolor only; invalidate the full cache
+            # because cached Path objects are valid but face attributes are not stored.
+            self.contour_path_cache.clear()
             self._notify("overlay_contours_changed", enable)
 
     def add_contour(self, name: str, mask: sitk.Image, color: str) -> int:
@@ -642,12 +950,25 @@ class SliceViewerState:
         """Remove the ROI identified by *roi_number* from the StructureSet."""
         self.structure_set.remove(roi_number)
         self.active_contours.discard(roi_number)
+        # Purge cached paths for this ROI.
+        self.contour_path_cache.invalidate_roi(roi_number)
         self._notify("all_contours_changed", self.structure_set)
         self._notify("active_contours_changed", self.active_contours)
 
     def update_contour_properties(self, roi_number: int, props: dict[str, Any]) -> None:
         """Update properties (``name``, ``mask``, ``color``) for *roi_number*."""
         self.structure_set.update(roi_number, props)
+        # Invalidate cached paths when the mask changes so stale contours are not shown.
+        if "mask" in props:
+            self.contour_path_cache.invalidate_roi(roi_number)
+        self._notify("all_contours_changed", self.structure_set)
+
+    def refresh_contours(self) -> None:
+        """Force a contour redraw and DVH update without modifying any mask.
+
+        Call this when leaving the edit tab so that brush-painted changes are
+        reflected in the DVH even if no ``update_contour_properties`` was issued.
+        """
         self._notify("all_contours_changed", self.structure_set)
 
     # =========================================================

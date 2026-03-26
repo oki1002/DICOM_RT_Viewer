@@ -18,6 +18,9 @@ if TYPE_CHECKING:
 class CrosshairEventHandler:
     """Handle mouse interactions with the crosshair overlay."""
 
+    #: Pixel radius within which a crosshair line is considered hit (display coordinates).
+    TOLERANCE_PIXELS: int = 5
+
     def __init__(self, state: "SliceViewerState", viewer: "DicomViewer") -> None:
         self.state = state
         self.viewer = viewer
@@ -54,10 +57,10 @@ class CrosshairEventHandler:
             return False
 
         ax = self.viewer.axs.get(axis)
-        # Convert data coordinates to display pixels for hit-testing
+        # Convert data coordinates to display pixels for hit-testing.
         px, py = ax.transData.transform((event.xdata, event.ydata))
         cx, cy = ax.transData.transform(pos)
-        tol = 5  # pixel tolerance
+        tol = self.TOLERANCE_PIXELS
 
         near_v = abs(px - cx) < tol
         near_h = abs(py - cy) < tol
@@ -98,8 +101,7 @@ class CrosshairEventHandler:
             if action:
                 targets = [action]
 
-        # Update indices without triggering individual crosshair recomputes;
-        # do a single batch update at the end.
+        # Batch-update all affected indices before triggering a single crosshair recompute.
         for target_axis, coord in targets:
             idx = self.state.physical_to_index(target_axis, coord)
             self.state.set_index(target_axis, idx, update_crosshair=False)

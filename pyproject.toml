@@ -4,10 +4,10 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dicom-viewer"
-version = "0.2.1"
+version = "0.2.2"
 description = "SimpleITK-based DICOM MPR viewer widget for Tkinter"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = { text = "MIT" }
 
 dependencies = [
@@ -32,5 +32,5 @@ dev = [
 packages = ["src/dicom_viewer"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.12"
 strict = true

@@ -50,7 +50,7 @@ class ViewerEventHandler:
     def _on_brush_tool_active_changed(self, is_active: bool) -> None:
         if is_active:
             self.brush_handler.activate()
-            # Cancel any in-progress WL drag immediately
+            # Cancel any in-progress W/L drag immediately.
             self._dragging_wl = False
             self._wl_start_pos = None
             self._wl_initial = None
@@ -96,27 +96,27 @@ class ViewerEventHandler:
     # ------------------------------------------------------------------
     def on_press(self, event) -> None:
         """Dispatch a mouse-press event to the appropriate handler."""
-        # Ignore while the toolbar zoom/pan mode is active
+        # Ignore while the toolbar zoom/pan mode is active.
         if self.viewer.toolbar.mode not in ("", None):
             return
 
-        # Priority 1: brush tool (exclusive — blocks crosshair, WL, bbox)
+        # Priority 1: brush tool (exclusive; blocks crosshair, W/L, bbox).
         if self.state.brush_tool_active:
             self.brush_handler.handle_press(event)
             return
 
-        # Priority 2: crosshair drag
+        # Priority 2: crosshair drag.
         if self.crosshair_handler.handle_press(event):
             return
 
-        # Priority 3: window / level (right-click)
+        # Priority 3: window / level (right-click).
         if event.button == 3:
             self._dragging_wl = True
             self._wl_start_pos = (event.x, event.y)
             self._wl_initial = self.state.window_level
             return
 
-        # Priority 4: bounding box (all views)
+        # Priority 4: bounding box (all views).
         if event.button == 1 and self.state.current_axis:
             self.bbox_handler.handle_press(event)
 
@@ -125,28 +125,28 @@ class ViewerEventHandler:
     # ------------------------------------------------------------------
     def on_motion(self, event) -> None:
         """Route mouse-motion events while a drag is in progress."""
-        # Priority 1: brush tool (exclusive)
+        # Priority 1: brush tool (exclusive).
         if self.state.brush_tool_active:
             self.brush_handler.handle_motion(event)
             return
 
-        # Priority 2: crosshair drag
+        # Priority 2: crosshair drag.
         if self.crosshair_handler.is_dragging:
             self.crosshair_handler.handle_motion(event)
             return
 
-        # Priority 3: window / level
+        # Priority 3: window / level.
+        # Horizontal drag -> window width; vertical drag -> window level.
         if self._dragging_wl and event.x is not None and event.y is not None:
             dx = event.x - self._wl_start_pos[0]
             dy = event.y - self._wl_start_pos[1]
             init_w, init_l = self._wl_initial
-            # Horizontal drag → window width; vertical drag → window level
             new_w = max(1, int(init_w + dx * 1.0))
             new_l = int(init_l - dy * 0.2)
             self.state.set_window_level(new_w, new_l)
             return
 
-        # Priority 4: bounding box
+        # Priority 4: bounding box.
         if self.bbox_handler.is_dragging:
             self.bbox_handler.handle_motion(event)
 

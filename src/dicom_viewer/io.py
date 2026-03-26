@@ -7,7 +7,7 @@ validate_dicom_files(folder_path) -> bool
 
 find_reg_matrices(dcm_root_dir) -> dict[str, np.ndarray]
     Recursively scan a directory tree for Spatial Registration Object (REG)
-    files and return a mapping of referenced SOP Instance UID to 4×4
+    files and return a mapping of referenced SOP Instance UID to 4x4
     transformation matrix.
 
 load_all_series(dcm_root_dir) -> dict[str, SeriesInfo]
@@ -95,7 +95,7 @@ def find_reg_matrices(dcm_root_dir: str | pathlib.Path) -> dict[str, np.ndarray]
     """Recursively scan *dcm_root_dir* for Spatial Registration Object files
     and return a mapping of referenced SOP Instance UID to inverted 4x4 matrix.
 
-    The stored matrix is Fixed←Moving; each is inverted to Moving←Fixed before
+    The stored matrix is Fixed<-Moving; each is inverted to Moving<-Fixed before
     being returned.
 
     Args:
@@ -200,7 +200,7 @@ def _get_window_level(
     """Return ``(window_width, window_center)`` for *image*.
 
     CT: uses DICOM tags 0028|1051/0028|1050, falling back to ``(300, 25)``.
-    Other modalities: derived from the 0.5th–99.5th percentile range.
+    Other modalities: derived from the 0.5th-99.5th percentile range.
     """
     if modality.upper() == "CT":
         try:
@@ -230,7 +230,7 @@ def _get_modality(reader: sitk.ImageSeriesReader) -> str:
 
 
 def _build_transform(reg_matrix: np.ndarray) -> sitk.AffineTransform:
-    """Construct a ``sitk.AffineTransform`` from a 4×4 registration matrix."""
+    """Construct a ``sitk.AffineTransform`` from a 4x4 registration matrix."""
     transform = sitk.AffineTransform(3)
     transform.SetMatrix(reg_matrix[:3, :3].flatten())
     transform.SetTranslation(reg_matrix[:3, 3])
@@ -343,6 +343,64 @@ def load_all_series(dcm_root_dir: str | pathlib.Path) -> dict[str, SeriesInfo]:
     return series_dict
 
 
+_RT_DOSE_STORAGE_UID = "1.2.840.10008.5.1.4.1.1.481.2"
+
+
+def find_rt_dose_files(folder_path: str | pathlib.Path) -> list[pathlib.Path]:
+    """Return RT-DOSE DICOM files found (non-recursively) in *folder_path*.
+
+    Args:
+        folder_path: Directory to search.
+
+    Returns:
+        Sorted list of :class:`pathlib.Path` objects for each RT-DOSE file.
+    """
+    folder = pathlib.Path(folder_path)
+    rt_dose_files: list[pathlib.Path] = []
+    for f in sorted(folder.iterdir()):
+        if not f.is_file():
+            continue
+        try:
+            ds = pydicom.dcmread(str(f), stop_before_pixels=True)
+            if getattr(ds, "Modality", "").strip() == "RTDOSE":
+                rt_dose_files.append(f)
+        except Exception:
+            continue
+    return rt_dose_files
+
+
+def load_rt_dose(dose_path: str | pathlib.Path) -> sitk.Image:
+    """Load an RT-DOSE DICOM file and return a ``sitk.Image`` scaled to Gy.
+
+    The pixel data is multiplied by the DICOM tag ``DoseGridScaling``
+    (0x3004, 0x000E) so the returned image values are in Gray (Gy).
+
+    Args:
+        dose_path: Path to the RT-DOSE DICOM file.
+
+    Returns:
+        ``sitk.Image`` with float32 voxel values in Gy, oriented to LPS.
+
+    Raises:
+        ValueError: If the file is not an RT-DOSE DICOM.
+    """
+    dose_path = pathlib.Path(dose_path)
+    ds = pydicom.dcmread(str(dose_path), stop_before_pixels=True)
+    if getattr(ds, "Modality", "").strip() != "RTDOSE":
+        raise ValueError(f"File is not RT-DOSE: {dose_path}")
+
+    scaling = float(getattr(ds, "DoseGridScaling", 1.0))
+    logger.info(f"Loading RT-DOSE from '{dose_path}' (DoseGridScaling={scaling}).")
+
+    image = sitk.ReadImage(str(dose_path))
+    array = sitk.GetArrayFromImage(image).astype(np.float32) * scaling
+    scaled_image = sitk.GetImageFromArray(array)
+    scaled_image.CopyInformation(image)
+
+    lps_image, _ = _orient_to_lps(scaled_image)
+    return lps_image
+
+
 def load_dcm_series(dcm_dir: str | pathlib.Path) -> SeriesInfo:
     """Load a folder that contains exactly one DICOM series.
 
@@ -353,13 +411,14 @@ def load_dcm_series(dcm_dir: str | pathlib.Path) -> SeriesInfo:
         The sole :class:`SeriesInfo` dict.
 
     Raises:
-        FileNotFoundError: If the directory contains zero or more than one series.
+        FileNotFoundError: If no DICOM series is found in the directory.
+        ValueError: If more than one series is found in the directory.
     """
     series_dict = load_all_series(dcm_dir)
     if len(series_dict) != 1:
-        raise FileNotFoundError(
+        raise ValueError(
             f"Expected exactly one DICOM series in '{dcm_dir}', "
             f"but found {len(series_dict)}."
         )
-    _, props = series_dict.popitem()
-    return props
+    # Use next(iter(...)) rather than popitem() to make the intent explicit.
+    return next(iter(series_dict.values()))

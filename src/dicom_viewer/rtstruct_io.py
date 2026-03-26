@@ -10,7 +10,7 @@ mask2rtstruct(ct_dir, rtss_path, structures) -> None
     Convert NumPy mask arrays to an RT-STRUCT DICOM file, creating or
     updating as appropriate.
 
-resample_mask_to_original_space(lps_image, original_image, lps_mask) -> sitk.Image
+resample_mask_to_original_space(_lps_image, original_image, lps_mask) -> sitk.Image
     Resample a mask from the LPS-aligned coordinate space back to the
     original image coordinate space.
 """
@@ -44,7 +44,7 @@ class RoiInfo(TypedDict):
 # Resampling
 # ---------------------------------------------------------------------------
 def resample_mask_to_original_space(
-    lps_image: sitk.Image,
+    _lps_image: sitk.Image,
     original_image: sitk.Image,
     lps_mask: sitk.Image,
 ) -> sitk.Image:
@@ -55,8 +55,8 @@ def resample_mask_to_original_space(
     reference the original DICOM geometry.
 
     Args:
-        lps_image: LPS-aligned CT image (source reference, currently unused
-            but kept for API symmetry).
+        _lps_image: LPS-aligned CT image.  Reserved for API symmetry; not used
+            in the current implementation.
         original_image: Original CT image before LPS alignment (resampling target).
         lps_mask: Binary mask in LPS coordinate space.
 
@@ -163,22 +163,31 @@ def mask2rtstruct(
     new RT-STRUCT is created.  Mask arrays must have shape ``(D, H, W)`` and
     are transposed to rt-utils' expected ``(H, W, D)`` convention internally.
 
+    Note:
+        *rtss_path* must not be ``None``.  Passing ``None`` will cause
+        ``rtstruct.save()`` to receive the string ``"None"`` as the path,
+        which is almost certainly unintended.  Callers are responsible for
+        resolving a concrete output path before calling this function.
+
     Args:
         ct_dir: Directory of the reference CT series.
-        rtss_path: Destination path for the RT-STRUCT file, or ``None`` to
-            create a new file alongside the CT.
+        rtss_path: Destination path for the RT-STRUCT file.
         structures: ``{roi_number: {"name": str, "mask": np.ndarray,
             "color": list | str}}`` mapping.
 
     Raises:
+        ValueError: If *rtss_path* is ``None``.
         RuntimeError: If any ROI cannot be added to the RT-STRUCT builder.
     """
+    if rtss_path is None:
+        raise ValueError("rtss_path must not be None; provide a concrete output path.")
+
     ct_dir = pathlib.Path(ct_dir)
-    rtss_path = pathlib.Path(rtss_path) if rtss_path else None
+    rtss_path = pathlib.Path(rtss_path)
 
     logger.info("Converting masks to RTSTRUCT.")
 
-    if rtss_path and rtss_path.exists():
+    if rtss_path.exists():
         logger.info(f"Updating existing RTSTRUCT: '{rtss_path}'.")
         rtstruct = RTStructBuilder.create_from(
             dicom_series_path=str(ct_dir),

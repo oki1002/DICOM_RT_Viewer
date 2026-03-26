@@ -4,7 +4,7 @@ A SimpleITK-based DICOM MPR viewer widget for Tkinter.
 
 ## Features
 
-- **Three-plane MPR display** — Axial (large), Coronal, and Sagittal views in a single widget.
+- **Three-plane MPR display** — Axial (large left), Coronal, and Sagittal views in a single widget.
 - **Blit-based rendering** — ~60 FPS updates via `DrawingManager` background caching.
 - **Observer-pattern state management** — All view state lives in `SliceViewerState`; the widget reacts to changes without polling.
 - **SimpleITK-native coordinates** — Physical LPS coordinates, origin, spacing, and direction cosines are preserved throughout; no manual NumPy axis reordering required.
@@ -12,15 +12,16 @@ A SimpleITK-based DICOM MPR viewer widget for Tkinter.
 - **Window / level adjustment** — Right-click drag: horizontal → window width (WW), vertical → window centre (WL).
 - **RT-STRUCT support** — ROI masks stored in `StructureSet` (keyed by integer ROI number); contour overlay with optional semi-transparent fill; brush tool for mask editing.
 - **Bounding box tool** — Create, move, and resize a bounding box with click-drag interactions.
+- **IsoDose overlay** — RT-DOSE volumes are displayed as isodose fills and contour lines; a DVH panel is available in the `"mpr"` layout mode.
 
 ## Requirements
 
-- Python ≥ 3.11
+- Python ≥ 3.12
 - SimpleITK ≥ 2.3
 - matplotlib ≥ 3.7
 - numpy ≥ 1.24
 - pydicom ≥ 2.4
-- rt-utils>=1.2
+- rt-utils ≥ 1.2
 - scikit-image ≥ 0.21
 - scipy ≥ 1.11
 
@@ -122,6 +123,20 @@ x, y, w, h = state.get_bbox_pixel_coords("axial")
 
 # Clear
 state.set_bounding_box("axial", None)
+```
+
+## Layout modes
+
+The viewer supports two layout modes controlled via `state.set_layout_mode()`:
+
+| Mode | Description |
+|---|---|
+| `"mpr_wide"` | **Default.** Large Axial on the left; Coronal and Sagittal stacked on the right. No DVH panel. |
+| `"mpr"` | 2×2 grid: top row — Axial + DVH panel; bottom row — Coronal + Sagittal. |
+
+```python
+state.set_layout_mode("mpr")   # switch to DVH layout
+state.set_layout_mode("mpr_wide")  # switch back to wide layout
 ```
 
 ## Embedding in a larger application
