@@ -573,6 +573,10 @@ class SliceViewerState:
         subsequent slice updates can read a lightweight pre-cast NumPy array
         instead of performing a ``sitk`` conversion on every frame.
 
+        When *image* is provided, :attr:`blend_alpha` is set to ``0.5`` so
+        that the IsoDose fill (alpha = (1 - blend_alpha) * 0.4) is visible
+        immediately without requiring manual slider adjustment.
+
         Args:
             image: LPS-oriented RT-DOSE ``sitk.Image``, or ``None`` to clear.
         """
@@ -584,6 +588,7 @@ class SliceViewerState:
             resample.SetTransform(sitk.Transform(3, sitk.sitkIdentity))
             resample.SetDefaultPixelValue(0.0)
             self.rt_dose_resampled = resample.Execute(image)
+            self.set_blend_alpha(0.5)
         else:
             self.rt_dose_resampled = None
 

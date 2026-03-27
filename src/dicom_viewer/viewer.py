@@ -306,7 +306,7 @@ class DicomViewer(ttk.Frame):
             for patch in self.contour_patches.get(axis, {}).values():
                 artists_to_hide.append(patch)
             for artist in self.isodose_artists.get(axis, []):
-                artists_to_hide.append(artist)
+                artists_to_hide.extend(self._iter_isodose_collections(artist))
 
         original_vis = {a: a.get_visible() for a in artists_to_hide}
         for a in artists_to_hide:
@@ -392,8 +392,12 @@ class DicomViewer(ttk.Frame):
         ):
             artists.append(self.secondary_img_displays[axis])
         for iso_artist in self.isodose_artists.get(axis, []):
-            if iso_artist.get_visible():
-                artists.append(iso_artist)
+            for coll in self._iter_isodose_collections(iso_artist):
+                try:
+                    if coll.get_visible():
+                        artists.append(coll)
+                except Exception:
+                    artists.append(coll)
         artists.extend(self.contour_patches[axis].values())
         if self.bbox_patches.get(axis) and self.bbox_patches[axis].get_visible():
             artists.append(self.bbox_patches[axis])
@@ -515,11 +519,39 @@ class DicomViewer(ttk.Frame):
     # Dose distributions are spatially smooth so step=2 preserves visual quality.
     _ISODOSE_DOWNSAMPLE_STEP: int = 2
 
-    def _clear_isodose_artists(self, axis: str) -> None:
-        """Remove all isodose artists and reset slice caches for *axis*.
+    @staticmethod
+    def _iter_isodose_collections(artist) -> list:
+        """
+        Return a list of internal collections within a QuadContourSet.
 
-        QuadContourSet.collections was deprecated in matplotlib 3.8 and
-        removed in 3.10; QuadContourSet.remove() is called directly instead.
+        Since QuadContourSet.collections was deprecated and removed in Matplotlib 3.8+,
+        this method determines the internal artist list based on the presence of
+        get_paths() or iterability. For non-QuadContourSet objects (e.g., PathCollection),
+        the artist is wrapped in a list and returned.
+
+        Args:
+            artist: The artist object stored in isodose_artists.
+
+        Returns:
+            A list of Artists on which set_visible or set_alpha can be safely called.
+        """
+        colls = getattr(artist, "collections", None)
+        if colls is not None:
+            return list(colls)
+        try:
+            return list(artist)
+        except TypeError:
+            return [artist]
+
+    def _clear_isodose_artists(self, axis: str) -> None:
+        """
+        Remove all QuadContourSet objects in isodose_artists[axis] and reset the cache.
+
+        Since QuadContourSet.collections was deprecated in Matplotlib 3.8 and
+        removed in 3.10, QuadContourSet.remove() is called directly.
+
+        Args:
+            axis: The name of the target axis.
         """
         for artist in self.isodose_artists.get(axis, []):
             try:
@@ -598,10 +630,11 @@ class DicomViewer(ttk.Frame):
             full_raw = self.state.get_dose_slice_cached(axis)
             if full_raw.size == 0:
                 for artist in self.isodose_artists.get(axis, []):
-                    try:
-                        artist.set_visible(False)
-                    except Exception:
-                        pass
+                    for coll in self._iter_isodose_collections(artist):
+                        try:
+                            coll.set_visible(False)
+                        except Exception:
+                            pass
                 return
             # Zero-copy stride slice for downsampling.
             raw = full_raw[::step, ::step]
@@ -609,10 +642,11 @@ class DicomViewer(ttk.Frame):
 
         if raw.max() <= 0:
             for artist in self.isodose_artists.get(axis, []):
-                try:
-                    artist.set_visible(False)
-                except Exception:
-                    pass
+                for coll in self._iter_isodose_collections(artist):
+                    try:
+                        coll.set_visible(False)
+                    except Exception:
+                        pass
             return
 
         ref_dose = self._get_ref_dose()
@@ -636,21 +670,30 @@ class DicomViewer(ttk.Frame):
         # Determine which isodose levels fall within the current dose range.
         # contourf requires at least 2 levels; a sentinel 0.0 is prepended so
         # the first real level always has a lower bound.
-        active_pairs = [
-            (ref_dose * pct / 100.0, color)
-            for pct, color in self._ISODOSE_LEVELS_PCT
-            if ref_dose * pct / 100.0 <= raw.max()
-        ]
+        # If overridden by `set_isodose_lines()`, the instance variable takes precedence
+        if hasattr(self, "_custom_isodose_levels_gy"):
+            active_pairs = [
+                (gy, color)
+                for gy, color in (self._custom_isodose_levels_gy or [])
+                if gy <= raw.max()
+            ]
+        else:
+            active_pairs = [
+                (ref_dose * pct / 100.0, color)
+                for pct, color in self._ISODOSE_LEVELS_PCT
+                if ref_dose * pct / 100.0 <= raw.max()
+            ]
         if not active_pairs:
             return
 
         levels_gy = [lvl for lvl, _ in active_pairs]
         line_colors = [col for _, col in active_pairs]
 
-        # contourf fill colors: one color per interval (len(levels) - 1).
-        # The sentinel 0.0 adds a "none" interval before the first real level.
-        fill_levels = [0.0] + levels_gy
-        fill_colors = ["none"] + line_colors
+        sentinel_levels = [0.0] + [lvl for lvl, _ in active_pairs]
+        last_color = active_pairs[-1][1]
+        sentinel_colors = (
+            ["none"] + [col for _, col in active_pairs[:-1]] + [last_color]
+        )
 
         new_artists: list = []
 
@@ -659,8 +702,8 @@ class DicomViewer(ttk.Frame):
                 xs,
                 ys,
                 raw,
-                levels=fill_levels,
-                colors=fill_colors,
+                levels=sentinel_levels,
+                colors=sentinel_colors,
                 alpha=fill_alpha,
                 zorder=2,
                 extend="max",
@@ -854,7 +897,8 @@ class DicomViewer(ttk.Frame):
         self.isodose_artists = {axis: [] for axis in AXES}
         self._isodose_rendered_index = {axis: None for axis in AXES}
         self._isodose_slice_cache = {axis: {} for axis in AXES}
-        self._ref_dose_cache = None
+        if hasattr(self, "_custom_isodose_levels_gy"):
+            del self._custom_isodose_levels_gy
         self.crosshairs = {axis: {"h": None, "v": None} for axis in AXES}
         self.bbox_patches = {axis: None for axis in AXES}
         self.contour_patches: dict[str, dict[int, Any]] = {axis: {} for axis in AXES}
@@ -891,11 +935,13 @@ class DicomViewer(ttk.Frame):
             disp = self.secondary_img_displays.get(axis)
             if disp and disp.get_visible():
                 disp.set_alpha(1.0 - alpha)
-            # Update only the contourf artist (index 0) alpha via blit,
-            # keeping contour lines (index 1) at alpha=1.0.
             artists = self.isodose_artists.get(axis, [])
             if artists:
-                artists[0].set_alpha(fill_alpha)
+                for coll in self._iter_isodose_collections(artists[0]):
+                    try:
+                        coll.set_alpha(fill_alpha)
+                    except Exception:
+                        pass
         for axis in AXES:
             self.drawing_manager.add_request(axis)
 
@@ -1027,6 +1073,8 @@ class DicomViewer(ttk.Frame):
                 self._update_isodose_display(axis)
             self.state.refresh_crosshair()
             self._cache_backgrounds()
+            for axis in AXES:
+                self.drawing_manager.add_request(axis)
 
         self._update_dvh_panel()
 
@@ -1103,6 +1151,8 @@ class DicomViewer(ttk.Frame):
             self._update_all_contours()
             self.state.refresh_crosshair()
             self._cache_backgrounds()
+            for axis in AXES:
+                self.drawing_manager.add_request(axis)
         else:
             self.canvas.draw()
 
@@ -1205,6 +1255,36 @@ class DicomViewer(ttk.Frame):
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+    def set_isodose_lines(self, gy_pairs: list[tuple[float, str]]) -> None:
+        """
+        Dynamically update IsoDose line definitions and trigger an immediate redraw.
+
+        This method is intended to be called as a callback from IsoDoseDialog.
+        By overwriting the levels as instance variables, we ensure that changes
+        do not affect other instances of the class.
+
+        Args:
+            gy_pairs: A list of (Gy value, hex color string) tuples.
+                    Must be sorted in ascending order of values.
+                    Passing an empty list will hide all IsoDose lines.
+        """
+        # Overwrite as instance variables to avoid affecting other instances
+        self._custom_isodose_levels_gy: list[tuple[float, str]] | None = (
+            gy_pairs if gy_pairs else []
+        )
+
+        # Invalidate cache for all axes and force a redraw
+        for axis in AXES:
+            self._isodose_rendered_index[axis] = None
+            self._isodose_slice_cache[axis] = {}
+
+        if self.state.rt_dose_resampled is not None:
+            for axis in AXES:
+                self._update_isodose_display(axis)
+            self._cache_backgrounds()
+            for axis in AXES:
+                self.drawing_manager.add_request(axis)
+
     def destroy(self) -> None:
         """Stop the render timer before destroying the widget."""
         self.drawing_manager.timer.stop()
