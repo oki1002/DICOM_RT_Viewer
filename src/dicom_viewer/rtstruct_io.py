@@ -17,6 +17,7 @@ resample_mask_to_original_space(_lps_image, original_image, lps_mask) -> sitk.Im
 
 import logging
 import pathlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, TypedDict
 
 import numpy as np
@@ -25,6 +26,10 @@ import SimpleITK as sitk
 from rt_utils import RTStructBuilder
 
 logger = logging.getLogger(__name__)
+
+# Maximum number of worker threads for parallel ROI mask retrieval.
+# Each ROI can be decoded independently via RTStructBuilder.
+_ROI_LOAD_MAX_WORKERS: int = 8
 
 
 class RoiInfo(TypedDict):
@@ -81,16 +86,19 @@ def load_rt_struct(
 ) -> dict[int, RoiInfo]:
     """Parse an RT-STRUCT file and return ROI masks indexed by ROI number.
 
-    Each ROI mask is transposed from rt-utils' ``(H, W, D)`` convention to
-    ``(D, H, W)`` before being returned.
+    Uses a ``ThreadPoolExecutor`` to fetch each ROI mask in parallel,
+    reducing load time when many ROIs are present.
+
+    Each ROI mask is transposed from the rt-utils ``(H, W, D)`` convention
+    to ``(D, H, W)`` before being returned.
 
     Args:
-        ct_dir: Directory of the CT series that the RT-STRUCT references.
+        ct_dir: Directory of the CT series referenced by the RT-STRUCT file.
         rtstruct_path: Path to the RT-STRUCT DICOM file.
 
     Returns:
-        ``{roi_number: RoiInfo}`` mapping.  Returns an empty dict if the file
-        cannot be read or no ROIs can be decoded.
+        ``{roi_number: RoiInfo}`` mapping.  Returns an empty dict when the
+        file cannot be read or no ROI can be decoded.
     """
     ct_dir = pathlib.Path(ct_dir)
     rtstruct_path = pathlib.Path(rtstruct_path)
@@ -112,10 +120,18 @@ def load_rt_struct(
         roi.ROINumber: roi.ROIName for roi in ds.StructureSetROISequence
     }
 
+    # Build a list of (roi_number, roi_name, color_hex) tuples for each ROI.
+    roi_tasks: list[tuple[int, str, str]] = []
     for roi_contour in ds.ROIContourSequence:
-        roi_number = roi_contour.ReferencedROINumber
+        roi_number = int(roi_contour.ReferencedROINumber)
         roi_name = roi_name_map.get(roi_number, f"ROI_{roi_number}")
+        color_hex = _extract_roi_color(roi_contour)
+        roi_tasks.append((roi_number, roi_name, color_hex))
 
+    def _load_single_roi(
+        roi_number: int, roi_name: str, color_hex: str
+    ) -> tuple[int, RoiInfo] | None:
+        """Fetch the mask for one ROI and return an RoiInfo.  Returns None on failure."""
         try:
             mask = rtstruct.get_roi_mask_by_name(roi_name).astype(bool)
             mask = np.transpose(mask, (2, 0, 1))
@@ -123,15 +139,28 @@ def load_rt_struct(
             logger.warning(
                 f"Could not get mask for ROI '{roi_name}' (ROINumber: {roi_number}): {exc}"
             )
-            continue
+            return None
+        return roi_number, RoiInfo(name=roi_name, mask=mask, color=color_hex)
 
-        color_hex = _extract_roi_color(roi_contour)
-
-        structures[int(roi_number)] = RoiInfo(
-            name=roi_name,
-            mask=mask,
-            color=color_hex,
-        )
+    # Process sequentially when there are only a few ROIs to avoid thread-creation overhead.
+    if len(roi_tasks) <= 2:
+        for roi_number, roi_name, color_hex in roi_tasks:
+            result = _load_single_roi(roi_number, roi_name, color_hex)
+            if result is not None:
+                structures[result[0]] = result[1]
+    else:
+        n_workers = min(_ROI_LOAD_MAX_WORKERS, len(roi_tasks))
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            futures = {
+                executor.submit(
+                    _load_single_roi, roi_number, roi_name, color_hex
+                ): roi_number
+                for roi_number, roi_name, color_hex in roi_tasks
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                if result is not None:
+                    structures[result[0]] = result[1]
 
     logger.info(f"RTSTRUCT loaded: {len(structures)} ROIs.")
     return structures
