@@ -16,6 +16,12 @@ load_all_series(dcm_root_dir) -> dict[str, SeriesInfo]
 
 load_dcm_series(dcm_dir) -> SeriesInfo
     Convenience wrapper for a folder that contains exactly one series.
+
+find_rt_dose_files(folder_path) -> list[pathlib.Path]
+    Return RT-DOSE DICOM files found (non-recursively) in *folder_path*.
+
+load_rt_dose(dose_path) -> sitk.Image
+    Load an RT-DOSE DICOM file and return a ``sitk.Image`` scaled to Gy.
 """
 
 import logging
@@ -26,11 +32,13 @@ from typing import TypedDict
 import numpy as np
 import pydicom
 import SimpleITK as sitk
+from pydicom.errors import InvalidDicomError
 
 logger = logging.getLogger(__name__)
 
 _SPATIAL_REGISTRATION_UID = "1.2.840.10008.5.1.4.1.1.66.1"
 _CT_IMAGE_STORAGE_UID = "1.2.840.10008.5.1.4.1.1.2"
+_RT_DOSE_STORAGE_UID = "1.2.840.10008.5.1.4.1.1.481.2"
 
 
 class SeriesInfo(TypedDict):
@@ -69,12 +77,13 @@ def validate_dicom_files(folder_path: str | pathlib.Path) -> bool:
     folder = pathlib.Path(folder_path)
     series_uids: set[str] = set()
 
-    for file in [f for f in folder.iterdir() if f.is_file()]:
+    for file in (f for f in folder.iterdir() if f.is_file()):
         if not pydicom.misc.is_dicom(file):
             logger.error(f"Non-DICOM file found: {file}")
             return False
 
-        ds = pydicom.dcmread(file)
+        # Skip the pixel data for validation; tag access is all we need.
+        ds = pydicom.dcmread(file, stop_before_pixels=True)
         if ds.SOPClassUID != _CT_IMAGE_STORAGE_UID:
             logger.error(f"File is not a CT image: {file}")
             return False
@@ -111,7 +120,7 @@ def find_reg_matrices(dcm_root_dir: str | pathlib.Path) -> dict[str, np.ndarray]
             continue
         try:
             ds = pydicom.dcmread(str(file), stop_before_pixels=True)
-        except Exception:
+        except InvalidDicomError:
             continue
 
         if (
@@ -144,7 +153,7 @@ def _dir_has_dicom(directory: pathlib.Path) -> bool:
         try:
             pydicom.dcmread(str(f), stop_before_pixels=True)
             return True
-        except Exception:
+        except InvalidDicomError:
             continue
     return False
 
@@ -167,7 +176,7 @@ def _orient_to_lps(image: sitk.Image) -> tuple[sitk.Image, sitk.Image]:
     """Orient *image* to LPS, resampling to axis-aligned grid if rotated.
 
     Returns:
-        ``(lps_image, original_image)``.  When no rotation is present both
+        ``(lps_image, original_image)``. When no rotation is present both
         elements reference the same object.
     """
     original_image = image
@@ -295,10 +304,10 @@ def _build_series_info(
 def load_all_series(dcm_root_dir: str | pathlib.Path) -> dict[str, SeriesInfo]:
     """Load every DICOM series found under *dcm_root_dir*.
 
-    The root directory and all subdirectories are searched.  Each series is
+    The root directory and all subdirectories are searched. Each series is
     keyed by its SeriesDescription (respiratory-phase percentage for 4DCT).
     When the same description appears in multiple series the last one loaded
-    wins.  REG files are parsed and registration transforms attached to
+    wins. REG files are parsed and registration transforms attached to
     matching series.
 
     Args:
@@ -343,9 +352,6 @@ def load_all_series(dcm_root_dir: str | pathlib.Path) -> dict[str, SeriesInfo]:
     return series_dict
 
 
-_RT_DOSE_STORAGE_UID = "1.2.840.10008.5.1.4.1.1.481.2"
-
-
 def find_rt_dose_files(folder_path: str | pathlib.Path) -> list[pathlib.Path]:
     """Return RT-DOSE DICOM files found (non-recursively) in *folder_path*.
 
@@ -362,10 +368,10 @@ def find_rt_dose_files(folder_path: str | pathlib.Path) -> list[pathlib.Path]:
             continue
         try:
             ds = pydicom.dcmread(str(f), stop_before_pixels=True)
-            if getattr(ds, "Modality", "").strip() == "RTDOSE":
-                rt_dose_files.append(f)
-        except Exception:
+        except InvalidDicomError:
             continue
+        if getattr(ds, "Modality", "").strip() == "RTDOSE":
+            rt_dose_files.append(f)
     return rt_dose_files
 
 
@@ -420,5 +426,5 @@ def load_dcm_series(dcm_dir: str | pathlib.Path) -> SeriesInfo:
             f"Expected exactly one DICOM series in '{dcm_dir}', "
             f"but found {len(series_dict)}."
         )
-    # Use next(iter(...)) rather than popitem() to make the intent explicit.
+    # next(iter(...)) makes the "one element" intent explicit vs. popitem().
     return next(iter(series_dict.values()))

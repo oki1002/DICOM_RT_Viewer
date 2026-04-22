@@ -15,6 +15,17 @@ if TYPE_CHECKING:
     from ..viewer_state import SliceViewerState
 
 
+# Per-view mapping of (drag direction) -> (target axis, event-coord attribute).
+# Used to translate a drag into one or two slice-index updates.
+#     "v" = vertical crosshair line   (drag left/right, uses event.xdata)
+#     "h" = horizontal crosshair line (drag up/down,    uses event.ydata)
+_DRAG_TARGETS: dict[str, dict[str, tuple[str, str]]] = {
+    "axial": {"v": ("sagittal", "xdata"), "h": ("coronal", "ydata")},
+    "coronal": {"v": ("sagittal", "xdata"), "h": ("axial", "ydata")},
+    "sagittal": {"v": ("coronal", "xdata"), "h": ("axial", "ydata")},
+}
+
+
 class CrosshairEventHandler:
     """Handle mouse interactions with the crosshair overlay."""
 
@@ -29,9 +40,6 @@ class CrosshairEventHandler:
         self._drag_target: str | None = None  # "h" | "v" | "cross"
         self._active_axis: str | None = None
 
-    # ------------------------------------------------------------------
-    # Public interface
-    # ------------------------------------------------------------------
     @property
     def is_dragging(self) -> bool:
         """``True`` while a crosshair drag is in progress."""
@@ -41,7 +49,7 @@ class CrosshairEventHandler:
         """Detect a click on the crosshair and begin a drag.
 
         A click is considered "on" the crosshair when the cursor is within
-        5 pixels of a crosshair line in display (pixel) coordinates.
+        ``TOLERANCE_PIXELS`` pixels of a crosshair line in display coordinates.
 
         Returns:
             ``True`` if a crosshair drag was initiated; ``False`` otherwise.
@@ -86,28 +94,23 @@ class CrosshairEventHandler:
         if not (axis and event.xdata is not None and event.ydata is not None):
             return
 
-        # Mapping of (view, direction) -> (target_axis, physical_coord)
-        actions = {
-            "axial": {"v": ("sagittal", event.xdata), "h": ("coronal", event.ydata)},
-            "coronal": {"v": ("sagittal", event.xdata), "h": ("axial", event.ydata)},
-            "sagittal": {"v": ("coronal", event.xdata), "h": ("axial", event.ydata)},
-        }
-
-        targets = []
+        actions = _DRAG_TARGETS.get(axis, {})
         if self._drag_target == "cross":
-            targets = list(actions.get(axis, {}).values())
+            targets = list(actions.values())
         elif self._drag_target in ("v", "h"):
-            action = actions.get(axis, {}).get(self._drag_target)
-            if action:
-                targets = [action]
+            action = actions.get(self._drag_target)
+            targets = [action] if action else []
+        else:
+            targets = []
 
         # Batch-update all affected indices before triggering a single crosshair recompute.
-        for target_axis, coord in targets:
+        for target_axis, coord_attr in targets:
+            coord = getattr(event, coord_attr)
             idx = self.state.physical_to_index(target_axis, coord)
             self.state.set_index(target_axis, idx, update_crosshair=False)
 
         if targets:
-            self.state._update_crosshair_by_index()
+            self.state.update_crosshair_by_index()
 
     def handle_release(self, event) -> None:
         """End the crosshair drag on left-button release."""

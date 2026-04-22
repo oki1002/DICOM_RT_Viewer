@@ -3,8 +3,8 @@
 Public API
 ----------
 load_rt_struct(ct_dir, rtstruct_path) -> dict[int, RoiInfo]
-    Parse an RT-STRUCT file and return a mapping of ROI number to mask and
-    display metadata.
+    Parse an RT-STRUCT file and return a mapping of ROI number to mask
+    and display metadata.
 
 mask2rtstruct(ct_dir, rtss_path, structures) -> None
     Convert NumPy mask arrays to an RT-STRUCT DICOM file, creating or
@@ -29,7 +29,15 @@ logger = logging.getLogger(__name__)
 
 # Maximum number of worker threads for parallel ROI mask retrieval.
 # Each ROI can be decoded independently via RTStructBuilder.
+# NOTE: rt-utils does not document thread safety; this parallelism relies on
+# each call constructing independent intermediate NumPy arrays. If any
+# thread-related issues surface, reduce this constant to 1.
 _ROI_LOAD_MAX_WORKERS: int = 8
+
+# Module-level RNG reused for random fallback colours. Allocating a fresh
+# RNG per ROI (as the previous implementation did) has noticeable overhead
+# for structures with many ROIs.
+_COLOR_RNG: np.random.Generator = np.random.default_rng()
 
 
 class RoiInfo(TypedDict):
@@ -55,14 +63,15 @@ def resample_mask_to_original_space(
 ) -> sitk.Image:
     """Resample *lps_mask* from the LPS-aligned space back to *original_image* space.
 
-    This is required before writing an RT-STRUCT when the CT was reoriented
-    during loading: the mask is in LPS coordinates but the RT-STRUCT must
+    Required before writing an RT-STRUCT when the CT was reoriented during
+    loading: the mask is in LPS coordinates but the RT-STRUCT must
     reference the original DICOM geometry.
 
     Args:
-        _lps_image: LPS-aligned CT image.  Reserved for API symmetry; not used
-            in the current implementation.
-        original_image: Original CT image before LPS alignment (resampling target).
+        _lps_image: LPS-aligned CT image. Reserved for API symmetry; not
+            used in the current implementation.
+        original_image: Original CT image before LPS alignment (resampling
+            target).
         lps_mask: Binary mask in LPS coordinate space.
 
     Returns:
@@ -97,7 +106,7 @@ def load_rt_struct(
         rtstruct_path: Path to the RT-STRUCT DICOM file.
 
     Returns:
-        ``{roi_number: RoiInfo}`` mapping.  Returns an empty dict when the
+        ``{roi_number: RoiInfo}`` mapping. Returns an empty dict when the
         file cannot be read or no ROI can be decoded.
     """
     ct_dir = pathlib.Path(ct_dir)
@@ -128,10 +137,14 @@ def load_rt_struct(
         color_hex = _extract_roi_color(roi_contour)
         roi_tasks.append((roi_number, roi_name, color_hex))
 
+    if not roi_tasks:
+        logger.info("RTSTRUCT contains no ROI entries.")
+        return structures
+
     def _load_single_roi(
         roi_number: int, roi_name: str, color_hex: str
     ) -> tuple[int, RoiInfo] | None:
-        """Fetch the mask for one ROI and return an RoiInfo.  Returns None on failure."""
+        """Fetch the mask for one ROI; return None on failure."""
         try:
             mask = rtstruct.get_roi_mask_by_name(roi_name).astype(bool)
             mask = np.transpose(mask, (2, 0, 1))
@@ -142,25 +155,13 @@ def load_rt_struct(
             return None
         return roi_number, RoiInfo(name=roi_name, mask=mask, color=color_hex)
 
-    # Process sequentially when there are only a few ROIs to avoid thread-creation overhead.
-    if len(roi_tasks) <= 2:
-        for roi_number, roi_name, color_hex in roi_tasks:
-            result = _load_single_roi(roi_number, roi_name, color_hex)
+    n_workers = min(_ROI_LOAD_MAX_WORKERS, len(roi_tasks))
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        futures = [executor.submit(_load_single_roi, *task) for task in roi_tasks]
+        for future in as_completed(futures):
+            result = future.result()
             if result is not None:
                 structures[result[0]] = result[1]
-    else:
-        n_workers = min(_ROI_LOAD_MAX_WORKERS, len(roi_tasks))
-        with ThreadPoolExecutor(max_workers=n_workers) as executor:
-            futures = {
-                executor.submit(
-                    _load_single_roi, roi_number, roi_name, color_hex
-                ): roi_number
-                for roi_number, roi_name, color_hex in roi_tasks
-            }
-            for future in as_completed(futures):
-                result = future.result()
-                if result is not None:
-                    structures[result[0]] = result[1]
 
     logger.info(f"RTSTRUCT loaded: {len(structures)} ROIs.")
     return structures
@@ -174,7 +175,7 @@ def _extract_roi_color(roi_contour: Any) -> str:
     if hasattr(roi_contour, "ROIDisplayColor"):
         r, g, b = (int(c) for c in roi_contour.ROIDisplayColor)
     else:
-        r, g, b = (int(c * 255) for c in np.random.default_rng().random(3))
+        r, g, b = (int(c * 255) for c in _COLOR_RNG.random(3))
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
@@ -188,14 +189,13 @@ def mask2rtstruct(
 ) -> None:
     """Write mask arrays to an RT-STRUCT DICOM file.
 
-    When *rtss_path* already exists the file is updated in place; otherwise a
-    new RT-STRUCT is created.  Mask arrays must have shape ``(D, H, W)`` and
-    are transposed to rt-utils' expected ``(H, W, D)`` convention internally.
+    When *rtss_path* already exists the file is updated in place;
+    otherwise a new RT-STRUCT is created. Mask arrays must have shape
+    ``(D, H, W)`` and are transposed to rt-utils' expected ``(H, W, D)``
+    convention internally.
 
     Note:
-        *rtss_path* must not be ``None``.  Passing ``None`` will cause
-        ``rtstruct.save()`` to receive the string ``"None"`` as the path,
-        which is almost certainly unintended.  Callers are responsible for
+        *rtss_path* must not be ``None``. Callers are responsible for
         resolving a concrete output path before calling this function.
 
     Args:

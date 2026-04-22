@@ -7,7 +7,7 @@ A SimpleITK-based DICOM MPR viewer widget for Tkinter.
 - **Three-plane MPR display** — Axial (large left), Coronal, and Sagittal views in a single widget.
 - **Blit-based rendering** — ~60 FPS updates via `DrawingManager` background caching.
 - **Observer-pattern state management** — All view state lives in `SliceViewerState`; the widget reacts to changes without polling.
-- **SimpleITK-native coordinates** — Physical LPS coordinates, origin, spacing, and direction cosines are preserved throughout; no manual NumPy axis reordering required.
+- **SimpleITK-native coordinates** — Physical LPS coordinates, origin, spacing, and direction cosines are preserved throughout; axis reordering between SimpleITK and NumPy conventions is handled internally by the library.
 - **Interactive navigation** — Crosshair drag, mouse wheel, and keyboard (↑ / ↓ / PageUp / PageDown).
 - **Window / level adjustment** — Right-click drag: horizontal → window width (WW), vertical → window centre (WL).
 - **RT-STRUCT support** — ROI masks stored in `StructureSet` (keyed by integer ROI number); contour overlay with optional semi-transparent fill; brush tool for mask editing.
@@ -33,6 +33,23 @@ Install directly from source (editable mode — changes take effect immediately)
 git clone https://github.com/yourname/dicom-viewer.git
 cd dicom-viewer
 pip install -e .
+```
+
+## Package structure
+
+```
+dicom_viewer/
+├── __init__.py
+├── viewer.py             # DicomViewer widget, DrawingManager
+├── viewer_state.py       # SliceViewerState, StructureSet
+├── io.py                 # DICOM series loading utilities
+├── rtstruct_io.py        # RT-STRUCT read / write utilities
+├── roi_operations.py     # Interpolation, margin, smoothing, boolean ops
+└── event_controllers/
+    ├── viewer_events.py      # ViewerEventHandler (top-level dispatcher)
+    ├── crosshair_handler.py
+    ├── brush_handler.py
+    └── bbox_handler.py
 ```
 
 ## Quick start
@@ -84,7 +101,7 @@ import SimpleITK as sitk
 roi_number = state.add_contour("PTV", mask_sitk_image, color="#ff4444")
 
 # Choose which ROIs to display (pass a set of ROI numbers)
-state.set_active_contours({roi_number})
+state.set_active_contours({roi_number})  # argument is a set[int]
 
 # Toggle filled overlay (semi-transparent)
 state.set_overlay_contours(True)
@@ -115,10 +132,11 @@ state.set_brush_tool_active(False)
 ## Bounding box
 
 ```python
-# Set a bounding box programmatically (physical coords: x_min, y_min, w, h)
+# Set a bounding box programmatically (physical LPS coords: x_min, y_min, w, h)
 state.set_bounding_box("axial", (x_min, y_min, width, height))
 
-# Retrieve as pixel indices (works for any view axis)
+# Retrieve as pixel indices — note that set_bounding_box accepts physical
+# coordinates while get_bbox_pixel_coords returns pixel indices.
 x, y, w, h = state.get_bbox_pixel_coords("axial")
 
 # Clear
@@ -135,7 +153,7 @@ The viewer supports two layout modes controlled via `state.set_layout_mode()`:
 | `"mpr"` | 2×2 grid: top row — Axial + DVH panel; bottom row — Coronal + Sagittal. |
 
 ```python
-state.set_layout_mode("mpr")   # switch to DVH layout
+state.set_layout_mode("mpr")       # switch to DVH layout
 state.set_layout_mode("mpr_wide")  # switch back to wide layout
 ```
 

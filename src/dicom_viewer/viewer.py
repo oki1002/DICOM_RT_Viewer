@@ -18,7 +18,7 @@ Window / level adjustment:
 Secondary image & blend:
     When a secondary image is loaded (e.g. a 4DCT phase or MAR-corrected
     volume), it is displayed as a semi-transparent overlay controlled by a
-    blend slider embedded below the canvas.  The slider maps to
+    blend slider embedded below the canvas. The slider maps to
     SliceViewerState.blend_alpha (1.0 = primary only, 0.0 = secondary only).
     The slider is hidden when no secondary image is loaded.
 
@@ -46,18 +46,14 @@ Performance optimisations:
 
     3. Dmax reference dose
        _get_ref_dose computes Dmax from the original (pre-resampled) RT-DOSE
-       image and caches the result in _ref_dose_cache.  This ensures the
+       image and caches the result in _ref_dose_cache. This ensures the
        isodose 100% reference matches the value shown in any application
        dialog that also derives Dmax from the original image.
 
-    4. Debounced _schedule_cache_backgrounds (50 ms delay, axis-aware)
+    4. Debounced _schedule_cache_backgrounds (150 ms delay, axis-aware)
        _schedule_cache_backgrounds(axis) accumulates changed axes and
-       rebuilds only those axes when _cache_backgrounds runs 50 ms later.
+       rebuilds only those axes when _cache_backgrounds runs 150 ms later.
        Pass axis=None to force a full rebuild.
-       The 50 ms delay is intentionally longer than the DrawingManager timer
-       interval (16 ms) so that drawing_manager.add_request calls triggered
-       by crosshair_changed are processed before the background cache is
-       rebuilt, preventing stale-background flicker.
 
     5. IsoDose same-slice skip
        _update_isodose_display tracks the last rendered slice index per axis
@@ -65,27 +61,28 @@ Performance optimisations:
        not changed, eliminating redundant contourf/contour calculations.
 
     6. Cached ref_dose
-       The np.percentile calculation in _get_ref_dose is performed once when
-       the RT-DOSE volume is loaded and stored in _ref_dose_cache.
-       Subsequent scroll events only read the cached value.
+       The np.max calculation in _get_ref_dose is performed once when the
+       RT-DOSE volume is loaded and stored in _ref_dose_cache. Subsequent
+       scroll events only read the cached value.
 
-    7. Crosshair blit guard
-       _on_crosshair_changed suppresses drawing_manager.add_request while
-       _cache_pending is True (i.e. while a deferred background cache rebuild
-       is scheduled), preventing unnecessary blits against a stale background.
-
-    8. DVH dose array reuse
+    7. DVH dose array reuse
        _update_dvh_panel reads from state.dose_array_cache["axial"] instead
        of calling sitk.GetArrayFromImage on every update.
 
-    9. IsoDose downsample (_ISODOSE_DOWNSAMPLE_STEP)
+    8. IsoDose downsample (_ISODOSE_DOWNSAMPLE_STEP)
        The dose slice is stride-sliced by _ISODOSE_DOWNSAMPLE_STEP (zero-copy)
-       before being passed to contourf/contour.  step=2 reduces the pixel
+       before being passed to contourf/contour. step=2 reduces the pixel
        count to 1/4 and computation time to approximately 1/5
        (measured: 512x512 ~757 ms -> 256x256 ~152 ms).
        Dose distributions are spatially smooth so visual quality is preserved
-       at step=2.  The downsampled slice is cached in _isodose_slice_cache
+       at step=2. The downsampled slice is cached in _isodose_slice_cache
        to avoid recomputation on revisited slices.
+
+    9. Blit artist cache
+       _build_blit_artists is called only when the artist composition
+       changes; scroll events reuse the cached list. Invalidated via
+       _invalidate_blit_cache whenever an artist is created, removed, or
+       toggled visible.
 """
 
 import collections
@@ -102,10 +99,9 @@ from matplotlib.colors import to_rgba
 from matplotlib.figure import Figure
 from matplotlib.patches import PathPatch, Rectangle
 from matplotlib.path import Path
-from skimage.measure import find_contours
 
 from .event_controllers.viewer_events import ViewerEventHandler
-from .viewer_state import AXES, SliceViewerState
+from .viewer_state import AXES, SliceViewerState, _mask_slice_to_paths
 
 logger = logging.getLogger(__name__)
 
@@ -116,9 +112,9 @@ logger = logging.getLogger(__name__)
 class DrawingManager:
     """Throttled redraw manager for blit-based rendering.
 
-    Normally operates at 16 ms (≈60 FPS).  When the queue builds up
-    faster than it can be drained the timer interval is shortened to
-    catch up; it is restored to 16 ms once the queue is empty.
+    Normally operates at 16 ms (≈60 FPS). When the queue builds up faster
+    than it can be drained the timer interval is shortened to catch up;
+    it is restored to 16 ms once the queue is empty.
 
     Adaptive timer strategy:
         - Requests remain after processing → shorten interval to 8 ms
@@ -126,10 +122,8 @@ class DrawingManager:
         - Queue is empty → restore interval to 16 ms to reduce CPU load.
     """
 
-    #: Timer interval during normal operation (ms) — ≈60 FPS
-    _INTERVAL_NORMAL_MS: int = 16
-    #: Timer interval when the queue is backlogged (ms) — catch-up mode
-    _INTERVAL_FAST_MS: int = 8
+    _INTERVAL_NORMAL_MS: int = 16  # ≈60 FPS
+    _INTERVAL_FAST_MS: int = 8  # catch-up mode
 
     def __init__(self, viewer: "DicomViewer") -> None:
         self.viewer = viewer
@@ -140,12 +134,13 @@ class DrawingManager:
         self.timer.start()
 
     def add_request(self, axis: str) -> None:
+        """Queue a blit redraw for *axis*."""
         if axis and axis in self.viewer.axs:
             self.request_queue.append(axis)
 
     def process_queue(self) -> None:
+        """Drain the queue, rendering each requested axis once."""
         if not self.request_queue:
-            # Queue is empty; restore the normal interval.
             self._set_interval(self._INTERVAL_NORMAL_MS)
             return
         # Deduplicate while preserving insertion order (Python 3.7+).
@@ -159,12 +154,18 @@ class DrawingManager:
         else:
             self._set_interval(self._INTERVAL_NORMAL_MS)
 
-    def _set_interval(self, interval_ms: int) -> None:
-        """Restart the timer only when the interval actually changes to minimise overhead.
+    def flush(self) -> None:
+        """Immediately drain the request queue without waiting for the timer.
 
-        Args:
-            interval_ms: New timer interval in milliseconds.
+        Called from interactive paths (e.g. scroll commit) to eliminate the
+        up-to-16-ms latency between enqueuing a redraw request and the next
+        timer tick. Safe to call on the main thread only.
         """
+        if self.request_queue:
+            self.process_queue()
+
+    def _set_interval(self, interval_ms: int) -> None:
+        """Restart the timer only when the interval actually changes."""
         if self._current_interval == interval_ms:
             return
         self._current_interval = interval_ms
@@ -190,6 +191,32 @@ class DicomViewer(ttk.Frame):
         viewer.pack(fill="both", expand=True)
         viewer.load_ct("/path/to/dicom")
     """
+
+    # IsoDose level definitions: (percentage, colour from red to blue).
+    # Listed from lowest to highest so contourf fills in the correct order.
+    _ISODOSE_LEVELS_PCT: list[tuple[int, str]] = [
+        (30, "#0000cc"),
+        (50, "#0066ff"),
+        (70, "#00cccc"),
+        (80, "#00cc00"),
+        (90, "#ffcc00"),
+        (95, "#ff6600"),
+        (100, "#ff0000"),
+    ]
+
+    # Stride used to downsample the dose slice before contourf/contour.
+    # step=1: full resolution (highest quality, slowest)
+    # step=2: 1/4 pixel count -> ~1/5 computation time (recommended)
+    # step=4: 1/16 pixel count -> ~1/20 computation time
+    # Dose distributions are spatially smooth so step=2 preserves visual quality.
+    _ISODOSE_DOWNSAMPLE_STEP: int = 2
+
+    # Idle time (ms) before the background cache is rebuilt after scrolling stops.
+    # canvas.draw() is suppressed as long as scroll events arrive within this window.
+    # Must comfortably exceed the scroll debounce window in viewer_events.py so that
+    # the rebuild only fires after the user has fully stopped interacting; otherwise
+    # a heavy canvas.draw() can land mid-scroll and cause a visible stall.
+    _CACHE_REBUILD_IDLE_MS: int = 150
 
     def __init__(
         self,
@@ -229,20 +256,23 @@ class DicomViewer(ttk.Frame):
         )
         self.blend_slider.set(self.state.blend_alpha)
         self.blend_slider.pack(side=tk.LEFT, padx=5)
-        self._blend_frame.pack_forget()  # hidden by default
+        self._blend_frame.pack_forget()
 
         # DrawingManager must be created after the Figure exists.
         self.drawing_manager = DrawingManager(self)
 
-        # True while a deferred background cache rebuild is scheduled but not yet executed.
+        # Deferred background-cache state.
         self._cache_pending: bool = False
-        # Axes to rebuild on the next _cache_backgrounds call.  None means all axes.
         self._cache_pending_axes: set[str] | None = None
+        self._cache_rebuild_after_id: str | None = None
+
+        # Custom isodose override set by set_isodose_lines(); None = use defaults.
+        self._custom_isodose_levels_gy: list[tuple[float, str]] | None = None
 
         # --- Layout ---
         self._dvh_ax: Any = None
         self._layout_mode: str = "mpr_wide"
-        self.axs: dict[str, Any] = {}  # populated by _setup_axes
+        self.axs: dict[str, Any] = {}
         self._setup_axes("mpr_wide")
 
         # --- Artist containers ---
@@ -255,10 +285,8 @@ class DicomViewer(ttk.Frame):
         }
         self.bbox_patches: dict[str, Any] = {axis: None for axis in AXES}
         self.contour_patches: dict[str, dict[int, Any]] = {axis: {} for axis in AXES}
-        # List of QuadContourSet artists per axis for isodose lines/fills.
         # contourf and contour each return a QuadContourSet, so a list is used.
         self.isodose_artists: dict[str, list] = {axis: [] for axis in AXES}
-        # Tracks the slice index last rendered per axis to skip redundant redraws.
         self._isodose_rendered_index: dict[str, int | None] = {
             axis: None for axis in AXES
         }
@@ -269,20 +297,14 @@ class DicomViewer(ttk.Frame):
             axis: {} for axis in AXES
         }
         # Cached 100% reference dose (Gy) pre-computed on RT-DOSE load.
-        # Avoids np.percentile calls during scrolling.
         self._ref_dose_cache: float | None = None
 
         # Same-slice early-exit: record the last rendered slice index per axis.
-        # Checked at the top of _on_index_changed to skip redundant redraws.
-        # Reset inside _reset_artists on image switch.
         self._last_rendered_index: dict[str, int] = {axis: -1 for axis in AXES}
 
         # Blit-layer artist cache: { axis: list[Artist] }
-        # Avoids rebuilding the artist list on every frame in _redraw_axis_blit.
-        # Invalidate with _invalidate_blit_cache(axis) whenever any of
-        # img_displays, secondary_img_displays, isodose_artists,
-        # contour_patches, bbox_patches, or crosshairs changes.
-        # brush_circle is appended dynamically each frame and excluded from the cache.
+        # Avoids rebuilding the artist list on every frame. brush_circle is
+        # appended dynamically each frame and excluded from the cache.
         self._blit_artists_cache: dict[str, list | None] = {axis: None for axis in AXES}
 
         # --- Event handling ---
@@ -329,6 +351,28 @@ class DicomViewer(ttk.Frame):
         s.add_listener("contour_cache_built", self._on_contour_cache_built)
 
     # ------------------------------------------------------------------
+    # Shared helpers
+    # ------------------------------------------------------------------
+    def _has_valid_primary_image(self) -> bool:
+        """Return ``True`` if a non-empty primary image is loaded."""
+        img = self.state.primary_image
+        return img is not None and img.GetNumberOfPixels() > 0
+
+    def _should_show_blend_slider(self) -> bool:
+        """Return ``True`` if either a secondary image or RT-DOSE is loaded."""
+        return (
+            self.state.secondary_image is not None
+            or self.state.rt_dose_image is not None
+        )
+
+    def _update_blend_slider_visibility(self) -> None:
+        """Show or hide the blend-slider frame based on current state."""
+        if self._should_show_blend_slider():
+            self._blend_frame.pack(side=tk.BOTTOM, pady=5)
+        else:
+            self._blend_frame.pack_forget()
+
+    # ------------------------------------------------------------------
     # Blit artists cache
     # ------------------------------------------------------------------
     def _invalidate_blit_cache(self, axis: str) -> None:
@@ -337,17 +381,11 @@ class DicomViewer(ttk.Frame):
         Call immediately after any change to img_displays,
         secondary_img_displays, isodose_artists, contour_patches,
         bbox_patches, or crosshairs.
-
-        Args:
-            axis: Name of the axis whose cache should be cleared.
         """
         self._blit_artists_cache[axis] = None
 
     def _invalidate_blit_cache_all(self) -> None:
-        """Invalidate the blit artist cache for all axes.
-
-        Call after operations that affect every axis, such as _reset_artists.
-        """
+        """Invalidate the blit artist cache for all axes."""
         for axis in AXES:
             self._blit_artists_cache[axis] = None
 
@@ -358,15 +396,14 @@ class DicomViewer(ttk.Frame):
         """Cache the background bitmap for each axis.
 
         Args:
-            axes_filter: Set of axis names to rebuild.  When ``None`` all axes
-                are rebuilt.  Specifying only changed axes avoids invalidating
+            axes_filter: Set of axis names to rebuild. When ``None`` all axes
+                are rebuilt. Specifying only changed axes avoids invalidating
                 cached backgrounds for unchanged views.
 
         Note:
             canvas.draw() is always called for all axes because Matplotlib
-            does not support per-axis rendering.  axes_filter only limits
+            does not support per-axis rendering. axes_filter only limits
             which bitmaps are stored after the draw.
-            Per-axis draw is a future optimisation.
         """
         target_axes = set(axes_filter) if axes_filter else set(AXES)
         artists_to_hide = []
@@ -398,16 +435,11 @@ class DicomViewer(ttk.Frame):
         for axis in AXES:
             self.drawing_manager.add_request(axis)
 
-    # Idle time (ms) before the background cache is rebuilt after scrolling stops.
-    # canvas.draw() is suppressed as long as scroll events arrive within this window.
-    # 50 ms is roughly half the typical interval between scroll steps (~100 ms).
-    _CACHE_REBUILD_IDLE_MS: int = 50
-
     def _schedule_cache_backgrounds(self, axis: str | None = None) -> None:
         """Defer the background cache rebuild until scrolling stops.
 
         Suppresses canvas.draw() during continuous scrolling to reduce
-        rendering overhead.  The rebuild is executed only after no new
+        rendering overhead. The rebuild is executed only after no new
         scroll events have arrived for ``_CACHE_REBUILD_IDLE_MS`` ms.
 
         When a rebuild is already pending, the timer is reset (cancelled
@@ -415,7 +447,7 @@ class DicomViewer(ttk.Frame):
         scrolling stops.
 
         Args:
-            axis: Axis to rebuild.  Pass ``None`` to rebuild all axes.
+            axis: Axis to rebuild. Pass ``None`` to rebuild all axes.
         """
         # Update the set of axes to rebuild.
         if axis is None:
@@ -424,18 +456,14 @@ class DicomViewer(ttk.Frame):
             self._cache_pending_axes = {axis}
         elif self._cache_pending_axes is not None:
             self._cache_pending_axes.add(axis)
-        # else: full rebuild already pending — nothing to add
+        # else: full rebuild already pending — nothing to add.
 
-        # Cancel and reschedule to reset the debounce window during continuous scrolling.
-        if self._cache_pending:
-            if (
-                hasattr(self, "_cache_rebuild_after_id")
-                and self._cache_rebuild_after_id
-            ):
-                try:
-                    self.after_cancel(self._cache_rebuild_after_id)
-                except Exception:
-                    pass
+        # Cancel and reschedule to reset the debounce window during scrolling.
+        if self._cache_pending and self._cache_rebuild_after_id:
+            try:
+                self.after_cancel(self._cache_rebuild_after_id)
+            except Exception:
+                pass
         self._cache_pending = True
         self._cache_rebuild_after_id = self.after(
             self._CACHE_REBUILD_IDLE_MS, self._do_cache_backgrounds
@@ -443,7 +471,7 @@ class DicomViewer(ttk.Frame):
 
     def _do_cache_backgrounds(self) -> None:
         """Execute the deferred background cache rebuild after scrolling stops."""
-        axes_filter = getattr(self, "_cache_pending_axes", None)
+        axes_filter = self._cache_pending_axes
         self._cache_pending = False
         self._cache_pending_axes = None
         self._cache_rebuild_after_id = None
@@ -468,15 +496,14 @@ class DicomViewer(ttk.Frame):
 
         self.canvas.restore_region(self._backgrounds[axis])
 
-        # Reuse the cached artist list when valid.
-        # brush_circle changes position every frame so it is appended dynamically.
+        # Reuse the cached artist list when valid; brush_circle is appended
+        # dynamically because its position changes every frame.
         cached = self._blit_artists_cache.get(axis)
         if cached is None:
             cached = self._build_blit_artists(axis)
             self._blit_artists_cache[axis] = cached
 
         artists = cached
-
         brush_circle = getattr(self.event_handler.brush_handler, "brush_circle", None)
         if brush_circle and brush_circle.axes == self.axs[axis]:
             artists = cached + [brush_circle]
@@ -486,17 +513,11 @@ class DicomViewer(ttk.Frame):
         self.canvas.blit(self.axs[axis].bbox)
 
     def _build_blit_artists(self, axis: str) -> list:
-        """Build and return the list of artists to draw in the blit layer for *axis*.
+        """Build the list of artists to draw in the blit layer for *axis*.
 
-        Collects all artists except brush_circle (which is appended dynamically).
-        The return value is stored in ``_blit_artists_cache[axis]`` and reused
-        until the artist composition changes.
-
-        Args:
-            axis: Target axis name.
-
-        Returns:
-            List of artists to pass to draw_artist.
+        Collects all artists except brush_circle (which is appended
+        dynamically). The return value is cached until the artist
+        composition changes.
         """
         artists: list = []
         if self.img_displays.get(axis):
@@ -525,8 +546,7 @@ class DicomViewer(ttk.Frame):
     # Slice display
     # ------------------------------------------------------------------
     def _update_slice_display(self, axis: str) -> None:
-        # Same strategy as dose_array_cache: retrieve slices from the pre-built
-        # cache to avoid sitk.GetArrayViewFromImage calls during scrolling.
+        """Update the primary (and secondary) image artist for *axis*."""
         primary_data = self.state.get_primary_slice_cached(axis)
         secondary_data = self.state.get_secondary_slice_cached(axis)
 
@@ -543,14 +563,10 @@ class DicomViewer(ttk.Frame):
 
         # coronal/sagittal: increasing row index = increasing z (inferior -> superior).
         # With origin="lower", large-z (superior) naturally appears at the top.
-        # Pass extent as-is and set ylim so that small-z (inferior) is at the bottom.
-        #
-        # axial: x-y plane. With origin="lower", large-y (anterior) would be at the top,
-        # which matches the radiological convention — but we invert ylim explicitly to
-        # make the intent clear and guard against future extent changes.
+        # axial: invert ylim so anterior (large-y) is at top (radiological convention).
         if axis in ("coronal", "sagittal"):
             y_bottom, y_top = extent[2], extent[3]
-        else:  # axial: invert y so anterior (large-y) is at top
+        else:
             y_bottom, y_top = extent[3], extent[2]
 
         if self.img_displays[axis] is None:
@@ -566,16 +582,14 @@ class DicomViewer(ttk.Frame):
             self.axs[axis].set_xlim(extent[0], extent[1])
             self.axs[axis].set_ylim(y_bottom, y_top)
             self.axs[axis].set_aspect("equal", adjustable="box")
-            # A new Artist object was created; invalidate the cache.
             self._invalidate_blit_cache(axis)
         else:
             disp = self.img_displays[axis]
             disp.set_data(primary_data)
-            # extent and clim do not change during scrolling; update only on diff.
+            # extent and clim are stable during scrolling; update only on diff.
             if disp.get_extent() != extent:
                 disp.set_extent(extent)
-            cur_clim = disp.get_clim()
-            if cur_clim[0] != clim[0] or cur_clim[1] != clim[1]:
+            if disp.get_clim() != clim:
                 disp.set_clim(clim)
 
         self._update_secondary_display(axis, secondary_data, clim, extent)
@@ -594,75 +608,57 @@ class DicomViewer(ttk.Frame):
             self.state.secondary_clim if self.state.secondary_clim is not None else clim
         )
         alpha = 1.0 - self.state.blend_alpha
-        if secondary_data.size > 0:
+
+        if secondary_data.size == 0:
             disp = self.secondary_img_displays[axis]
-            if disp is None:
-                self.secondary_img_displays[axis] = self.axs[axis].imshow(
-                    secondary_data,
-                    cmap=self.state.secondary_image_cmap,
-                    origin="lower",
-                    vmin=effective_clim[0],
-                    vmax=effective_clim[1],
-                    extent=extent,
-                    interpolation="bilinear",
-                    alpha=alpha,
-                )
-                # A new Artist object was created; invalidate the cache.
+            if disp and disp.get_visible():
+                disp.set_visible(False)
                 self._invalidate_blit_cache(axis)
-            else:
-                disp.set_data(secondary_data)
-                # extent does not change during scrolling; update only on diff.
-                if disp.get_extent() != extent:
-                    disp.set_extent(extent)
-                cur_clim = disp.get_clim()
-                if cur_clim[0] != effective_clim[0] or cur_clim[1] != effective_clim[1]:
-                    disp.set_clim(effective_clim)
-                disp.set_alpha(alpha)
-                disp.set_cmap(self.state.secondary_image_cmap)
-            if not self.secondary_img_displays[axis].get_visible():
-                self.secondary_img_displays[axis].set_visible(True)
-                # Visibility flag changed; invalidate the cache.
-                self._invalidate_blit_cache(axis)
-        elif self.secondary_img_displays[axis]:
-            if self.secondary_img_displays[axis].get_visible():
-                self.secondary_img_displays[axis].set_visible(False)
-                # Visibility flag changed; invalidate the cache.
-                self._invalidate_blit_cache(axis)
+            return
 
-    # IsoDose level definitions: (percentage, colour from red to blue).
-    # Listed from lowest to highest so contourf fills in the correct order.
-    _ISODOSE_LEVELS_PCT: list[tuple[int, str]] = [
-        (30, "#0000cc"),
-        (50, "#0066ff"),
-        (70, "#00cccc"),
-        (80, "#00cc00"),
-        (90, "#ffcc00"),
-        (95, "#ff6600"),
-        (100, "#ff0000"),
-    ]
+        disp = self.secondary_img_displays[axis]
+        if disp is None:
+            self.secondary_img_displays[axis] = self.axs[axis].imshow(
+                secondary_data,
+                cmap=self.state.secondary_image_cmap,
+                origin="lower",
+                vmin=effective_clim[0],
+                vmax=effective_clim[1],
+                extent=extent,
+                interpolation="bilinear",
+                alpha=alpha,
+            )
+            self._invalidate_blit_cache(axis)
+        else:
+            disp.set_data(secondary_data)
+            if disp.get_extent() != extent:
+                disp.set_extent(extent)
+            if disp.get_clim() != effective_clim:
+                disp.set_clim(effective_clim)
+            disp.set_alpha(alpha)
+            disp.set_cmap(self.state.secondary_image_cmap)
 
-    # Stride used to downsample the dose slice before contourf/contour.
-    # step=1: full resolution (highest quality, slowest)
-    # step=2: 1/4 pixel count -> ~1/5 computation time (recommended)
-    # step=4: 1/16 pixel count -> ~1/20 computation time
-    # Dose distributions are spatially smooth so step=2 preserves visual quality.
-    _ISODOSE_DOWNSAMPLE_STEP: int = 2
+        disp = self.secondary_img_displays[axis]
+        if not disp.get_visible():
+            disp.set_visible(True)
+            self._invalidate_blit_cache(axis)
 
     @staticmethod
     def _iter_isodose_collections(artist) -> list:
-        """
-        Return a list of internal collections within a QuadContourSet.
+        """Return the internal collections within a QuadContourSet.
 
-        Since QuadContourSet.collections was deprecated and removed in Matplotlib 3.8+,
-        this method determines the internal artist list based on the presence of
-        get_paths() or iterability. For non-QuadContourSet objects (e.g., PathCollection),
-        the artist is wrapped in a list and returned.
+        Since QuadContourSet.collections was deprecated and removed in
+        Matplotlib 3.8+, this method determines the internal artist list
+        based on the presence of get_paths() or iterability. For
+        non-QuadContourSet objects (e.g. PathCollection), the artist is
+        wrapped in a list and returned.
 
         Args:
             artist: The artist object stored in isodose_artists.
 
         Returns:
-            A list of Artists on which set_visible or set_alpha can be safely called.
+            A list of Artists on which set_visible or set_alpha can be
+            safely called.
         """
         colls = getattr(artist, "collections", None)
         if colls is not None:
@@ -672,15 +668,15 @@ class DicomViewer(ttk.Frame):
         except TypeError:
             return [artist]
 
+    # ------------------------------------------------------------------
+    # IsoDose display
+    # ------------------------------------------------------------------
     def _clear_isodose_artists(self, axis: str) -> None:
         """Hide the currently visible isodose artists and clear the tracking list.
 
         Artist objects are retained in ``_isodose_slice_cache`` so ``remove()``
-        is not called here.  Use :meth:`_invalidate_isodose_cache` to fully
+        is not called here. Use :meth:`_invalidate_isodose_cache` to fully
         destroy cached artists.
-
-        Args:
-            axis: Target axis name.
         """
         for artist in self.isodose_artists.get(axis, []):
             for coll in self._iter_isodose_collections(artist):
@@ -690,23 +686,21 @@ class DicomViewer(ttk.Frame):
                     pass
         self.isodose_artists[axis] = []
         self._isodose_rendered_index[axis] = None
-        # isodose_artists list changed; invalidate the blit cache.
         self._invalidate_blit_cache(axis)
 
     def _invalidate_isodose_cache(self, axis: str | None = None) -> None:
         """Fully destroy the isodose artist cache.
 
         Call when artists must be recreated even for the same slice, e.g. on
-        RT-DOSE replacement or isodose level changes.  Unlike
+        RT-DOSE replacement or isodose level changes. Unlike
         ``_clear_isodose_artists``, this method calls ``remove()`` on each
         artist and purges the cache dict entirely.
 
         Args:
-            axis: Axis to invalidate.  Pass ``None`` to invalidate all axes.
+            axis: Axis to invalidate. Pass ``None`` to invalidate all axes.
         """
         targets = list(AXES) if axis is None else [axis]
         for ax_name in targets:
-            # Remove cached artists from the Axes.
             for cached_artists in self._isodose_slice_cache[ax_name].values():
                 for artist in cached_artists:
                     try:
@@ -716,7 +710,6 @@ class DicomViewer(ttk.Frame):
             self._isodose_slice_cache[ax_name] = {}
             self._isodose_rendered_index[ax_name] = None
             self.isodose_artists[ax_name] = []
-            # isodose_artists list changed; invalidate the blit cache.
             self._invalidate_blit_cache(ax_name)
 
     def _get_ref_dose(self) -> float | None:
@@ -724,13 +717,9 @@ class DicomViewer(ttk.Frame):
 
         Priority:
             1. Prescription dose if set and positive.
-            2. _ref_dose_cache pre-computed from the original RT-DOSE image
-               on load (matches the value shown in application dialogs that
-               derive Dmax from the same original image).
-            3. None when neither is available (caller should skip rendering).
-
-        Returns:
-            Reference dose in Gy, or None.
+            2. _ref_dose_cache (true Dmax of the positive voxels in the
+               original RT-DOSE image) pre-computed on load.
+            3. None when neither is available.
         """
         if (
             self.state.prescription_dose is not None
@@ -744,7 +733,7 @@ class DicomViewer(ttk.Frame):
 
         Design:
             When the slice index has not changed ``_isodose_rendered_index``
-            short-circuits the method.  Otherwise:
+            short-circuits the method. Otherwise:
 
             1. Hide the currently visible artists via ``_clear_isodose_artists``.
             2. If ``_isodose_slice_cache`` contains artists for this slice,
@@ -753,8 +742,8 @@ class DicomViewer(ttk.Frame):
                artists in ``_isodose_slice_cache``.
 
         Performance:
-            The contourf/contour cost is incurred only on the first visit to each
-            slice.  Revisited slices complete with a visibility toggle only.
+            The contourf/contour cost is incurred only on the first visit to
+            each slice. Revisited slices complete with a visibility toggle only.
             Downsampling is applied via ``_ISODOSE_DOWNSAMPLE_STEP`` stride slicing.
 
         Artist layout:
@@ -775,8 +764,8 @@ class DicomViewer(ttk.Frame):
         ] == current_idx and self.isodose_artists.get(axis):
             return
 
-        # Hide the currently displayed artists without removing them from the Axes.
         self._clear_isodose_artists(axis)
+        fill_alpha = (1.0 - self.state.blend_alpha) * 0.4
 
         # Cache hit: restore artists with set_visible(True).
         cached_artists = self._isodose_slice_cache[axis].get(current_idx)
@@ -787,22 +776,27 @@ class DicomViewer(ttk.Frame):
                         coll.set_visible(True)
                     except Exception:
                         pass
+            if cached_artists:
+                for coll in self._iter_isodose_collections(cached_artists[0]):
+                    try:
+                        coll.set_alpha(fill_alpha)
+                    except Exception:
+                        pass
             self.isodose_artists[axis] = cached_artists
             self._isodose_rendered_index[axis] = current_idx
-            # isodose_artists list changed; invalidate the blit cache.
             self._invalidate_blit_cache(axis)
             return
 
         # Cache miss: fetch the dose slice and run contourf/contour.
-        step = self._ISODOSE_DOWNSAMPLE_STEP
         full_raw = self.state.get_dose_slice_cached(axis)
         if full_raw.size == 0:
-            # Empty slice (outside CT extent): cache an empty list to speed up future lookups.
+            # Empty slice (outside CT extent): cache an empty list.
             self._isodose_slice_cache[axis][current_idx] = []
             self._isodose_rendered_index[axis] = current_idx
             return
 
         # Downsample via zero-copy stride slicing.
+        step = self._ISODOSE_DOWNSAMPLE_STEP
         raw = full_raw[::step, ::step]
 
         if raw.max() <= 0:
@@ -816,45 +810,51 @@ class DicomViewer(ttk.Frame):
 
         extent = self.state.get_extent(axis)
         ax = self.axs[axis]
-        fill_alpha = (1.0 - self.state.blend_alpha) * 0.4
 
         # Build grid coordinates matching the downsampled slice dimensions.
+        # Stride slicing picks samples at indices 0, step, 2*step, ..., so the
+        # corresponding physical coordinates span only
+        # [extent_low, extent_low + (w - 1) * step * dx_original]. Using
+        # linspace(extent_low, extent_high, w) would misalign the dose overlay
+        # by up to (step - 1) voxels on the high-index side.
+        full_h, full_w = full_raw.shape
         h, w = raw.shape
-        xs = np.linspace(extent[0], extent[1], w)
-        ys = np.linspace(extent[2], extent[3], h)
+        dx = (extent[1] - extent[0]) / max(full_w - 1, 1)
+        dy = (extent[3] - extent[2]) / max(full_h - 1, 1)
+        xs = extent[0] + np.arange(w) * step * dx
+        ys = extent[2] + np.arange(h) * step * dy
 
-        # Extract isodose levels within the current dose range.
-        # Instance variables set by set_isodose_lines() take precedence over class defaults.
-        # contourf requires at least 2 levels, so 0.0 is prepended as a sentinel.
-        if hasattr(self, "_custom_isodose_levels_gy"):
-            active_pairs = [
-                (gy, color)
-                for gy, color in (self._custom_isodose_levels_gy or [])
-                if gy <= raw.max()
-            ]
+        # Resolve active isodose levels. Levels outside the slice's dose range
+        # are NOT filtered here: passing them to contourf is harmless (the
+        # corresponding region is empty) and avoids the previous bug where
+        # filtering combined with extend="max" would stretch the highest
+        # remaining colour down to very low dose values on slices whose max
+        # was far below ref_dose.
+        if self._custom_isodose_levels_gy is not None:
+            active_pairs = list(self._custom_isodose_levels_gy)
         else:
             active_pairs = [
                 (ref_dose * pct / 100.0, color)
                 for pct, color in self._ISODOSE_LEVELS_PCT
-                if ref_dose * pct / 100.0 <= raw.max()
             ]
+        # Drop non-positive levels (they would collapse the contourf band).
+        active_pairs = [(gy, color) for gy, color in active_pairs if gy > 0]
 
         if not active_pairs:
-            # No active levels in the current dose range; cache an empty list and return.
             self._isodose_slice_cache[axis][current_idx] = []
             self._isodose_rendered_index[axis] = current_idx
             return
 
         levels_gy = [lvl for lvl, _ in active_pairs]
         line_colors = [col for _, col in active_pairs]
-        sentinel_levels = [0.0] + [lvl for lvl, _ in active_pairs]
-        last_color = active_pairs[-1][1]
-        sentinel_colors = (
-            ["none"] + [col for _, col in active_pairs[:-1]] + [last_color]
-        )
+        # contourf bands: below lvl_1 is transparent; lvl_i..lvl_{i+1} is
+        # line_colors[i]; everything above the highest level is painted with
+        # the highest colour via extend="max" (voxels above Dmax, if any,
+        # still receive the 100% hue).
+        sentinel_levels = [0.0] + levels_gy
+        sentinel_colors = ["none"] + line_colors[:-1] + [line_colors[-1]]
 
         new_artists: list = []
-
         try:
             cf = ax.contourf(
                 xs,
@@ -885,11 +885,9 @@ class DicomViewer(ttk.Frame):
         except Exception as e:
             logger.warning(f"contour failed for axis '{axis}': {e}")
 
-        # Store the newly created artists in the slice cache.
         self._isodose_slice_cache[axis][current_idx] = new_artists
         self.isodose_artists[axis] = new_artists
         self._isodose_rendered_index[axis] = current_idx
-        # isodose_artists list changed; invalidate the blit cache.
         self._invalidate_blit_cache(axis)
 
     def _update_dose_display(self, axis: str) -> None:
@@ -903,11 +901,11 @@ class DicomViewer(ttk.Frame):
         self, axis: str, pos: tuple[float, float] | None
     ) -> None:
         ax = self.axs[axis]
-        _cache_invalidated = False
+        cache_invalidated = False
         for line in self.crosshairs[axis].values():
             if line and line.get_visible():
                 line.set_visible(False)
-                _cache_invalidated = True
+                cache_invalidated = True
 
         if self.state.crosshair_visible and pos:
             c1, c2 = pos
@@ -917,24 +915,24 @@ class DicomViewer(ttk.Frame):
                 h_line.set_ydata([c2])
                 if not h_line.get_visible():
                     h_line.set_visible(True)
-                    _cache_invalidated = True
+                    cache_invalidated = True
             else:
                 self.crosshairs[axis]["h"] = ax.axhline(
                     c2, color="limegreen", lw=0.8, alpha=0.8
                 )
-                _cache_invalidated = True
+                cache_invalidated = True
             if v_line:
                 v_line.set_xdata([c1])
                 if not v_line.get_visible():
                     v_line.set_visible(True)
-                    _cache_invalidated = True
+                    cache_invalidated = True
             else:
                 self.crosshairs[axis]["v"] = ax.axvline(
                     c1, color="limegreen", lw=0.8, alpha=0.8
                 )
-                _cache_invalidated = True
+                cache_invalidated = True
 
-        if _cache_invalidated:
+        if cache_invalidated:
             self._invalidate_blit_cache(axis)
 
     # ------------------------------------------------------------------
@@ -965,19 +963,13 @@ class DicomViewer(ttk.Frame):
         """Render contour patches for all active ROIs on *axis*.
 
         Paths are computed by ``find_contours`` on the first visit and then
-        stored in ``state.contour_path_cache``.  Subsequent visits to the
+        stored in ``state.contour_path_cache``. Subsequent visits to the
         same ``(roi_number, axis, slice_index)`` tuple return the cached
         result without re-running ``find_contours``.
 
         The cache is bypassed (but not populated) when *override_mask* is
         supplied, because override data represents transient brush-dragging
         state that must not be persisted.
-
-        Args:
-            axis: One of ``"axial"``, ``"coronal"``, or ``"sagittal"``.
-            override_mask: Optional ``{roi_number: 2-D numpy array}`` used
-                during brush dragging.  When present, its slice data takes
-                precedence over ``state.structure_set`` for the given ROI.
         """
         ax = self.axs[axis]
         existing = self.contour_patches[axis]
@@ -985,7 +977,7 @@ class DicomViewer(ttk.Frame):
         effective_override = override_mask or {}
         cache = self.state.contour_path_cache
         current_index = self.state.indices[axis]
-        _cache_invalidated = False
+        cache_invalidated = False
 
         for roi_number in self.state.active_contours:
             using_override = roi_number in effective_override
@@ -994,7 +986,6 @@ class DicomViewer(ttk.Frame):
                 mask_slice = effective_override[roi_number]
             else:
                 # Retrieve the slice from mask_slice_cache to avoid a sitk round-trip.
-                # Fall back to sitk.Image only on a cache miss.
                 cached_slice = self.state.mask_slice_cache.get_slice(
                     roi_number, axis, current_index
                 )
@@ -1012,35 +1003,21 @@ class DicomViewer(ttk.Frame):
             extent = self.state.get_extent(axis)
             color = self.state.structure_set.get_color(roi_number) or "white"
 
-            if not using_override:
-                paths = cache.get(roi_number, axis, current_index)
-            else:
-                paths = None  # always recompute for transient override data
+            # Paths are never cached for override data (transient brush state).
+            paths = (
+                None if using_override else cache.get(roi_number, axis, current_index)
+            )
 
             if paths is None:
-                raw_contours = find_contours(mask_slice.astype(float), level=0.5)
-                paths = []
-                for contour in raw_contours:
-                    verts = [
-                        (
-                            extent[0]
-                            + (x / (mask_slice.shape[1] - 1)) * (extent[1] - extent[0]),
-                            extent[2]
-                            + (y / (mask_slice.shape[0] - 1)) * (extent[3] - extent[2]),
-                        )
-                        for y, x in contour
-                    ]
-                    if verts:
-                        codes = [Path.MOVETO] + [Path.LINETO] * (len(verts) - 1)
-                        paths.append(Path(verts, codes))
-                # Store in cache only for non-override (persistent) slices.
+                x0, x1, y0, y1 = extent
+                paths = _mask_slice_to_paths(mask_slice, x0, x1, y0, y1)
                 if not using_override:
                     cache.set(roi_number, axis, current_index, paths)
 
             if not paths:
                 if roi_number in existing:
                     existing.pop(roi_number).remove()
-                    _cache_invalidated = True
+                    cache_invalidated = True
                 continue
 
             combined = Path.make_compound_path(*paths)
@@ -1055,17 +1032,17 @@ class DicomViewer(ttk.Frame):
                 patch = PathPatch(combined, edgecolor=color, facecolor=face, lw=1.0)
                 ax.add_patch(patch)
                 existing[roi_number] = patch
-                _cache_invalidated = True
+                cache_invalidated = True
             used.add(roi_number)
 
         removed = set(existing.keys()) - used
         for num in removed:
             existing.pop(num).remove()
         if removed:
-            _cache_invalidated = True
+            cache_invalidated = True
         self.contour_patches[axis] = existing
 
-        if _cache_invalidated:
+        if cache_invalidated:
             self._invalidate_blit_cache(axis)
 
     def _update_all_contours(self) -> None:
@@ -1077,27 +1054,25 @@ class DicomViewer(ttk.Frame):
     # Artist reset
     # ------------------------------------------------------------------
     def _reset_artists(self) -> None:
-        for axis, ax in self.axs.items():
+        for ax in self.axs.values():
             ax.clear()
             ax.set_facecolor("black")
             ax.tick_params(colors="white")
             ax.set_axis_off()
         self.img_displays = {axis: None for axis in AXES}
         self.secondary_img_displays = {axis: None for axis in AXES}
-        # ax.clear() removes all artists from the Axes, invalidating cached references.
-        # Purge the cache dicts here so that _invalidate_isodose_cache does not
-        # attempt to call remove() on already-removed artists.
+        # ax.clear() removes all artists from the Axes, so purge the cache
+        # dicts here to avoid calling remove() on already-removed artists.
         self._isodose_slice_cache = {axis: {} for axis in AXES}
         self.isodose_artists = {axis: [] for axis in AXES}
         self._isodose_rendered_index = {axis: None for axis in AXES}
-        if hasattr(self, "_custom_isodose_levels_gy"):
-            del self._custom_isodose_levels_gy
+        self._custom_isodose_levels_gy = None
         self.crosshairs = {axis: {"h": None, "v": None} for axis in AXES}
         self.bbox_patches = {axis: None for axis in AXES}
-        self.contour_patches: dict[str, dict[int, Any]] = {axis: {} for axis in AXES}
+        self.contour_patches = {axis: {} for axis in AXES}
         self._backgrounds = {axis: None for axis in AXES}
-        # Reset the same-slice early-exit counters and blit artist caches on image
-        # switch so that the first slice of the new image is always rendered.
+        # Reset the same-slice early-exit counters and blit caches so the
+        # first slice of the new image is always rendered.
         self._last_rendered_index = {axis: -1 for axis in AXES}
         self._invalidate_blit_cache_all()
 
@@ -1106,7 +1081,7 @@ class DicomViewer(ttk.Frame):
     # ------------------------------------------------------------------
     def _on_primary_image_data_changed(self, image: sitk.Image | None) -> None:
         self._reset_artists()
-        if image is not None and image.GetNumberOfPixels() > 0:
+        if self._has_valid_primary_image():
             for axis in AXES:
                 self._update_slice_display(axis)
             self._update_all_contours()
@@ -1117,10 +1092,7 @@ class DicomViewer(ttk.Frame):
 
     def _on_secondary_image_data_changed(self, image: sitk.Image | None) -> None:
         """Show blend slider when secondary image or dose is present."""
-        if image is not None or self.state.rt_dose_image is not None:
-            self._blend_frame.pack(side=tk.BOTTOM, pady=5)
-        else:
-            self._blend_frame.pack_forget()
+        self._update_blend_slider_visibility()
         for axis in AXES:
             self._update_slice_display(axis)
         self._schedule_cache_backgrounds()
@@ -1139,18 +1111,17 @@ class DicomViewer(ttk.Frame):
                         coll.set_alpha(fill_alpha)
                     except Exception:
                         pass
-        for axis in AXES:
             self.drawing_manager.add_request(axis)
 
     def _on_secondary_cmap_changed(self, cmap_name: str) -> None:
-        # set_cmap is called inside _update_secondary_display; no direct update needed here.
+        # set_cmap is applied inside _update_secondary_display.
         for axis in AXES:
             self._update_slice_display(axis)
         self._schedule_cache_backgrounds()
 
     def _on_index_changed(self, axis: str, new_idx: int) -> None:
-        # Skip all processing for redundant redraws of the same slice
-        # (e.g. crosshair drag that does not change the index).
+        # Skip redundant redraws of the same slice (e.g. crosshair drag that
+        # does not change the index).
         if self._last_rendered_index.get(axis) == new_idx:
             return
         self._last_rendered_index[axis] = new_idx
@@ -1158,12 +1129,16 @@ class DicomViewer(ttk.Frame):
         self._update_slice_display(axis)
         self._draw_axis_contours(axis)
         if self.state.rt_dose_resampled is not None:
-            # Same-slice skip is active, so only update isodose for the changed axis.
             self._update_isodose_display(axis)
-        # _schedule_cache_backgrounds is always used regardless of RT-DOSE presence.
-        # The 50 ms delay ensures crosshair_changed -> drawing_manager.add_request
-        # is processed before the background cache rebuild runs.
-        self._schedule_cache_backgrounds(axis)
+        # NOTE: _schedule_cache_backgrounds is intentionally NOT called here.
+        # Slice scrolling only updates artists that already live in the blit
+        # layer (AxesImage via set_data, contour patches, isodose artists),
+        # so the cached background bitmap remains valid. Calling canvas.draw()
+        # on every scroll caused visible stalls at ~150 ms intervals; skipping
+        # it here makes scrolling consistently smooth. Events that DO require
+        # a background rebuild (window/level change, layout change, ROI edits,
+        # limits changes) continue to invoke _schedule_cache_backgrounds from
+        # their own listeners.
 
     def _on_window_level_changed(self, window: int, level: int) -> None:
         clim = (level - window / 2, level + window / 2)
@@ -1183,8 +1158,6 @@ class DicomViewer(ttk.Frame):
             self._update_crosshairs_display(axis, self.state.crosshair_pos.get(axis))
         # Crosshairs live in the blit layer so they always update immediately,
         # even while a background cache rebuild is pending.
-        # (The previous blit guard was removed because it caused the crosshair
-        # to freeze while _cache_pending was True.)
         # Skip add_request when the crosshair is hidden to avoid unnecessary blits.
         if not self.state.crosshair_visible:
             return
@@ -1213,13 +1186,11 @@ class DicomViewer(ttk.Frame):
             )
             ax.add_patch(patch)
             self.bbox_patches[axis] = patch
-            # A new Artist object was created; invalidate the cache.
             self._invalidate_blit_cache(axis)
 
         if bbox is None or not self.state.bbox_visible:
             if patch.get_visible():
                 patch.set_visible(False)
-                # Visibility flag changed; invalidate the cache.
                 self._invalidate_blit_cache(axis)
             patch.set_xy((0, 0))
             patch.set_width(0)
@@ -1231,7 +1202,6 @@ class DicomViewer(ttk.Frame):
             patch.set_height(h)
             if not patch.get_visible():
                 patch.set_visible(True)
-                # Visibility flag changed; invalidate the cache.
                 self._invalidate_blit_cache(axis)
         self.drawing_manager.add_request(axis)
 
@@ -1268,31 +1238,28 @@ class DicomViewer(ttk.Frame):
 
     def _on_rt_dose_changed(self, image) -> None:
         """Update dose overlay and DVH panel when the RT-DOSE volume changes."""
-        if image is not None or self.state.secondary_image is not None:
-            self._blend_frame.pack(side=tk.BOTTOM, pady=5)
-        else:
-            self._blend_frame.pack_forget()
+        self._update_blend_slider_visibility()
 
         # Invalidate isodose caches when the dose volume changes.
         self._invalidate_isodose_cache()
         self._ref_dose_cache = None
 
-        # Pre-compute ref_dose from the original (pre-resampled) image so that
-        # the value matches any application dialog that also reads from the original.
+        # Pre-compute ref_dose from the original (pre-resampled) image so the
+        # value matches any application dialog that reads from the original.
         # Using the resampled image is avoided because interpolation can shift Dmax.
         if image is not None:
             arr_orig = sitk.GetArrayViewFromImage(image).astype(np.float32)
             if arr_orig.size > 0:
                 positive = arr_orig[arr_orig > 0]
                 if positive.size > 0:
-                    self._ref_dose_cache = float(np.percentile(positive, 99))
+                    self._ref_dose_cache = float(positive.max())
                     logger.info(f"ref_dose cached: {self._ref_dose_cache:.3f} Gy.")
 
         if self.state.primary_image is not None:
             for axis in AXES:
                 self._update_isodose_display(axis)
             self.state.refresh_crosshair()
-            # Use deferred scheduling to suppress canvas.draw() on rapid updates
+            # Deferred scheduling suppresses canvas.draw() on rapid updates
             # such as prescription-dose changes.
             self._schedule_cache_backgrounds()
             for axis in AXES:
@@ -1362,11 +1329,9 @@ class DicomViewer(ttk.Frame):
         self._setup_axes(mode)
         self._reset_artists()
 
-        image = self.state.primary_image
-        if image is not None and image.GetNumberOfPixels() > 0:
+        if self._has_valid_primary_image():
             for axis in AXES:
                 self._update_slice_display(axis)
-            # Re-render isodose after layout rebuild (artists were reset above).
             if self.state.rt_dose_resampled is not None:
                 for axis in AXES:
                     self._update_isodose_display(axis)
@@ -1379,15 +1344,22 @@ class DicomViewer(ttk.Frame):
             self.canvas.draw()
 
         # Restore blend slider visibility after rebuild.
-        if (
-            self.state.secondary_image is not None
-            or self.state.rt_dose_image is not None
-        ):
-            self._blend_frame.pack(side=tk.BOTTOM, pady=5)
-        else:
-            self._blend_frame.pack_forget()
-
+        self._update_blend_slider_visibility()
         self._update_dvh_panel()
+
+    def _draw_dvh_placeholder(self, ax, text: str) -> None:
+        """Render a centred grey placeholder message inside the DVH axes."""
+        ax.text(
+            0.5,
+            0.5,
+            text,
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            color="gray",
+            fontsize=9,
+        )
+        self.canvas.draw_idle()
 
     def _update_dvh_panel(self) -> None:
         """Render the DVH for all active contours into the DVH axes."""
@@ -1405,58 +1377,37 @@ class DicomViewer(ttk.Frame):
         # Use the dose resampled to the CT grid so voxel shapes match ROI masks.
         dose = self.state.rt_dose_resampled
         if dose is None:
-            ax.text(
-                0.5,
-                0.5,
-                "RT-DOSE not loaded",
-                transform=ax.transAxes,
-                ha="center",
-                va="center",
-                color="gray",
-                fontsize=9,
-            )
-            self.canvas.draw_idle()
+            self._draw_dvh_placeholder(ax, "RT-DOSE not loaded")
             return
 
         active = self.state.active_contours
         if not active:
-            ax.text(
-                0.5,
-                0.5,
-                "No contours selected",
-                transform=ax.transAxes,
-                ha="center",
-                va="center",
-                color="gray",
-                fontsize=9,
-            )
-            self.canvas.draw_idle()
+            self._draw_dvh_placeholder(ax, "No contours selected")
             return
 
         # Reuse the pre-cast float32 array from dose_array_cache to avoid a
         # full sitk.GetArrayFromImage conversion on every DVH update.
         dose_arr = self.state.dose_array_cache.get("axial")
         if dose_arr is None:
-            # Cache not yet populated; fall back to direct conversion.
             dose_arr = sitk.GetArrayFromImage(dose).astype(np.float32)
-        plotted = False
 
+        plotted = False
         for roi_number in active:
             mask_sitk = self.state.structure_set.get_mask(roi_number)
-            name = self.state.structure_set.get_name(roi_number) or str(roi_number)
-            color = self.state.structure_set.get_color(roi_number) or "white"
             if mask_sitk is None:
                 continue
+            name = self.state.structure_set.get_name(roi_number) or str(roi_number)
+            color = self.state.structure_set.get_color(roi_number) or "white"
             mask_arr = sitk.GetArrayFromImage(mask_sitk).astype(bool)
             if mask_arr.shape != dose_arr.shape:
                 continue
             voxels = dose_arr[mask_arr]
-            if len(voxels) == 0:
+            if voxels.size == 0:
                 continue
 
             # Cumulative DVH: y[i] = fraction of voxels receiving >= sorted_dose[i]
             sorted_dose = np.sort(voxels)
-            n = len(sorted_dose)
+            n = sorted_dose.size
             volume_pct = (n - np.arange(n)) / n * 100.0
             ax.plot(sorted_dose, volume_pct, color=color, label=name, lw=1.5)
             plotted = True
@@ -1478,24 +1429,20 @@ class DicomViewer(ttk.Frame):
     # Public API
     # ------------------------------------------------------------------
     def set_isodose_lines(self, gy_pairs: list[tuple[float, str]]) -> None:
-        """
-        Dynamically update IsoDose line definitions and trigger an immediate redraw.
+        """Dynamically update IsoDose line definitions and trigger a redraw.
 
-        This method is intended to be called as a callback from IsoDoseDialog.
-        By overwriting the levels as instance variables, we ensure that changes
-        do not affect other instances of the class.
+        Intended to be called as a callback from IsoDoseDialog. By assigning
+        to the instance variable, we ensure changes do not affect other
+        instances of the class.
 
         Args:
-            gy_pairs: A list of (Gy value, hex color string) tuples.
-                    Must be sorted in ascending order of values.
-                    Passing an empty list will hide all IsoDose lines.
+            gy_pairs: A list of (Gy value, hex color string) tuples. Must be
+                sorted in ascending order of values. Passing an empty list
+                will hide all IsoDose lines.
         """
-        # Overwrite as instance variables to avoid affecting other instances
-        self._custom_isodose_levels_gy: list[tuple[float, str]] | None = (
-            gy_pairs if gy_pairs else []
-        )
+        self._custom_isodose_levels_gy = list(gy_pairs) if gy_pairs else []
 
-        # Invalidate cache for all axes and force a redraw
+        # Invalidate cache for all axes and force a redraw.
         self._invalidate_isodose_cache()
 
         if self.state.rt_dose_resampled is not None:
@@ -1514,7 +1461,7 @@ class DicomViewer(ttk.Frame):
         """Load a DICOM CT series from *ct_dir* and display it.
 
         Window / level is taken from the DICOM metadata via
-        :func:`~dicom_viewer.io.load_dcm_series`.  Pass *window* to override.
+        :func:`~dicom_viewer.io.load_dcm_series`. Pass *window* to override.
 
         Args:
             ct_dir: Path to the DICOM folder.
@@ -1557,19 +1504,26 @@ class DicomViewer(ttk.Frame):
 # Backward-compatibility helpers
 # ---------------------------------------------------------------------------
 class _IndexVarProxy:
+    """Tk-style IntVar dict proxy over SliceViewerState indices."""
+
+    _AXIS_CHAR_MAP = {"x": "sagittal", "y": "coronal", "z": "axial"}
+
     def __init__(self, state: SliceViewerState) -> None:
         self._state = state
 
     def __getitem__(self, axis_char: str) -> "_SingleVar":
-        mapping = {"x": "sagittal", "y": "coronal", "z": "axial"}
-        if axis_char not in mapping:
+        axis = self._AXIS_CHAR_MAP.get(axis_char)
+        if axis is None:
             raise KeyError(
-                f"Unknown axis character '{axis_char}'. Expected one of: {list(mapping)}"
+                f"Unknown axis character '{axis_char}'. "
+                f"Expected one of: {list(self._AXIS_CHAR_MAP)}"
             )
-        return _SingleVar(self._state, mapping[axis_char])
+        return _SingleVar(self._state, axis)
 
 
 class _SingleVar:
+    """IntVar-like adapter around a single ``SliceViewerState`` axis index."""
+
     def __init__(self, state: SliceViewerState, axis: str) -> None:
         self._state = state
         self._axis = axis

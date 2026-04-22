@@ -25,13 +25,16 @@ class BboxEventHandler:
     #: Pixel radius within which an edge or corner counts as a resize handle.
     TOLERANCE_PIXELS: int = 5
 
+    #: Minimum allowed box dimension (in data units) during a resize.
+    _MIN_SIZE: float = 1.0
+
     def __init__(self, state: "SliceViewerState", viewer: "DicomViewer") -> None:
         self.state = state
         self.viewer = viewer
 
         self._interaction_mode: str | None = None  # "create" | "move" | "resize"
         self._resize_handle: str | None = None  # "t" | "b" | "l" | "r" | corners
-        self._active_axis: str | None = None  # which view owns the current drag
+        self._active_axis: str | None = None
         self._is_dragging: bool = False
         self._drag_start_pos_data: tuple[float, float] | None = None
         self._original_pos: list[float] | None = None
@@ -63,32 +66,21 @@ class BboxEventHandler:
 
         if handle:
             # Resize an existing box.
-            self._interaction_mode = "resize"
+            self._begin_drag(axis, "resize", (px, py), list(bbox))
             self._resize_handle = handle
-            self._active_axis = axis
-            self._is_dragging = True
-            self._drag_start_pos_data = (px, py)
-            self._original_pos = list(bbox)
             return True
 
         if bbox and (
             bbox[0] <= px <= bbox[0] + bbox[2] and bbox[1] <= py <= bbox[1] + bbox[3]
         ):
             # Move the existing box.
-            self._interaction_mode = "move"
-            self._active_axis = axis
-            self._is_dragging = True
-            self._drag_start_pos_data = (px, py)
-            self._original_pos = list(bbox)
+            self._begin_drag(axis, "move", (px, py), list(bbox))
             return True
 
         # Click outside any existing box: clear and start creating a new one.
         self.state.set_bounding_box(axis, None)
-        self._interaction_mode = "create"
-        self._active_axis = axis
-        self._drag_start_pos_data = (px, py)
+        self._begin_drag(axis, "create", (px, py), None)
         self.state.set_bounding_box(axis, (px, py, 0, 0))
-        self._is_dragging = True
         return True
 
     def handle_motion(self, event) -> None:
@@ -97,32 +89,26 @@ class BboxEventHandler:
         if (
             not self._is_dragging
             or not axis
-            or event.inaxes != self.viewer.axs.get(axis)
             or event.xdata is None
+            or event.ydata is None
         ):
             return
 
         px, py = event.xdata, event.ydata
+        x0, y0 = self._drag_start_pos_data
         mode = self._interaction_mode
 
         if mode == "create":
-            x0, y0 = self._drag_start_pos_data
-            x_start, x_end = sorted([x0, px])
-            y_start, y_end = sorted([y0, py])
+            x_start, x_end = (x0, px) if x0 <= px else (px, x0)
+            y_start, y_end = (y0, py) if y0 <= py else (py, y0)
             self.state.set_bounding_box(
                 axis, (x_start, y_start, x_end - x_start, y_end - y_start)
             )
-
         elif mode == "move":
-            dx = px - self._drag_start_pos_data[0]
-            dy = py - self._drag_start_pos_data[1]
             x, y, w, h = self._original_pos
-            self.state.set_bounding_box(axis, (x + dx, y + dy, w, h))
-
+            self.state.set_bounding_box(axis, (x + px - x0, y + py - y0, w, h))
         elif mode == "resize":
-            dx = px - self._drag_start_pos_data[0]
-            dy = py - self._drag_start_pos_data[1]
-            self._resize_bbox(dx, dy)
+            self._resize_bbox(px - x0, py - y0)
 
     def handle_release(self, event) -> None:
         """End the current interaction on left-button release."""
@@ -135,8 +121,22 @@ class BboxEventHandler:
             self._original_pos = None
 
     # ------------------------------------------------------------------
-    # Handle detection
+    # Internal helpers
     # ------------------------------------------------------------------
+    def _begin_drag(
+        self,
+        axis: str,
+        mode: str,
+        start_pos: tuple[float, float],
+        original_pos: list[float] | None,
+    ) -> None:
+        """Initialise drag state for any of the three interaction modes."""
+        self._interaction_mode = mode
+        self._active_axis = axis
+        self._is_dragging = True
+        self._drag_start_pos_data = start_pos
+        self._original_pos = original_pos
+
     def _detect_handle(self, event, axis: str) -> str | None:
         """Return the name of the resize handle under the cursor, or ``None``.
 
@@ -149,38 +149,36 @@ class BboxEventHandler:
             "b" = bottom edge (y_min; posterior in axial, inferior in cor/sag)
             "t" = top edge    (y_max = y + h; anterior in axial, superior in cor/sag)
 
-        Detection is performed in data coordinates.  The pixel tolerance is
+        Detection is performed in data coordinates. The pixel tolerance is
         converted to data units via an inverse transform so that the correct
         handle is returned regardless of ylim orientation.
         """
         bbox = self.state.bounding_boxes.get(axis)
         if bbox is None or not self.viewer.axs.get(axis):
             return None
-
-        ax = self.viewer.axs[axis]
         if event.xdata is None or event.ydata is None:
             return None
 
+        ax = self.viewer.axs[axis]
         x, y, w, h = bbox
         x_min, x_max = x, x + w
         y_min, y_max = y, y + h
 
         # Convert the pixel tolerance to data units via the inverse display transform.
-        m_px = self.TOLERANCE_PIXELS
         try:
-            p0 = ax.transData.inverted().transform((0, 0))
-            p1 = ax.transData.inverted().transform((m_px, m_px))
+            inv = ax.transData.inverted()
+            p0 = inv.transform((0, 0))
+            p1 = inv.transform((self.TOLERANCE_PIXELS, self.TOLERANCE_PIXELS))
             tol_x = abs(p1[0] - p0[0])
             tol_y = abs(p1[1] - p0[1])
         except Exception:
             tol_x = tol_y = 1.0
 
         ex, ey = event.xdata, event.ydata
-
         on_l = abs(ex - x_min) < tol_x
         on_r = abs(ex - x_max) < tol_x
-        on_b = abs(ey - y_min) < tol_y  # bottom edge (y_min = posterior/inferior)
-        on_t = abs(ey - y_max) < tol_y  # top edge    (y_max = anterior/superior)
+        on_b = abs(ey - y_min) < tol_y
+        on_t = abs(ey - y_max) < tol_y
 
         if on_t and on_l:
             return "tl"
@@ -200,28 +198,20 @@ class BboxEventHandler:
             return "r"
         return None
 
-    # ------------------------------------------------------------------
-    # Resize logic
-    # ------------------------------------------------------------------
     def _resize_bbox(self, dx: float, dy: float) -> None:
         """Apply a resize delta to the original box according to the active handle.
 
-        Edge-to-handle mapping (data coordinates, consistent with _detect_handle):
-            "t" = top edge    (y_max = y + h; anterior in axial, superior in cor/sag)
-            "b" = bottom edge (y_min;         posterior in axial, inferior in cor/sag)
-            "l" = left edge   (x_min)
-            "r" = right edge  (x_max = x + w)
-
         dx/dy are data-coordinate deltas (event.xdata/ydata - drag_start).
-        Because _detect_handle also operates in data coordinates, the dragged
-        edge always moves in the expected direction regardless of ylim orientation:
+        Because :meth:`_detect_handle` also operates in data coordinates, the
+        dragged edge always moves in the expected direction regardless of
+        ylim orientation:
 
             dragging "t" up   (dy > 0) -> increase y_max -> h += dy
             dragging "b" down (dy < 0) -> decrease y_min -> y += dy; h -= dy
         """
         handle = self._resize_handle
         x, y, w, h = self._original_pos
-        min_size = 1.0
+        min_size = self._MIN_SIZE
 
         if "l" in handle:
             new_w = w - dx

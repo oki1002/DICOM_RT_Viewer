@@ -13,15 +13,13 @@ Event priority for ``on_press`` / ``on_motion``:
 Scroll debounce:
     Scroll events are buffered for ``SCROLL_DEBOUNCE_MS`` ms; accumulated
     steps are applied to ``state.set_index`` in a single call after that
-    interval elapses from the last event.
-    The ``threading.Timer`` callback runs on a background thread, so
-    Matplotlib drawing API calls are dispatched to the main thread via
-    ``canvas.get_tk_widget().after(0, ...)``.
+    interval elapses from the last event. Debouncing is driven by the Tk
+    event loop (``widget.after``), so no background thread or lock is
+    needed — every callback runs on the main thread.
     Brush-size adjustment requires real-time response and is therefore
     excluded from debouncing.
 """
 
-import threading
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -35,8 +33,11 @@ if TYPE_CHECKING:
     from ..viewer_state import SliceViewerState
 
 # Debounce window (ms) for batching consecutive scroll events.
-# The timer is reset whenever a new scroll event arrives within this window.
-SCROLL_DEBOUNCE_MS: int = 5
+# Kept short so that the commit-to-frame latency stays well under the
+# 16 ms budget of a 60 FPS target. Rapid wheel flicks still coalesce
+# into a single redraw because consecutive events arrive faster than
+# this window.
+SCROLL_DEBOUNCE_MS: int = 30
 
 
 class ViewerEventHandler:
@@ -55,15 +56,12 @@ class ViewerEventHandler:
         self._wl_start_pos: tuple[int, int] | None = None
         self._wl_initial: tuple[int, int] | None = None
 
-        # --- Scroll debounce ---
-        # _scroll_lock guards cross-thread access to _scroll_timer,
-        # _scroll_accum, and _scroll_axis.
-        self._scroll_lock: threading.Lock = threading.Lock()
-        # Pending threading.Timer; None when no timer is scheduled.
-        self._scroll_timer: threading.Timer | None = None
-        # Accumulated scroll step total (positive = up).
+        # Scroll debounce state. All fields are touched only from the Tk
+        # main thread, so no lock is required. ``_scroll_after_id`` holds
+        # the pending ``widget.after`` callback id (or None when no
+        # callback is scheduled).
+        self._scroll_after_id: str | None = None
         self._scroll_accum: int = 0
-        # Axis being accumulated; None when unset.
         self._scroll_axis: str | None = None
 
         self.state.add_listener(
@@ -77,11 +75,15 @@ class ViewerEventHandler:
         if is_active:
             self.brush_handler.activate()
             # Cancel any in-progress W/L drag immediately.
-            self._dragging_wl = False
-            self._wl_start_pos = None
-            self._wl_initial = None
+            self._reset_wl_drag()
         else:
             self.brush_handler.deactivate()
+
+    def _reset_wl_drag(self) -> None:
+        """Clear all window/level drag state."""
+        self._dragging_wl = False
+        self._wl_start_pos = None
+        self._wl_initial = None
 
     # ------------------------------------------------------------------
     # Axes enter / leave
@@ -106,10 +108,10 @@ class ViewerEventHandler:
         """Receive a scroll event and accumulate it in the debounce buffer.
 
         Brush-size changes are processed immediately because they require
-        real-time response.  All other scroll events accumulate their steps
+        real-time response. All other scroll events accumulate their steps
         and are applied together after ``SCROLL_DEBOUNCE_MS`` ms.
         """
-        # Brush-size changes bypass debouncing and are applied immediately.
+        # Brush-size changes bypass debouncing.
         if self.state.brush_tool_active and self.state.current_axis:
             self.brush_handler.handle_scroll(event)
             return
@@ -118,60 +120,60 @@ class ViewerEventHandler:
         if not axis or self.state.primary_image is None:
             return
 
-        step = int(np.sign(event.step))
-
-        with self._scroll_lock:
-            # Reset the accumulator when the scroll axis changes.
-            if self._scroll_axis != axis:
-                self._scroll_accum = 0
-                self._scroll_axis = axis
-
-            self._scroll_accum += step
-
-            # Cancel and reschedule the timer to reset the debounce window.
-            if self._scroll_timer is not None:
-                self._scroll_timer.cancel()
-
-            self._scroll_timer = threading.Timer(
-                SCROLL_DEBOUNCE_MS / 1000.0,
-                self._flush_scroll,
-            )
-            self._scroll_timer.daemon = True
-            self._scroll_timer.start()
-
-    def _flush_scroll(self) -> None:
-        """Debounce timer callback: apply accumulated steps to slice navigation.
-
-        This method is called from a background thread, so all
-        Matplotlib/Tkinter API calls are dispatched to the main thread
-        via ``after(0, ...)``.
-        """
-        with self._scroll_lock:
-            accum = self._scroll_accum
-            axis = self._scroll_axis
+        # Reset the accumulator when the scroll target view changes.
+        if self._scroll_axis != axis:
             self._scroll_accum = 0
-            self._scroll_axis = None
-            self._scroll_timer = None
+            self._scroll_axis = axis
 
-        if not axis or accum == 0:
+        self._scroll_accum += int(np.sign(event.step))
+
+        widget = self._tk_widget()
+        if widget is None:
+            # Fall back to immediate application when the Tk backend is
+            # unavailable (e.g. in headless tests).
+            self._flush_scroll()
             return
 
-        def _apply() -> None:
-            """Run on the main thread: update the index and trigger a redraw."""
-            if self.state.primary_image is None:
-                return
-            current = self.state.indices.get(axis, 0)
-            new_idx = current + accum
-            new_idx = max(0, min(new_idx, self.state.get_max_index(axis)))
-            self.state.set_index(axis, new_idx, update_crosshair=True)
+        # Cancel any previously-scheduled flush and re-arm the timer so the
+        # debounce window is measured from the most recent event.
+        if self._scroll_after_id is not None:
+            try:
+                widget.after_cancel(self._scroll_after_id)
+            except Exception:
+                pass
+        self._scroll_after_id = widget.after(SCROLL_DEBOUNCE_MS, self._flush_scroll)
 
-        # Post the callback to the main thread via the Tk widget.
+    def _flush_scroll(self) -> None:
+        """Apply the accumulated scroll steps to the current slice index.
+
+        Runs on the Tk main thread (via ``widget.after``), so direct calls
+        into Matplotlib / state are safe.
+
+        After ``set_index`` fires its listener chain — which enqueues redraw
+        requests into ``DrawingManager`` — the queue is drained immediately
+        via ``flush()``. This removes the up-to-16 ms latency that would
+        otherwise be incurred waiting for the next timer tick.
+        """
+        accum = self._scroll_accum
+        axis = self._scroll_axis
+        self._scroll_accum = 0
+        self._scroll_axis = None
+        self._scroll_after_id = None
+
+        if not axis or accum == 0 or self.state.primary_image is None:
+            return
+
+        current = self.state.indices.get(axis, 0)
+        new_idx = max(0, min(current + accum, self.state.get_max_index(axis)))
+        self.state.set_index(axis, new_idx, update_crosshair=True)
+        self.viewer.drawing_manager.flush()
+
+    def _tk_widget(self):
+        """Return the underlying Tk widget, or ``None`` on non-Tk backends."""
         try:
-            self.viewer.canvas.get_tk_widget().after(0, _apply)
-        except Exception:
-            # Fall back to a direct call when the Tk backend is unavailable
-            # or the widget has already been destroyed (e.g. in test environments).
-            _apply()
+            return self.viewer.canvas.get_tk_widget()
+        except AttributeError:
+            return None
 
     # ------------------------------------------------------------------
     # Mouse press
@@ -247,9 +249,7 @@ class ViewerEventHandler:
             self.bbox_handler.handle_release(event)
 
         if self._dragging_wl:
-            self._dragging_wl = False
-            self._wl_start_pos = None
-            self._wl_initial = None
+            self._reset_wl_drag()
 
     # ------------------------------------------------------------------
     # Keyboard
@@ -259,12 +259,13 @@ class ViewerEventHandler:
         axis = self.state.current_axis
         if not axis or self.state.primary_image is None:
             return
-        delta = 0
         if event.key in ("up", "pageup"):
             delta = 1
         elif event.key in ("down", "pagedown"):
             delta = -1
-        if delta:
-            current = self.state.indices[axis]
-            new_idx = max(0, min(current + delta, self.state.get_max_index(axis)))
-            self.state.set_index(axis, new_idx, update_crosshair=True)
+        else:
+            return
+        current = self.state.indices[axis]
+        new_idx = max(0, min(current + delta, self.state.get_max_index(axis)))
+        self.state.set_index(axis, new_idx, update_crosshair=True)
+        self.viewer.drawing_manager.flush()

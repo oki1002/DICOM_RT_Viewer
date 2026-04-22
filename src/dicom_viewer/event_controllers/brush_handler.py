@@ -103,9 +103,7 @@ class BrushEventHandler:
             self._update_brush_cursor(event)
 
         if self._is_dragging:
-            pos_px = self._physical_to_slice_pixel(
-                self.state.current_axis, (event.xdata, event.ydata)
-            )
+            pos_px = self._physical_to_slice_pixel(current, (event.xdata, event.ydata))
             if pos_px == self._last_pos_px:
                 return
             self._paint_at(event, interpolate=True)
@@ -189,19 +187,20 @@ class BrushEventHandler:
 
     def _remove_brush_cursor(self) -> None:
         """Remove the brush cursor circle from the canvas."""
-        if self.brush_circle:
-            axis_name = next(
-                (
-                    name
-                    for name, ax in self.viewer.axs.items()
-                    if ax == self.brush_circle.axes
-                ),
-                None,
-            )
-            self.brush_circle.remove()
-            self.brush_circle = None
-            if axis_name:
-                self.viewer.drawing_manager.add_request(axis_name)
+        if not self.brush_circle:
+            return
+        axis_name = next(
+            (
+                name
+                for name, ax in self.viewer.axs.items()
+                if ax == self.brush_circle.axes
+            ),
+            None,
+        )
+        self.brush_circle.remove()
+        self.brush_circle = None
+        if axis_name:
+            self.viewer.drawing_manager.add_request(axis_name)
 
     # ------------------------------------------------------------------
     # Painting logic
@@ -228,7 +227,7 @@ class BrushEventHandler:
         self._last_pos_px = center_px
 
         # Render the contour from the cached slice so the outline reflects the
-        # latest paint state without a sitk round-trip or State notification.
+        # latest paint state without a sitk round-trip or a State notification.
         self._draw_axis_contours_from_cache(axis)
         self.viewer.drawing_manager.add_request(axis)
 
@@ -292,10 +291,10 @@ class BrushEventHandler:
         """Re-render the contour for the edited ROI using the cached slice.
 
         During dragging the cached volume reflects the latest paint but has
-        not yet been written back to State.  This method extracts the current
+        not yet been written back to State. This method extracts the current
         2-D slice from ``_cached_mask_volume`` and passes it to the viewer's
         public contour renderer via the ``override_mask`` parameter, bypassing
-        ``state.structure_set`` for the active ROI.  The outline therefore
+        ``state.structure_set`` for the active ROI. The outline therefore
         updates in real time without a sitk round-trip or a State notification.
         """
         if self._cached_mask_volume is None or self._cached_roi_number is None:
@@ -320,7 +319,7 @@ class BrushEventHandler:
         dimension for *axis* replaced by the current slice index.
         """
         slobj: list = [slice(None)] * 3
-        slobj[self.state._axis_to_numpy_index(axis)] = self.state.indices[axis]
+        slobj[self.state.axis_to_numpy_index(axis)] = self.state.indices[axis]
         return tuple(slobj)
 
     def _discard_cache(self) -> None:
@@ -365,8 +364,7 @@ class BrushEventHandler:
         slice_shape = mask_slice.shape
         if slice_shape[0] < 2 or slice_shape[1] < 2:
             return None
-        extent = self.state.get_extent(axis)
-        x_min, x_max, y_min, y_max = extent
+        x_min, x_max, y_min, y_max = self.state.get_extent(axis)
         col = (phys_pos[0] - x_min) / (x_max - x_min) * (slice_shape[1] - 1)
         row = (phys_pos[1] - y_min) / (y_max - y_min) * (slice_shape[0] - 1)
         return int(round(row)), int(round(col))

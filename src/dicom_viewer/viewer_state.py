@@ -61,6 +61,11 @@ logger = logging.getLogger(__name__)
 
 AXES = ("axial", "coronal", "sagittal")
 
+# Axis-name to dimension lookup tables. Defined at module level so that
+# runtime lookups never rebuild a dict (a measurable cost during scroll).
+_AXIS_TO_NUMPY_DIM: dict[str, int] = {"axial": 0, "coronal": 1, "sagittal": 2}
+_AXIS_TO_XYZ_DIM: dict[str, int] = {"axial": 2, "coronal": 1, "sagittal": 0}
+
 
 # ---------------------------------------------------------------------------
 # ContourPathCache
@@ -82,9 +87,6 @@ class ContourPathCache:
         # { (roi_number, axis, slice_index): list[matplotlib.path.Path] }
         self._cache: dict[tuple[int, str, int], list] = {}
 
-    # ------------------------------------------------------------------
-    # Read / write
-    # ------------------------------------------------------------------
     def get(self, roi_number: int, axis: str, index: int) -> list | None:
         """Return cached paths, or ``None`` when the entry is absent."""
         return self._cache.get((roi_number, axis, index))
@@ -93,14 +95,11 @@ class ContourPathCache:
         """Store *paths* for the given key."""
         self._cache[(roi_number, axis, index)] = paths
 
-    # ------------------------------------------------------------------
-    # Invalidation
-    # ------------------------------------------------------------------
     def invalidate_roi(self, roi_number: int) -> None:
         """Remove all cached entries for *roi_number*."""
-        keys = [k for k in self._cache if k[0] == roi_number]
-        for k in keys:
-            del self._cache[k]
+        # Materialise the key list first: dict cannot be mutated during iteration.
+        for key in [k for k in self._cache if k[0] == roi_number]:
+            del self._cache[key]
 
     def clear(self) -> None:
         """Remove every cached entry."""
@@ -129,9 +128,6 @@ class MaskSliceCache:
         cache.set_volume(roi_number=1, arr=np.zeros((100, 256, 256), dtype=np.uint8))
         slice_2d = cache.get_slice(roi_number=1, axis="axial", index=50)
     """
-
-    # Defined as a class variable to avoid dict construction on every scroll event.
-    _AXIS_DIM: dict[str, int] = {"axial": 0, "coronal": 1, "sagittal": 2}
 
     def __init__(self) -> None:
         # { roi_number: ndarray(z, y, x) }
@@ -165,14 +161,15 @@ class MaskSliceCache:
         arr = self._volumes.get(roi_number)
         if arr is None:
             return None
-        dim = self._AXIS_DIM.get(axis)
-        if dim is None:
+        dim = _AXIS_TO_NUMPY_DIM.get(axis)
+        if dim is None or index < 0 or index >= arr.shape[dim]:
             return None
-        if index < 0 or index >= arr.shape[dim]:
-            return None
-        slobj: list = [slice(None)] * 3
-        slobj[dim] = index
-        return arr[tuple(slobj)]
+        # Direct-indexed return avoids the cost of building a slice tuple.
+        if dim == 0:
+            return arr[index, :, :]
+        if dim == 1:
+            return arr[:, index, :]
+        return arr[:, :, index]
 
     def invalidate_roi(self, roi_number: int) -> None:
         """Remove the cached entry for *roi_number*."""
@@ -210,9 +207,6 @@ class StructureSet:
         self._data: dict[int, dict[str, Any]] = {}
         self._next_number: int = 1
 
-    # ------------------------------------------------------------------
-    # Mutation
-    # ------------------------------------------------------------------
     def add(self, name: str, mask: sitk.Image, color: str) -> int:
         """Add an ROI and return its assigned ROI number.
 
@@ -238,20 +232,20 @@ class StructureSet:
         if roi_number in self._data:
             self._data[roi_number].update(props)
 
-    # ------------------------------------------------------------------
-    # Accessors
-    # ------------------------------------------------------------------
     def get_name(self, roi_number: int) -> str | None:
         """Return the structure name for *roi_number*, or ``None``."""
-        return self._data.get(roi_number, {}).get("name")
+        entry = self._data.get(roi_number)
+        return entry["name"] if entry else None
 
     def get_mask(self, roi_number: int) -> sitk.Image | None:
         """Return the binary mask for *roi_number*, or ``None``."""
-        return self._data.get(roi_number, {}).get("mask")
+        entry = self._data.get(roi_number)
+        return entry["mask"] if entry else None
 
     def get_color(self, roi_number: int) -> str | None:
         """Return the hex colour string for *roi_number*, or ``None``."""
-        return self._data.get(roi_number, {}).get("color")
+        entry = self._data.get(roi_number)
+        return entry["color"] if entry else None
 
     def get_roi_numbers(self) -> list[int]:
         """Return a list of all ROI numbers in insertion order."""
@@ -328,14 +322,9 @@ class SliceViewerState:
     prescription_dose: float | None = None
 
     # --- Performance caches (not part of logical state) ---
-    # 3-D NumPy array cache for the primary image.
-    # Same design as dose_array_cache: converted once on load so that scroll
-    # updates only index into arr[i, :, :] without a sitk round-trip.
-    # Populated by _build_primary_array_cache() inside set_primary_image_data.
     primary_array_cache: np.ndarray | None = field(
         default=None, repr=False, compare=False
     )
-    # 3-D NumPy array cache for the secondary image. Same design as primary_array_cache.
     secondary_array_cache: np.ndarray | None = field(
         default=None, repr=False, compare=False
     )
@@ -345,26 +334,16 @@ class SliceViewerState:
     dose_array_cache: dict[str, np.ndarray] = field(
         default_factory=dict, repr=False, compare=False
     )
-    # Contour path cache shared between DicomViewer instances that share
-    # this state.  Invalidated per-ROI on mask changes.
     contour_path_cache: ContourPathCache = field(
         default_factory=ContourPathCache, repr=False, compare=False
     )
-    # 3-D NumPy array cache for ROI masks.
-    # Eliminates sitk round-trips during scroll by pre-caching mask volumes.
-    # Call invalidate_roi on mask updates; call clear when the structure set
-    # is replaced entirely.
     mask_slice_cache: MaskSliceCache = field(
         default_factory=MaskSliceCache, repr=False, compare=False
     )
-    # Thread pool used for background contour path builds.
-    # One task per ROI is submitted to pre-compute find_contours for all slices.
-    # Created lazily on first use; None until then.
     _contour_cache_executor: ThreadPoolExecutor | None = field(
         default=None, repr=False, compare=False
     )
     # In-flight background build Futures keyed by roi_number.
-    # Completed Futures are left in place to prevent duplicate submissions.
     _contour_cache_futures: dict[int, Future] = field(
         default_factory=dict, repr=False, compare=False
     )
@@ -408,9 +387,6 @@ class SliceViewerState:
     )
 
     # Cache for get_extent() results, keyed by axis name.
-    # Avoids repeated GetSize/GetSpacing/GetOrigin calls during scroll.
-    # Invalidated by _invalidate_extent_cache() when primary_image changes.
-    # { axis: [left, right, bottom, top] }
     _extent_cache: dict[str, list[float]] = field(
         default_factory=dict,
         compare=False,
@@ -429,7 +405,11 @@ class SliceViewerState:
         self._listeners[event_type].discard(listener)
 
     def _notify(self, event_type: str, *args, **kwargs) -> None:
-        """Call every listener registered for *event_type*."""
+        """Call every listener registered for *event_type*.
+
+        The listener set is snapshotted so a listener that mutates the
+        registry during iteration does not raise RuntimeError.
+        """
         for listener in list(self._listeners[event_type]):
             try:
                 listener(*args, **kwargs)
@@ -439,20 +419,24 @@ class SliceViewerState:
     # =========================================================
     # Axis index helpers
     # =========================================================
-    def _axis_to_xyz_index(self, axis: str) -> int:
+    def axis_to_xyz_index(self, axis: str) -> int:
         """Map a view-axis name to the LPS physical-coordinate dimension.
 
         Returns 0 for sagittal (x), 1 for coronal (y), 2 for axial (z).
         """
-        return {"axial": 2, "coronal": 1, "sagittal": 0}[axis]
+        return _AXIS_TO_XYZ_DIM[axis]
 
-    def _axis_to_numpy_index(self, axis: str) -> int:
+    def axis_to_numpy_index(self, axis: str) -> int:
         """Map a view-axis name to the NumPy array dimension.
 
-        NumPy arrays from SimpleITK are ordered ``(z, y, x)``, so:
+        NumPy arrays from SimpleITK are ordered ``(z, y, x)``:
         axial -> 0, coronal -> 1, sagittal -> 2.
         """
-        return {"axial": 0, "coronal": 1, "sagittal": 2}[axis]
+        return _AXIS_TO_NUMPY_DIM[axis]
+
+    # Backward-compatible aliases for internal callers.
+    _axis_to_xyz_index = axis_to_xyz_index
+    _axis_to_numpy_index = axis_to_numpy_index
 
     # =========================================================
     # Physical <-> index conversion
@@ -466,10 +450,11 @@ class SliceViewerState:
             self.indices.get("coronal", 0),
             self.indices.get("sagittal", 0),
         ]
-        numpy_indices[self._axis_to_numpy_index(axis)] = index
-        sitk_indices = tuple(numpy_indices[::-1])  # (z, y, x) -> (x, y, z)
+        numpy_indices[_AXIS_TO_NUMPY_DIM[axis]] = index
+        # Reverse (z, y, x) to SimpleITK's (x, y, z) ordering.
+        sitk_indices = tuple(numpy_indices[::-1])
         phys_point = self.primary_image.TransformIndexToPhysicalPoint(sitk_indices)
-        return phys_point[self._axis_to_xyz_index(axis)]
+        return phys_point[_AXIS_TO_XYZ_DIM[axis]]
 
     def physical_to_index(self, axis: str, coord: float) -> int:
         """Convert a physical LPS coordinate along *axis* to the nearest index."""
@@ -480,9 +465,9 @@ class SliceViewerState:
             self.index_to_physical("coronal", self.indices["coronal"]),
             self.index_to_physical("axial", self.indices["axial"]),
         ]
-        phys[self._axis_to_xyz_index(axis)] = coord
+        phys[_AXIS_TO_XYZ_DIM[axis]] = coord
         idx_point = self.primary_image.TransformPhysicalPointToIndex(phys)
-        numpy_idx = self._axis_to_numpy_index(axis)
+        numpy_idx = _AXIS_TO_NUMPY_DIM[axis]
         max_idx = self.primary_image.GetSize()[::-1][numpy_idx] - 1
         return int(np.clip(idx_point[2 - numpy_idx], 0, max_idx))
 
@@ -490,7 +475,7 @@ class SliceViewerState:
         """Return the maximum valid slice index for *axis*."""
         if self.primary_image is None:
             return 0
-        numpy_idx = self._axis_to_numpy_index(axis)
+        numpy_idx = _AXIS_TO_NUMPY_DIM[axis]
         return self.primary_image.GetSize()[::-1][numpy_idx] - 1
 
     # =========================================================
@@ -503,47 +488,21 @@ class SliceViewerState:
         arr = sitk.GetArrayViewFromImage(volume)
         if arr.size == 0:
             return np.array([])
-        slobj: list = [slice(None)] * 3
-        slobj[self._axis_to_numpy_index(axis)] = self.indices[axis]
-        return arr[tuple(slobj)]
+        return _slice_along_axis(arr, axis, self.indices[axis])
 
     def get_extent(self, axis: str) -> list[float]:
         """Return ``[left, right, bottom, top]`` in physical coordinates.
 
         Results are cached in ``_extent_cache`` to avoid repeated
-        GetSize/GetSpacing/GetOrigin calls during scrolling.
-        The cache is invalidated by ``_invalidate_extent_cache()``.
+        GetSize/GetSpacing/GetOrigin calls during scrolling. The cache is
+        invalidated by ``_invalidate_extent_cache()``.
         """
         cached = self._extent_cache.get(axis)
         if cached is not None:
             return cached
-
         if self.primary_image is None:
             return [0.0, 1.0, 0.0, 1.0]
-        size = self.primary_image.GetSize()
-        spacing = self.primary_image.GetSpacing()
-        origin = self.primary_image.GetOrigin()
-        if axis == "axial":
-            extent = [
-                origin[0],
-                origin[0] + spacing[0] * size[0],
-                origin[1],
-                origin[1] + spacing[1] * size[1],
-            ]
-        elif axis == "coronal":
-            extent = [
-                origin[0],
-                origin[0] + spacing[0] * size[0],
-                origin[2],
-                origin[2] + spacing[2] * size[2],
-            ]
-        else:  # sagittal
-            extent = [
-                origin[1],
-                origin[1] + spacing[1] * size[1],
-                origin[2],
-                origin[2] + spacing[2] * size[2],
-            ]
+        extent = _compute_extent(self.primary_image, axis)
         self._extent_cache[axis] = extent
         return extent
 
@@ -563,7 +522,7 @@ class SliceViewerState:
             self.indices[axis] = value
             self._notify("index_changed", axis, value)
             if update_crosshair:
-                self._update_crosshair_by_index()
+                self.update_crosshair_by_index()
 
     # =========================================================
     # Image resampling helper
@@ -576,11 +535,11 @@ class SliceViewerState:
         """Resample *image* to match the primary image geometry.
 
         If *transform* is provided it is applied before resampling (useful
-        for 4DCT phase registration).  Otherwise an identity transform is used.
+        for 4DCT phase registration). Otherwise an identity transform is used.
 
         Args:
             image:     The source image to resample.
-            transform: Optional pre-registered transform.  When ``None`` an
+            transform: Optional pre-registered transform. When ``None`` an
                 identity transform is assumed.
 
         Returns:
@@ -634,8 +593,7 @@ class SliceViewerState:
         self.rt_dose_resampled = None
         self.prescription_dose = None
 
-        # Invalidate all performance caches when the image changes.
-        # Cancel any in-flight background builds and release their references.
+        # Invalidate all performance caches and cancel any in-flight builds.
         self._cancel_all_contour_cache_builds()
         self.primary_array_cache = None
         self.secondary_array_cache = None
@@ -652,8 +610,6 @@ class SliceViewerState:
             self.set_index("axial", z_dim // 2, update_crosshair=False)
             self.set_index("coronal", y_dim // 2, update_crosshair=False)
             self.set_index("sagittal", x_dim // 2, update_crosshair=False)
-            # Same design as dose_array_cache: convert the CT volume to NumPy
-            # once at load time so scroll updates avoid sitk round-trips.
             self._build_primary_array_cache()
         else:
             self.indices = {axis: 0 for axis in AXES}
@@ -667,7 +623,7 @@ class SliceViewerState:
         """Set (or clear) the secondary overlay image.
 
         The image is automatically resampled to the primary image grid.
-        Setting ``image=None`` hides the overlay.  When a new image is
+        Setting ``image=None`` hides the overlay. When a new image is
         provided, :attr:`blend_alpha` is set to ``0.5`` so both images are
         visible immediately.
 
@@ -680,8 +636,7 @@ class SliceViewerState:
         else:
             self.secondary_image = self.get_resampled_image(image)
             self.set_blend_alpha(0.5)
-            # Convert the secondary image to NumPy once at load time to eliminate
-            # sitk round-trips during scrolling.
+            # Pre-cast once at load time to eliminate sitk round-trips during scroll.
             self.secondary_array_cache = np.asarray(
                 sitk.GetArrayFromImage(self.secondary_image), dtype=np.float32
             )
@@ -695,21 +650,13 @@ class SliceViewerState:
 
         A value of ``1.0`` means only the primary image is visible; ``0.0``
         shows only the secondary image.
-
-        Args:
-            alpha: Opacity of the primary image layer.
         """
         if self.blend_alpha != alpha:
             self.blend_alpha = alpha
             self._notify("blend_alpha_changed", alpha)
 
     def set_secondary_image_cmap(self, cmap_name: str) -> None:
-        """Change the colourmap used to display the secondary image.
-
-        Args:
-            cmap_name: A Matplotlib-compatible colourmap name (e.g.
-                ``"hot"``, ``"jet"``).
-        """
+        """Change the colourmap used to display the secondary image."""
         if self.secondary_image_cmap != cmap_name:
             self.secondary_image_cmap = cmap_name
             self._notify("secondary_image_cmap_changed", cmap_name)
@@ -718,9 +665,6 @@ class SliceViewerState:
         """Override the colour limits for the secondary image display.
 
         Set to ``None`` to fall back to the primary window/level.
-
-        Args:
-            clim: ``(vmin, vmax)`` pair, or ``None`` to clear the override.
         """
         if self.secondary_clim != clim:
             self.secondary_clim = clim
@@ -730,7 +674,7 @@ class SliceViewerState:
         """Set (or clear) the RT-DOSE volume.
 
         The raw image is stored in :attr:`rt_dose_image` and used for slice
-        display with the dose's own physical extent.  A version resampled to
+        display with the dose's own physical extent. A version resampled to
         the primary image grid is stored in :attr:`rt_dose_resampled` for DVH
         computation (where dose values must align with ROI masks).
 
@@ -757,7 +701,6 @@ class SliceViewerState:
         else:
             self.rt_dose_resampled = None
 
-        # Rebuild the dose NumPy cache after the resample result is ready.
         self._build_dose_array_cache()
         self._notify("rt_dose_changed", image)
 
@@ -766,9 +709,6 @@ class SliceViewerState:
 
         When ``None``, the 99th-percentile of the positive dose values is used
         as the 100% reference for IsoDose rendering.
-
-        Args:
-            dose_gy: Prescription dose in Gy, or ``None``.
         """
         if self.prescription_dose != dose_gy:
             self.prescription_dose = dose_gy
@@ -778,12 +718,7 @@ class SliceViewerState:
     # Primary / secondary image performance cache
     # =========================================================
     def _build_primary_array_cache(self) -> None:
-        """Convert the primary CT image to a float32 NumPy array and cache it.
-
-        Same design as dose_array_cache: converted once at load time so that
-        scroll updates read only ``primary_array_cache[i, :, :]`` without
-        triggering a sitk round-trip.
-        """
+        """Convert the primary CT image to a float32 NumPy array and cache it."""
         if self.primary_image is None:
             self.primary_array_cache = None
             return
@@ -798,47 +733,21 @@ class SliceViewerState:
         """Return the current primary image slice from the array cache.
 
         Falls back to ``get_slice_data`` when the cache has not been built.
-
-        Args:
-            axis: One of ``"axial"``, ``"coronal"``, or ``"sagittal"``.
-
-        Returns:
-            2-D float32 NumPy array.
         """
         if self.primary_array_cache is None:
             return self.get_slice_data(self.primary_image, axis)
-        numpy_dim = self._axis_to_numpy_index(axis)
-        idx = self.indices[axis]
-        # Index directly via tuple to avoid list construction on every scroll event.
-        if numpy_dim == 0:
-            return self.primary_array_cache[idx, :, :]
-        if numpy_dim == 1:
-            return self.primary_array_cache[:, idx, :]
-        return self.primary_array_cache[:, :, idx]
+        return _slice_along_axis(self.primary_array_cache, axis, self.indices[axis])
 
     def get_secondary_slice_cached(self, axis: str) -> np.ndarray:
         """Return the current secondary image slice from the array cache.
 
         Falls back to ``get_slice_data`` when the cache has not been built.
-
-        Args:
-            axis: One of ``"axial"``, ``"coronal"``, or ``"sagittal"``.
-
-        Returns:
-            2-D float32 NumPy array, or an empty array when no secondary image is loaded.
         """
         if self.secondary_image is None:
             return np.array([], dtype=np.float32)
         if self.secondary_array_cache is None:
             return self.get_slice_data(self.secondary_image, axis)
-        numpy_dim = self._axis_to_numpy_index(axis)
-        idx = self.indices[axis]
-        # Index directly via tuple to avoid list construction on every scroll event.
-        if numpy_dim == 0:
-            return self.secondary_array_cache[idx, :, :]
-        if numpy_dim == 1:
-            return self.secondary_array_cache[:, idx, :]
-        return self.secondary_array_cache[:, :, idx]
+        return _slice_along_axis(self.secondary_array_cache, axis, self.indices[axis])
 
     # =========================================================
     # Dose performance cache
@@ -846,18 +755,10 @@ class SliceViewerState:
     def _build_dose_array_cache(self) -> None:
         """Pre-cast the resampled dose volume to ``float32`` NumPy arrays.
 
-        All three axes share the same 3-D array object (no copy).  Each axis
-        key stores a reference to the same ``ndarray``; slice retrieval in
-        :meth:`get_dose_slice_cached` selects the appropriate dimension via
-        ``numpy_dim``:
-
-            axial    -> arr[i, :, :]  (dim-0)
-            coronal  -> arr[:, i, :]  (dim-1)
-            sagittal -> arr[:, :, i]  (dim-2)
-
-        Memory consumption is therefore equivalent to one volume regardless of
-        how many axis keys are stored.  When no resampled dose is available the
-        cache is cleared.
+        All three axes share the same 3-D array object (no copy). Memory
+        consumption is therefore equivalent to one volume regardless of
+        how many axis keys are stored. When no resampled dose is available
+        the cache is cleared.
         """
         self.dose_array_cache.clear()
         if self.rt_dose_resampled is None:
@@ -868,7 +769,7 @@ class SliceViewerState:
         arr = np.asarray(
             sitk.GetArrayFromImage(self.rt_dose_resampled), dtype=np.float32
         )
-        for axis in ("axial", "coronal", "sagittal"):
+        for axis in AXES:
             self.dose_array_cache[axis] = arr
 
         logger.info(f"Dose array cache built: shape={arr.shape}, dtype={arr.dtype}.")
@@ -877,69 +778,34 @@ class SliceViewerState:
         """Return the dose 2-D slice for the current index along *axis*.
 
         Uses :attr:`dose_array_cache` when available (avoids a ``sitk``
-        round-trip on every frame).  Falls back to :meth:`get_dose_slice`
+        round-trip on every frame). Falls back to :meth:`get_dose_slice`
         when the cache has not been populated.
-
-        Args:
-            axis: One of ``"axial"``, ``"coronal"``, or ``"sagittal"``.
 
         Returns:
             A 2-D ``float32`` NumPy array, or an empty array when the dose
             volume is absent or the CT slice lies outside the dose grid.
         """
-        if axis not in self.dose_array_cache:
+        arr = self.dose_array_cache.get(axis)
+        if arr is None:
             return self.get_dose_slice(axis)
 
-        arr = self.dose_array_cache[axis]
-        numpy_dim = self._axis_to_numpy_index(axis)
+        dim = _AXIS_TO_NUMPY_DIM[axis]
         idx = self.indices[axis]
-        max_idx = arr.shape[numpy_dim] - 1
-
-        if idx < 0 or idx > max_idx:
+        if idx < 0 or idx >= arr.shape[dim]:
             return np.array([], dtype=np.float32)
-
-        # Index directly via tuple to avoid list construction on every scroll event.
-        if numpy_dim == 0:
-            return arr[idx, :, :]
-        if numpy_dim == 1:
-            return arr[:, idx, :]
-        return arr[:, :, idx]
+        return _slice_along_axis(arr, axis, idx)
 
     # =========================================================
     # RT-DOSE geometry helpers
     # =========================================================
     def get_dose_extent(self, axis: str) -> list[float]:
-        """Return ``[left, right, bottom, top]`` in physical coordinates for the dose image.
+        """Return ``[left, right, bottom, top]`` for the dose image.
 
         Uses the dose image's own geometry (not the primary CT geometry).
         """
         if self.rt_dose_image is None:
             return [0.0, 1.0, 0.0, 1.0]
-        dose = self.rt_dose_image
-        size = dose.GetSize()
-        spacing = dose.GetSpacing()
-        origin = dose.GetOrigin()
-        if axis == "axial":
-            return [
-                origin[0],
-                origin[0] + spacing[0] * size[0],
-                origin[1],
-                origin[1] + spacing[1] * size[1],
-            ]
-        elif axis == "coronal":
-            return [
-                origin[0],
-                origin[0] + spacing[0] * size[0],
-                origin[2],
-                origin[2] + spacing[2] * size[2],
-            ]
-        else:  # sagittal
-            return [
-                origin[1],
-                origin[1] + spacing[1] * size[1],
-                origin[2],
-                origin[2] + spacing[2] * size[2],
-            ]
+        return _compute_extent(self.rt_dose_image, axis)
 
     def get_dose_slice(self, axis: str) -> np.ndarray:
         """Extract the dose 2-D slice closest to the current CT slice position.
@@ -954,9 +820,7 @@ class SliceViewerState:
         dose = self.rt_dose_image
         physical_coord = self.index_to_physical(axis, self.indices[axis])
 
-        # Axis -> SimpleITK x/y/z dimension; axis -> NumPy (z,y,x) dimension
-        sitk_dim = {"axial": 2, "coronal": 1, "sagittal": 0}[axis]
-        numpy_dim = {"axial": 0, "coronal": 1, "sagittal": 2}[axis]
+        sitk_dim = _AXIS_TO_XYZ_DIM[axis]
 
         dose_origin = dose.GetOrigin()[sitk_dim]
         dose_spacing = dose.GetSpacing()[sitk_dim]
@@ -968,13 +832,10 @@ class SliceViewerState:
         if dose_idx_f < -0.5 or dose_idx_f >= dose_size - 0.5:
             return np.array([])
 
-        dose_idx = int(round(dose_idx_f))
-        dose_idx = max(0, min(dose_idx, dose_size - 1))
+        dose_idx = max(0, min(int(round(dose_idx_f)), dose_size - 1))
 
         arr = sitk.GetArrayViewFromImage(dose)  # (z, y, x)
-        slobj: list = [slice(None)] * 3
-        slobj[numpy_dim] = dose_idx
-        return np.asarray(arr[tuple(slobj)])
+        return np.asarray(_slice_along_axis(arr, axis, dose_idx))
 
     def set_layout_mode(self, mode: str) -> None:
         """Switch the viewer layout mode.
@@ -1000,10 +861,6 @@ class SliceViewerState:
 
         After resampling the images are cached in :attr:`all_phases_data` and
         listeners are notified with ``"phases_data_loaded"``.
-
-        Args:
-            phases_data: Mapping of phase label -> series info dict, as
-                returned by ``load_all_series()``.
         """
         if not self.primary_image:
             logger.error("Cannot set phases: primary image not loaded.")
@@ -1023,11 +880,7 @@ class SliceViewerState:
         self._notify("phases_data_loaded", self.all_phases_data)
 
     def set_active_phase_as_secondary(self, phase_name: str) -> None:
-        """Activate a 4DCT phase as the secondary overlay image.
-
-        Args:
-            phase_name: Key in :attr:`all_phases_data` to activate.
-        """
+        """Activate a 4DCT phase as the secondary overlay image."""
         if phase_name not in self.all_phases_data:
             logger.warning(f"Phase '{phase_name}' not found in loaded phases.")
             return
@@ -1058,9 +911,9 @@ class SliceViewerState:
         """
         # Force notification by clearing the previous position first.
         self.crosshair_pos = {axis: None for axis in AXES}
-        self._update_crosshair_by_index()
+        self.update_crosshair_by_index()
 
-    def _update_crosshair_by_index(self) -> None:
+    def update_crosshair_by_index(self) -> None:
         """Recompute crosshair positions from current indices and notify listeners.
 
         For coronal/sagittal views the physical z coordinate is passed directly
@@ -1078,6 +931,9 @@ class SliceViewerState:
         if self.crosshair_pos != new_pos:
             self.crosshair_pos = new_pos
             self._notify("crosshair_changed")
+
+    # Backward-compatible alias for internal callers.
+    _update_crosshair_by_index = update_crosshair_by_index
 
     def set_crosshair_visible(self, visible: bool) -> None:
         """Show or hide the crosshair lines in all views."""
@@ -1098,11 +954,6 @@ class SliceViewerState:
         Only one bounding box can exist across all views at a time.
         When a non-``None`` box is set for *axis*, any existing box on
         another axis is cleared automatically.
-
-        Args:
-            axis: View axis (``"axial"``, ``"coronal"``, or ``"sagittal"``).
-            bbox: ``(x_min, y_min, width, height)`` in physical units, or
-                ``None`` to clear.
         """
         if self.bounding_boxes.get(axis) == bbox:
             return
@@ -1138,21 +989,17 @@ class SliceViewerState:
             raise ValueError(f"No bounding box set for axis '{axis}'")
         x0_p, y0_p, w_p, h_p = bbox
         x1_p, y1_p = x0_p + w_p, y0_p + h_p
-        if axis == "axial":
-            x0 = self.physical_to_index("sagittal", x0_p)
-            x1 = self.physical_to_index("sagittal", x1_p)
-            y0 = self.physical_to_index("coronal", y0_p)
-            y1 = self.physical_to_index("coronal", y1_p)
-        elif axis == "coronal":
-            x0 = self.physical_to_index("sagittal", x0_p)
-            x1 = self.physical_to_index("sagittal", x1_p)
-            y0 = self.physical_to_index("axial", y0_p)
-            y1 = self.physical_to_index("axial", y1_p)
-        else:  # sagittal
-            x0 = self.physical_to_index("coronal", x0_p)
-            x1 = self.physical_to_index("coronal", x1_p)
-            y0 = self.physical_to_index("axial", y0_p)
-            y1 = self.physical_to_index("axial", y1_p)
+        # Map each physical axis to the corresponding index axis per view.
+        axis_mapping = {
+            "axial": ("sagittal", "coronal"),
+            "coronal": ("sagittal", "axial"),
+            "sagittal": ("coronal", "axial"),
+        }
+        x_axis, y_axis = axis_mapping[axis]
+        x0 = self.physical_to_index(x_axis, x0_p)
+        x1 = self.physical_to_index(x_axis, x1_p)
+        y0 = self.physical_to_index(y_axis, y0_p)
+        y1 = self.physical_to_index(y_axis, y1_p)
         return min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y0)
 
     # =========================================================
@@ -1174,8 +1021,8 @@ class SliceViewerState:
         """Enable or disable filled (semi-transparent) contour overlay."""
         if self.overlay_contours != enable:
             self.overlay_contours = enable
-            # Path objects remain valid since facecolor is recomputed from to_rgba()
-            # inside _draw_axis_contours on every redraw.
+            # Path objects remain valid; the facecolor is recomputed from
+            # to_rgba() inside _draw_axis_contours on every redraw.
             self._notify("overlay_contours_changed", enable)
 
     def add_contour(self, name: str, mask: sitk.Image, color: str) -> int:
@@ -1184,7 +1031,6 @@ class SliceViewerState:
         # Cache the mask as a NumPy array to eliminate sitk round-trips during scrolling.
         arr = sitk.GetArrayFromImage(mask).astype(np.uint8)
         self.mask_slice_cache.set_volume(roi_number, arr)
-        # Pre-compute contour paths on a background thread (same strategy as RT-DOSE).
         self._schedule_contour_cache_build(roi_number)
         self._notify("all_contours_changed", self.structure_set)
         return roi_number
@@ -1193,7 +1039,6 @@ class SliceViewerState:
         """Remove the ROI identified by *roi_number* from the StructureSet."""
         self.structure_set.remove(roi_number)
         self.active_contours.discard(roi_number)
-        # Discard the build Future, path cache, and slice cache for the removed ROI.
         self._cancel_contour_cache_build(roi_number)
         self.contour_path_cache.invalidate_roi(roi_number)
         self.mask_slice_cache.invalidate_roi(roi_number)
@@ -1204,8 +1049,7 @@ class SliceViewerState:
         """Update properties (``name``, ``mask``, ``color``) for *roi_number*."""
         self.structure_set.update(roi_number, props)
         if "mask" in props:
-            # On mask change, invalidate both the path cache and the slice cache,
-            # then rebuild all slice paths on a background thread.
+            # On mask change, invalidate both caches then rebuild in the background.
             self.contour_path_cache.invalidate_roi(roi_number)
             arr = sitk.GetArrayFromImage(props["mask"]).astype(np.uint8)
             self.mask_slice_cache.set_volume(roi_number, arr)
@@ -1218,8 +1062,6 @@ class SliceViewerState:
     def _get_contour_executor(self) -> ThreadPoolExecutor:
         """Return the thread pool used for contour path builds (created lazily)."""
         if self._contour_cache_executor is None:
-            # A generous max_workers allows one task per ROI to run concurrently;
-            # actual concurrency is left to the OS scheduler.
             self._contour_cache_executor = ThreadPoolExecutor(
                 max_workers=8, thread_name_prefix="contour_cache"
             )
@@ -1231,9 +1073,6 @@ class SliceViewerState:
         Any existing in-flight task is cancelled before the new one is submitted.
         A ``"contour_cache_built"`` event is emitted on completion so the viewer
         can issue a redraw request.
-
-        Args:
-            roi_number: ROI number whose cache should be built.
         """
         self._cancel_contour_cache_build(roi_number)
         executor = self._get_contour_executor()
@@ -1255,7 +1094,7 @@ class SliceViewerState:
     def _cancel_contour_cache_build(self, roi_number: int) -> None:
         """Cancel the pending build task for *roi_number*, if any.
 
-        Tasks that are queued but not yet started are cancelled immediately.
+        Queued but not-yet-started tasks are cancelled immediately.
         Already-running tasks cannot be interrupted, but their ``_on_done``
         callback will not emit a notification because ``cancelled()`` returns
         ``False`` and the Future is no longer tracked.
@@ -1274,20 +1113,18 @@ class SliceViewerState:
         self._contour_cache_futures.clear()
 
     def _build_contour_path_cache_for_roi(self, roi_number: int) -> None:
-        """Run ``find_contours`` for every axis and slice of *roi_number* and populate the cache.
+        """Run ``find_contours`` for every axis and slice of *roi_number*.
 
-        This is the contour counterpart of ``_build_dose_array_cache`` for RT-DOSE.
-        Running it on a background thread at load time ensures that ``find_contours``
-        is never called during scrolling.
+        This is the contour counterpart of ``_build_dose_array_cache`` for
+        RT-DOSE. Running it on a background thread at load time ensures that
+        ``find_contours`` is never called during scrolling.
 
-        Thread safety: writes to ``contour_path_cache`` are not guarded by a lock,
-        but the ``(roi_number, axis, index)`` keys written here are never written
-        concurrently by the UI thread (brush-dragging skips the cache for the active
-        ROI but does not write to it).  The GIL protection on dict insertion is
-        therefore considered sufficient in practice.
-
-        Args:
-            roi_number: ROI number whose cache should be populated.
+        Thread safety: writes to ``contour_path_cache`` are not guarded by a
+        lock, but the ``(roi_number, axis, index)`` keys written here are
+        never written concurrently by the UI thread (brush-dragging skips
+        the cache for the active ROI but does not write to it). The GIL
+        protection on dict insertion is therefore considered sufficient
+        in practice.
         """
         if self.primary_image is None:
             return
@@ -1300,7 +1137,7 @@ class SliceViewerState:
         origin = self.primary_image.GetOrigin()
         spacing = self.primary_image.GetSpacing()
 
-        # Pre-compute extent and slice count for each axis.
+        # Per-axis (extent, numpy_dim, slice_count) configuration.
         # extent = [left, right, bottom, top] (physical coordinates)
         axis_configs: dict[str, tuple[list[float], int, int]] = {
             "axial": (
@@ -1310,8 +1147,8 @@ class SliceViewerState:
                     origin[1],
                     origin[1] + spacing[1] * size[1],
                 ],
-                0,  # numpy dim
-                size[2],  # slice count
+                0,
+                size[2],
             ),
             "coronal": (
                 [
@@ -1320,8 +1157,8 @@ class SliceViewerState:
                     origin[2],
                     origin[2] + spacing[2] * size[2],
                 ],
-                1,  # numpy dim
-                size[1],  # slice count
+                1,
+                size[1],
             ),
             "sagittal": (
                 [
@@ -1330,43 +1167,32 @@ class SliceViewerState:
                     origin[2],
                     origin[2] + spacing[2] * size[2],
                 ],
-                2,  # numpy dim
-                size[0],  # slice count
+                2,
+                size[0],
             ),
         }
 
         cache = self.contour_path_cache
 
         for axis, (extent, numpy_dim, n_slices) in axis_configs.items():
-            slobj: list = [slice(None)] * 3
+            x0, x1, y0, y1 = extent
             for idx in range(n_slices):
-                # Skip slices that already have a cached entry.
                 if cache.get(roi_number, axis, idx) is not None:
                     continue
 
-                slobj[numpy_dim] = idx
-                mask_slice = arr[tuple(slobj)]
+                # Direct-indexed slice retrieval (no slice tuple allocation).
+                if numpy_dim == 0:
+                    mask_slice = arr[idx, :, :]
+                elif numpy_dim == 1:
+                    mask_slice = arr[:, idx, :]
+                else:
+                    mask_slice = arr[:, :, idx]
 
                 if mask_slice.shape[0] < 2 or mask_slice.shape[1] < 2:
                     cache.set(roi_number, axis, idx, [])
                     continue
 
-                raw_contours = find_contours(mask_slice.astype(float), level=0.5)
-
-                paths = []
-                for contour in raw_contours:
-                    verts = [
-                        (
-                            extent[0]
-                            + (x / (mask_slice.shape[1] - 1)) * (extent[1] - extent[0]),
-                            extent[2]
-                            + (y / (mask_slice.shape[0] - 1)) * (extent[3] - extent[2]),
-                        )
-                        for y, x in contour
-                    ]
-                    if verts:
-                        codes = [MplPath.MOVETO] + [MplPath.LINETO] * (len(verts) - 1)
-                        paths.append(MplPath(verts, codes))
+                paths = _mask_slice_to_paths(mask_slice, x0, x1, y0, y1)
                 cache.set(roi_number, axis, idx, paths)
 
     def refresh_contours(self) -> None:
@@ -1413,3 +1239,88 @@ class SliceViewerState:
         new_image = sitk.GetImageFromArray(array)
         new_image.CopyInformation(self.primary_image)
         return new_image
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+def _slice_along_axis(arr: np.ndarray, axis: str, index: int) -> np.ndarray:
+    """Return the 2-D slice of *arr* at *index* along *axis*.
+
+    Centralises the three direct-indexed branches used across the slice
+    caches (primary, secondary, dose, mask). Avoids building a slice tuple
+    on every scroll event.
+    """
+    dim = _AXIS_TO_NUMPY_DIM[axis]
+    if dim == 0:
+        return arr[index, :, :]
+    if dim == 1:
+        return arr[:, index, :]
+    return arr[:, :, index]
+
+
+def _compute_extent(image: sitk.Image, axis: str) -> list[float]:
+    """Return ``[left, right, bottom, top]`` in physical coordinates for *image*.
+
+    Shared helper used by both :meth:`SliceViewerState.get_extent` and
+    :meth:`SliceViewerState.get_dose_extent`.
+    """
+    size = image.GetSize()
+    spacing = image.GetSpacing()
+    origin = image.GetOrigin()
+    if axis == "axial":
+        return [
+            origin[0],
+            origin[0] + spacing[0] * size[0],
+            origin[1],
+            origin[1] + spacing[1] * size[1],
+        ]
+    if axis == "coronal":
+        return [
+            origin[0],
+            origin[0] + spacing[0] * size[0],
+            origin[2],
+            origin[2] + spacing[2] * size[2],
+        ]
+    # sagittal
+    return [
+        origin[1],
+        origin[1] + spacing[1] * size[1],
+        origin[2],
+        origin[2] + spacing[2] * size[2],
+    ]
+
+
+def _mask_slice_to_paths(
+    mask_slice: np.ndarray,
+    x0: float,
+    x1: float,
+    y0: float,
+    y1: float,
+) -> list[MplPath]:
+    """Convert a 2-D mask slice into a list of matplotlib ``Path`` objects.
+
+    Pads the mask with a one-voxel zero border so that masks which touch
+    the slice edge (e.g. the BODY contour on coronal / sagittal views)
+    still produce closed contours. The +1 pixel padding offset is undone
+    when mapping contour coordinates back into physical space. Each
+    subpath is explicitly closed so that the fill rule sees a properly
+    bounded polygon.
+    """
+    padded = np.pad(mask_slice.astype(float), pad_width=1, mode="constant")
+    raw_contours = find_contours(padded, level=0.5)
+    h, w = mask_slice.shape
+    sx = (x1 - x0) / max(w - 1, 1)
+    sy = (y1 - y0) / max(h - 1, 1)
+
+    paths: list[MplPath] = []
+    for contour in raw_contours:
+        if len(contour) < 3:
+            continue
+        verts = [(x0 + (x - 1) * sx, y0 + (y - 1) * sy) for y, x in contour]
+        verts.append(verts[0])
+        codes = (
+            [MplPath.MOVETO] + [MplPath.LINETO] * (len(verts) - 2) + [MplPath.CLOSEPOLY]
+        )
+        paths.append(MplPath(verts, codes))
+    return paths
