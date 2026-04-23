@@ -11,8 +11,9 @@ A SimpleITK-based DICOM MPR viewer widget for Tkinter.
 - **Interactive navigation** — Crosshair drag, mouse wheel, and keyboard (↑ / ↓ / PageUp / PageDown).
 - **Window / level adjustment** — Right-click drag: horizontal → window width (WW), vertical → window centre (WL).
 - **RT-STRUCT support** — ROI masks stored in `StructureSet` (keyed by integer ROI number); contour overlay with optional semi-transparent fill; brush tool for mask editing.
+- **ROI operations** — Inter-slice interpolation, directional margin (uniform or 6-direction), Gaussian smoothing, and boolean operations (union / intersection / subtraction).
 - **Bounding box tool** — Create, move, and resize a bounding box with click-drag interactions.
-- **IsoDose overlay** — RT-DOSE volumes are displayed as isodose fills and contour lines; a DVH panel is available in the `"mpr"` layout mode.
+- **RT-DOSE overlay** — RT-DOSE volumes are displayed as isodose fills and contour lines; a DVH panel is available in the `"mpr"` layout mode.
 
 ## Requirements
 
@@ -41,8 +42,8 @@ pip install -e .
 dicom_viewer/
 ├── __init__.py
 ├── viewer.py             # DicomViewer widget, DrawingManager
-├── viewer_state.py       # SliceViewerState, StructureSet
-├── io.py                 # DICOM series loading utilities
+├── viewer_state.py       # SliceViewerState, StructureSet, ContourPathCache, MaskSliceCache
+├── io.py                 # DICOM series loading utilities (CT, RT-DOSE, REG)
 ├── rtstruct_io.py        # RT-STRUCT read / write utilities
 ├── roi_operations.py     # Interpolation, margin, smoothing, boolean ops
 └── event_controllers/
@@ -106,8 +107,45 @@ state.set_active_contours({roi_number})  # argument is a set[int]
 # Toggle filled overlay (semi-transparent)
 state.set_overlay_contours(True)
 
+# Update an ROI's name, mask, or colour
+state.update_contour_properties(roi_number, {"color": "#00ff00"})
+
 # Remove an ROI
 state.delete_contour(roi_number)
+```
+
+## ROI operations
+
+`dicom_viewer.roi_operations` provides pure-function utilities that take and
+return `sitk.Image`:
+
+```python
+from dicom_viewer.roi_operations import (
+    interpolate_contour,
+    apply_margin,
+    smooth_contour,
+    boolean_operation,
+    BooleanOp,
+    MarginConfig,
+)
+
+# Fill empty slices between existing mask slices
+filled_mask = interpolate_contour(mask_sitk_image)
+
+# Uniform 5 mm expansion (use negative values to shrink)
+grown = apply_margin(mask_sitk_image, MarginConfig.uniform(5.0))
+
+# Anisotropic margin (per-direction)
+custom = apply_margin(
+    mask_sitk_image,
+    MarginConfig(superior=5, inferior=3, anterior=2, posterior=2, left=4, right=4),
+)
+
+# Gaussian smoothing (sigma in mm)
+smoothed = smooth_contour(mask_sitk_image, sigma_mm=2.0)
+
+# Boolean operations: UNION, INTERSECTION, SUBTRACTION
+combined = boolean_operation(mask_a, mask_b, BooleanOp.UNION)
 ```
 
 ## Brush tool
@@ -141,6 +179,23 @@ x, y, w, h = state.get_bbox_pixel_coords("axial")
 
 # Clear
 state.set_bounding_box("axial", None)
+```
+
+## RT-DOSE & IsoDose display
+
+```python
+from dicom_viewer.io import load_rt_dose
+
+dose_image = load_rt_dose("/path/to/RTDOSE.dcm")
+state.set_rt_dose_image(dose_image)
+
+# Set a prescription dose (100% reference) for isodose rendering.
+# If omitted or set to None, the per-voxel Dmax is used instead.
+state.set_prescription_dose(60.0)  # 60 Gy
+
+# Customise isodose lines on the viewer itself ((Gy, colour) pairs).
+# Pass an empty list to hide all lines.
+viewer.set_isodose_lines([(18.0, "#0000cc"), (54.0, "#ffcc00"), (60.0, "#ff0000")])
 ```
 
 ## Layout modes
