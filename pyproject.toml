@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dicom-viewer"
-version = "0.3.0"
+dynamic = ["version"]
 description = "SimpleITK-based DICOM MPR viewer widget for Tkinter"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -26,6 +26,11 @@ dev = [
     "pytest>=7",
     "mypy>=1.0",
 ]
+
+[tool.hatch.version]
+# __init__.py's __version__ is the single source of truth; pyproject.toml
+# no longer duplicates it, so the two can no longer drift apart.
+path = "src/dicom_viewer/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 # src layout: only the package under src/ is included in the wheel.

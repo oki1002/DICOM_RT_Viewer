@@ -13,6 +13,9 @@ mask2rtstruct(ct_dir, rtss_path, structures) -> None
 resample_mask_to_original_space(_lps_image, original_image, lps_mask) -> sitk.Image
     Resample a mask from the LPS-aligned coordinate space back to the
     original image coordinate space.
+
+random_hex_color() -> str
+    Return a random display colour as a ``"#rrggbb"`` hex string.
 """
 
 import logging
@@ -167,6 +170,23 @@ def load_rt_struct(
     return structures
 
 
+# ---------------------------------------------------------------------------
+# Colour utilities
+# ---------------------------------------------------------------------------
+def random_hex_color() -> str:
+    """Return a random display colour as a hex string, e.g. ``"#a1b2c3"``.
+
+    Draws from the module-level RNG shared by this module's own
+    RT-STRUCT fallback colour (see :func:`_extract_roi_color`) and by
+    external callers that add ROIs without a caller-supplied colour.
+
+    Returns:
+        A ``"#rrggbb"`` hex colour string.
+    """
+    r, g, b = (int(c * 255) for c in _COLOR_RNG.random(3))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
 def _extract_roi_color(roi_contour: Any) -> str:
     """Return the display colour for *roi_contour* as a hex string.
 
@@ -174,9 +194,8 @@ def _extract_roi_color(roi_contour: Any) -> str:
     """
     if hasattr(roi_contour, "ROIDisplayColor"):
         r, g, b = (int(c) for c in roi_contour.ROIDisplayColor)
-    else:
-        r, g, b = (int(c * 255) for c in _COLOR_RNG.random(3))
-    return f"#{r:02x}{g:02x}{b:02x}"
+        return f"#{r:02x}{g:02x}{b:02x}"
+    return random_hex_color()
 
 
 # ---------------------------------------------------------------------------

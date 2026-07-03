@@ -200,6 +200,7 @@ class StructureSet:
         name  = ss.get_name(num)    # -> "PTV"
         color = ss.get_color(num)   # -> "#ff0000"
         nums  = ss.get_roi_numbers()  # -> [1, ...]
+        unique = ss.generate_unique_name("PTV")  # -> "PTV(2)"
     """
 
     def __init__(self) -> None:
@@ -236,6 +237,32 @@ class StructureSet:
         """Return the structure name for *roi_number*, or ``None``."""
         entry = self._data.get(roi_number)
         return entry["name"] if entry else None
+
+    def generate_unique_name(self, base_name: str) -> str:
+        """Return a name that does not collide with any existing ROI name.
+
+        When *base_name* is already taken, ``"base_name(2)"``,
+        ``"base_name(3)"``, ... is tried until a free name is found.
+        Centralising this rule here ensures every ROI-creation call site
+        (manual addition, RT-STRUCT import, inference results, ...)
+        resolves name collisions the same way.
+
+        Args:
+            base_name: The desired ROI name.
+
+        Returns:
+            A name guaranteed not to collide with any existing ROI name.
+        """
+        existing_names = {entry["name"] for entry in self._data.values()}
+        if base_name not in existing_names:
+            return base_name
+
+        counter = 2
+        candidate = f"{base_name}({counter})"
+        while candidate in existing_names:
+            counter += 1
+            candidate = f"{base_name}({counter})"
+        return candidate
 
     def get_mask(self, roi_number: int) -> sitk.Image | None:
         """Return the binary mask for *roi_number*, or ``None``."""

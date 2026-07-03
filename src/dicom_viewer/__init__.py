@@ -19,10 +19,15 @@ StructureSet
 
 I/O helpers (``dicom_viewer.io``)
     validate_dicom_files, find_reg_matrices,
-    load_all_series, load_dcm_series
+    load_all_series, load_dcm_series, normalize_phase_label
 
 RT-STRUCT helpers (``dicom_viewer.rtstruct_io``)
-    load_rt_struct, mask2rtstruct, resample_mask_to_original_space
+    load_rt_struct, mask2rtstruct, resample_mask_to_original_space,
+    random_hex_color
+
+ROI operations (``dicom_viewer.roi_operations``)
+    interpolate_contour, apply_margin, smooth_contour,
+    boolean_operation, thin_slices
 
 Quick start::
 
@@ -41,4 +46,4 @@ from .viewer import DicomViewer
 from .viewer_state import SliceViewerState, StructureSet
 
 __all__ = ["DicomViewer", "SliceViewerState", "StructureSet"]
-__version__ = "0.2.1"
+__version__ = "0.3.1"

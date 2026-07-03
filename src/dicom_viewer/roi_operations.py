@@ -5,6 +5,7 @@ Provided functions:
     - Margin application (apply_margin)
     - Gaussian smoothing (smooth_contour)
     - Boolean operations (boolean_operation)
+    - Slice thinning (thin_slices)
 
 All functions take and return ``sitk.Image``. Callers (on the UI side) can
 use these by simply passing metadata from ``SliceViewerState``.
@@ -322,4 +323,39 @@ def boolean_operation(
 
     out = sitk.GetImageFromArray(result.astype(np.uint8))
     out.CopyInformation(mask_a)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Slice thinning
+# ---------------------------------------------------------------------------
+def thin_slices(mask_image: sitk.Image, interval: int) -> sitk.Image:
+    """Keep only every *interval*-th slice along the axial axis, zeroing the rest.
+
+    Thinning is fixed to the axial axis (z, NumPy axis 0). Passing
+    ``interval=2`` keeps every other slice; the remaining slices are
+    cleared rather than removed, so the output geometry matches the input.
+
+    Args:
+        mask_image: Binary mask to thin (sitk.Image, uint8).
+        interval:   Output interval (must be 2 or greater).
+
+    Returns:
+        Thinned binary mask (sitk.Image, uint8). Retains the same
+        metadata (origin / spacing / direction) as the input.
+
+    Raises:
+        ValueError: If *interval* is less than 2.
+    """
+    if interval < 2:
+        raise ValueError(f"interval must be 2 or greater, got {interval}.")
+
+    arr = sitk.GetArrayFromImage(mask_image)
+    thinned = np.zeros_like(arr)
+    thinned[::interval] = arr[::interval]
+
+    logger.info(f"Slices thinned: interval={interval}.")
+
+    out = sitk.GetImageFromArray(thinned)
+    out.CopyInformation(mask_image)
     return out

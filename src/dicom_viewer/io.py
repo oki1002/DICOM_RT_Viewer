@@ -22,6 +22,10 @@ find_rt_dose_files(folder_path) -> list[pathlib.Path]
 
 load_rt_dose(dose_path) -> sitk.Image
     Load an RT-DOSE DICOM file and return a ``sitk.Image`` scaled to Gy.
+
+normalize_phase_label(text) -> str | None
+    Extract a respiratory-phase label (e.g. ``"10%"``) from a DICOM
+    SeriesDescription string, or ``None`` if no such pattern is present.
 """
 
 import logging
@@ -39,6 +43,7 @@ logger = logging.getLogger(__name__)
 _SPATIAL_REGISTRATION_UID = "1.2.840.10008.5.1.4.1.1.66.1"
 _CT_IMAGE_STORAGE_UID = "1.2.840.10008.5.1.4.1.1.2"
 _RT_DOSE_STORAGE_UID = "1.2.840.10008.5.1.4.1.1.481.2"
+_PHASE_LABEL_PATTERN = re.compile(r"\d+%")
 
 
 class SeriesInfo(TypedDict):
@@ -95,6 +100,27 @@ def validate_dicom_files(folder_path: str | pathlib.Path) -> bool:
 
     logger.info(f"Validation passed: single CT series in {folder}.")
     return True
+
+
+# ---------------------------------------------------------------------------
+# Phase label utilities
+# ---------------------------------------------------------------------------
+def normalize_phase_label(text: str) -> str | None:
+    """Extract a respiratory-phase label (e.g. ``"10%"``) from *text*.
+
+    Used to resolve 4DCT phase series into a stable key (see
+    :func:`_resolve_series_description`) and shared with external callers
+    that need to test whether a string represents a respiratory phase,
+    ensuring both sides agree on the same label for a given series.
+
+    Args:
+        text: A string to search, typically a DICOM SeriesDescription.
+
+    Returns:
+        The matched ``"N%"`` substring, or ``None`` if no match is found.
+    """
+    match = _PHASE_LABEL_PATTERN.search(text)
+    return match.group(0) if match else None
 
 
 # ---------------------------------------------------------------------------
@@ -259,8 +285,7 @@ def _resolve_series_description(reader: sitk.ImageSeriesReader, series_id: str) 
         return series_id
 
     raw_desc = reader.GetMetaData(0, "0008|103e")
-    match = re.search(r"(\d+%)", raw_desc)
-    return match.group(1) if match else raw_desc
+    return normalize_phase_label(raw_desc) or raw_desc
 
 
 def _build_series_info(
