@@ -20,6 +20,7 @@ Scroll debounce:
     excluded from debouncing.
 """
 
+import tkinter as tk
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -120,11 +121,14 @@ class ViewerEventHandler:
         if not axis or self.state.primary_image is None:
             return
 
-        # Reset the accumulator when the scroll target view changes.
-        if self._scroll_axis != axis:
-            self._scroll_accum = 0
-            self._scroll_axis = axis
+        # Flush any accumulated steps for the previous view before switching
+        # views, otherwise a quick hop between views silently drops the
+        # pending scroll delta of the view the pointer just left.
+        if self._scroll_axis is not None and self._scroll_axis != axis:
+            self._cancel_scroll_timer()
+            self._flush_scroll()
 
+        self._scroll_axis = axis
         self._scroll_accum += int(np.sign(event.step))
 
         widget = self._tk_widget()
@@ -136,23 +140,32 @@ class ViewerEventHandler:
 
         # Cancel any previously-scheduled flush and re-arm the timer so the
         # debounce window is measured from the most recent event.
-        if self._scroll_after_id is not None:
+        self._cancel_scroll_timer()
+        self._scroll_after_id = widget.after(SCROLL_DEBOUNCE_MS, self._flush_scroll)
+
+    def _cancel_scroll_timer(self) -> None:
+        """Cancel the pending scroll-debounce callback, if any."""
+        if self._scroll_after_id is None:
+            return
+        widget = self._tk_widget()
+        if widget is not None:
             try:
                 widget.after_cancel(self._scroll_after_id)
-            except Exception:
+            except tk.TclError:
                 pass
-        self._scroll_after_id = widget.after(SCROLL_DEBOUNCE_MS, self._flush_scroll)
+        self._scroll_after_id = None
 
     def _flush_scroll(self) -> None:
         """Apply the accumulated scroll steps to the current slice index.
 
         Runs on the Tk main thread (via ``widget.after``), so direct calls
-        into Matplotlib / state are safe.
+        into Matplotlib / state are safe. Range clamping is delegated to
+        ``SliceViewerState.set_index``.
 
         After ``set_index`` fires its listener chain — which enqueues redraw
         requests into ``DrawingManager`` — the queue is drained immediately
-        via ``flush()``. This removes the up-to-16 ms latency that would
-        otherwise be incurred waiting for the next timer tick.
+        via ``flush()`` so the new slice appears without waiting for the
+        next Tk idle-loop iteration.
         """
         accum = self._scroll_accum
         axis = self._scroll_axis
@@ -164,9 +177,19 @@ class ViewerEventHandler:
             return
 
         current = self.state.indices.get(axis, 0)
-        new_idx = max(0, min(current + accum, self.state.get_max_index(axis)))
-        self.state.set_index(axis, new_idx, update_crosshair=True)
+        self.state.set_index(axis, current + accum, update_crosshair=True)
         self.viewer.drawing_manager.flush()
+
+    def cancel_pending(self) -> None:
+        """Cancel any pending debounced scroll flush without applying it.
+
+        Call this when the owning viewer is being destroyed so that a
+        ``widget.after`` callback never fires against a widget that no
+        longer exists.
+        """
+        self._cancel_scroll_timer()
+        self._scroll_accum = 0
+        self._scroll_axis = None
 
     def _tk_widget(self):
         """Return the underlying Tk widget, or ``None`` on non-Tk backends."""
@@ -266,6 +289,5 @@ class ViewerEventHandler:
         else:
             return
         current = self.state.indices[axis]
-        new_idx = max(0, min(current + delta, self.state.get_max_index(axis)))
-        self.state.set_index(axis, new_idx, update_crosshair=True)
+        self.state.set_index(axis, current + delta, update_crosshair=True)
         self.viewer.drawing_manager.flush()

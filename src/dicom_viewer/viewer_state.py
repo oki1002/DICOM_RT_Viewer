@@ -258,8 +258,10 @@ class SliceViewerState:
     )
 
     # --- Observer ---
-    _listeners: dict[str, set[Callable]] = field(
-        default_factory=lambda: defaultdict(set),
+    # Values are unused; a dict is used as an insertion-ordered set so that
+    # listeners fire in a deterministic, registration order.
+    _listeners: dict[str, dict[Callable, None]] = field(
+        default_factory=lambda: defaultdict(dict),
         compare=False,
         repr=False,
     )
@@ -297,16 +299,25 @@ class SliceViewerState:
         """Mask volume cache (delegates to the one owned by ViewerCacheManager)."""
         return self._cache.mask_slice_cache
 
+    def close(self) -> None:
+        """Shut down the background contour-build thread pool permanently.
+
+        Call this once when the viewer that owns this state is destroyed.
+        The state itself has no other resources that require explicit
+        cleanup.
+        """
+        self._cache.close()
+
     # =========================================================
     # Observer
     # =========================================================
     def add_listener(self, event_type: str, listener: Callable) -> None:
         """Register *listener* to be called when *event_type* is emitted."""
-        self._listeners[event_type].add(listener)
+        self._listeners[event_type][listener] = None
 
     def remove_listener(self, event_type: str, listener: Callable) -> None:
         """Unregister *listener* from *event_type*. No-op if not registered."""
-        self._listeners[event_type].discard(listener)
+        self._listeners[event_type].pop(listener, None)
 
     def _notify(self, event_type: str, *args, **kwargs) -> None:
         """Call every listener registered for *event_type*.
@@ -421,10 +432,17 @@ class SliceViewerState:
     # Index manipulation
     # =========================================================
     def set_index(self, axis: str, value: int, update_crosshair: bool = True) -> None:
-        """Set the slice index for *axis* and notify listeners."""
-        if self.indices.get(axis) != value:
-            self.indices[axis] = value
-            self._notify("index_changed", axis, value)
+        """Set the slice index for *axis* and notify listeners.
+
+        *value* is clamped to ``[0, get_max_index(axis)]`` here so that every
+        caller (scroll, keyboard, crosshair drag, ``_SingleVar``) shares one
+        range-checking rule instead of duplicating ``max(0, min(...))`` at
+        each call site.
+        """
+        clamped = int(np.clip(value, 0, self.get_max_index(axis)))
+        if self.indices.get(axis) != clamped:
+            self.indices[axis] = clamped
+            self._notify("index_changed", axis, clamped)
             if update_crosshair:
                 self.update_crosshair_by_index()
 
@@ -600,8 +618,9 @@ class SliceViewerState:
     def set_prescription_dose(self, dose_gy: float | None) -> None:
         """Set the prescription dose in Gy.
 
-        When ``None``, the 99th-percentile of the positive dose values is used
-        as the 100% reference for IsoDose rendering.
+        When ``None``, ``DicomViewer._get_ref_dose`` falls back to the cached
+        maximum of the positive voxels in the original (pre-resampled)
+        RT-DOSE image as the 100% reference for IsoDose rendering.
         """
         if self.prescription_dose != dose_gy:
             self.prescription_dose = dose_gy
@@ -895,6 +914,34 @@ class SliceViewerState:
         self._cache.schedule_contour_build(roi_number, self.primary_image)
         self._notify("all_contours_changed", self.structure_set)
         return roi_number
+
+    def add_contours(self, rois: list[tuple[str, sitk.Image, str]]) -> list[int]:
+        """Add multiple ROIs in a single batch and fire one notification.
+
+        Loading an RT-STRUCT with many ROIs one at a time via
+        :meth:`add_contour` fires ``all_contours_changed`` — and therefore a
+        full contour redraw — after every single ROI. This method performs
+        the same per-ROI registration but defers the notification until all
+        ROIs have been added, so an N-ROI RT-STRUCT triggers one redraw
+        instead of N.
+
+        Args:
+            rois: List of ``(name, mask, color)`` tuples, e.g. built from
+                the ``RoiInfo`` dicts returned by
+                :func:`~dicom_viewer.rtstruct_io.load_rt_struct`.
+
+        Returns:
+            ROI numbers in the same order as *rois*.
+        """
+        roi_numbers: list[int] = []
+        for name, mask, color in rois:
+            roi_number = self.structure_set.add(name, mask, color)
+            self._cache.register_mask_volume(roi_number, mask)
+            self._cache.schedule_contour_build(roi_number, self.primary_image)
+            roi_numbers.append(roi_number)
+        if roi_numbers:
+            self._notify("all_contours_changed", self.structure_set)
+        return roi_numbers
 
     def delete_contour(self, roi_number: int) -> None:
         """Remove the ROI identified by *roi_number* from the StructureSet."""

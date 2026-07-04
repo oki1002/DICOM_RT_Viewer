@@ -260,7 +260,7 @@ class ViewerCacheManager:
     # ------------------------------------------------------------------
     def register_mask_volume(self, roi_number: int, mask: sitk.Image) -> None:
         """Convert a mask image to a uint8 array and register it in MaskSliceCache."""
-        arr = sitk.GetArrayFromImage(mask).astype(np.uint8)
+        arr = sitk.GetArrayFromImage(mask).astype(np.uint8, copy=False)
         self.mask_slice_cache.set_volume(roi_number, arr)
 
     def invalidate_roi(self, roi_number: int) -> None:
@@ -279,6 +279,8 @@ class ViewerCacheManager:
         """Discard every cache and cancel all in-flight background builds.
 
         Call this when the state is fully reset, e.g. on image switch.
+        The thread pool itself is kept alive; use :meth:`close` to shut it
+        down permanently.
         """
         self.cancel_all_contour_builds()
         self.primary_array = None
@@ -286,6 +288,19 @@ class ViewerCacheManager:
         self.dose_array = None
         self.contour_path_cache.clear()
         self.mask_slice_cache.clear()
+
+    def close(self) -> None:
+        """Cancel in-flight builds and shut down the background thread pool.
+
+        Call this exactly once, when the owning ``SliceViewerState`` (and its
+        viewer) is being torn down permanently. After this call the manager
+        must not be used again; :meth:`schedule_contour_build` would recreate
+        a new executor and leak a thread pool that is never closed.
+        """
+        self.cancel_all_contour_builds()
+        if self._contour_executor is not None:
+            self._contour_executor.shutdown(wait=False, cancel_futures=True)
+            self._contour_executor = None
 
     # ------------------------------------------------------------------
     # Background contour-path build

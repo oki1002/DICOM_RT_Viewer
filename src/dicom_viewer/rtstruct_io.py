@@ -149,7 +149,7 @@ def load_rt_struct(
     ) -> tuple[int, RoiInfo] | None:
         """Fetch the mask for one ROI; return None on failure."""
         try:
-            mask = rtstruct.get_roi_mask_by_name(roi_name).astype(bool)
+            mask = rtstruct.get_roi_mask_by_name(roi_name).astype(bool, copy=False)
             mask = np.transpose(mask, (2, 0, 1))
         except Exception as exc:
             logger.warning(
@@ -249,7 +249,7 @@ def mask2rtstruct(
         roi_name = roi_data["name"]
         try:
             rtstruct.add_roi(
-                mask=np.transpose(roi_data["mask"], (1, 2, 0)).astype(bool),
+                mask=np.transpose(roi_data["mask"], (1, 2, 0)).astype(bool, copy=False),
                 color=roi_data["color"],
                 name=roi_name,
             )
