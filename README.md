@@ -5,7 +5,7 @@ A SimpleITK-based DICOM MPR viewer widget for Tkinter.
 ## Features
 
 - **Three-plane MPR display** — Axial (large left), Coronal, and Sagittal views in a single widget.
-- **Blit-based rendering** — ~60 FPS updates via `DrawingManager` background caching.
+- **Blit-based rendering** — Idle-driven blit updates via `DrawingManager`; redraw requests are coalesced into a single Tk `after_idle` callback instead of a fixed-interval polling timer.
 - **Observer-pattern state management** — All view state lives in `SliceViewerState`; the widget reacts to changes without polling.
 - **SimpleITK-native coordinates** — Physical LPS coordinates, origin, spacing, and direction cosines are preserved throughout; axis reordering between SimpleITK and NumPy conventions is handled internally by the library.
 - **Interactive navigation** — Crosshair drag, mouse wheel, and keyboard (↑ / ↓ / PageUp / PageDown).
@@ -19,6 +19,7 @@ A SimpleITK-based DICOM MPR viewer widget for Tkinter.
 
 - Python ≥ 3.12
 - SimpleITK ≥ 2.3
+- contourpy ≥ 1.2
 - matplotlib ≥ 3.7
 - numpy ≥ 1.24
 - pydicom ≥ 2.4
@@ -41,17 +42,32 @@ pip install -e .
 ```
 dicom_viewer/
 ├── __init__.py
-├── viewer.py             # DicomViewer widget, DrawingManager
-├── viewer_state.py       # SliceViewerState, StructureSet, ContourPathCache, MaskSliceCache
-├── io.py                 # DICOM series loading utilities (CT, RT-DOSE, REG)
-├── rtstruct_io.py        # RT-STRUCT read / write utilities
-├── roi_operations.py     # Interpolation, margin, smoothing, boolean ops
+├── viewer.py                  # DicomViewer widget (wires up the collaborators below)
+├── geometry.py                 # Pure geometric helpers (slicing, extent, contour paths)
+├── io.py                       # DICOM series loading utilities (CT, RT-DOSE, REG)
+├── rtstruct_io.py               # RT-STRUCT read / write utilities
+├── roi_operations.py             # Interpolation, margin, smoothing, boolean ops
+├── state/
+│   ├── viewer_state.py          # SliceViewerState, StructureSet
+│   └── viewer_cache.py           # ViewerCacheManager, ContourPathCache, MaskSliceCache
+├── rendering/
+│   ├── drawing_manager.py        # DrawingManager (idle-driven blit redraw)
+│   ├── render.py                  # RGBA colormap LUT helpers
+│   ├── isodose.py                 # IsoDoseOverlay (fill bands + contour lines)
+│   ├── dvh.py                     # DvhPanel (cumulative DVH panel)
+│   └── layout.py                  # LayoutManager (mpr / mpr_wide GridSpec layouts)
 └── event_controllers/
     ├── viewer_events.py      # ViewerEventHandler (top-level dispatcher)
     ├── crosshair_handler.py
     ├── brush_handler.py
     └── bbox_handler.py
 ```
+
+`state/` holds the Tkinter-independent observable state and performance
+caches; `rendering/` holds the canvas-rendering collaborators that
+`DicomViewer` constructs and wires together in `__init__`. Each class in
+`rendering/` is constructed with the state, figure, or callback it needs
+(dependency injection), so none of them import `DicomViewer` itself.
 
 ## Quick start
 
@@ -112,6 +128,31 @@ state.update_contour_properties(roi_number, {"color": "#00ff00"})
 
 # Remove an ROI
 state.delete_contour(roi_number)
+```
+
+Loading many ROIs at once (e.g. from an RT-STRUCT with dozens of
+structures) is faster via `add_contours`, which fires a single redraw
+notification instead of one per ROI. `load_rt_struct` returns each mask as
+a plain NumPy array, so it must be wrapped back into a `sitk.Image` sharing
+the CT's geometry before being added:
+
+```python
+import SimpleITK as sitk
+from dicom_viewer.rtstruct_io import load_rt_struct
+
+structures = load_rt_struct(ct_dir, rtstruct_path)
+
+def to_sitk_mask(mask_arr):
+    mask_image = sitk.GetImageFromArray(mask_arr.astype("uint8"))
+    mask_image.CopyInformation(ct_image)  # ct_image: the loaded CT sitk.Image
+    return mask_image
+
+roi_numbers = state.add_contours(
+    [
+        (info["name"], to_sitk_mask(info["mask"]), info["color"])
+        for info in structures.values()
+    ]
+)
 ```
 
 ## ROI operations
@@ -228,16 +269,24 @@ all update in response to the same state changes.
 ## Architecture overview
 
 ```
-SliceViewerState          # owns all mutable state; broadcasts events
-    └─ StructureSet       # ROI masks keyed by integer ROI number
+SliceViewerState (state/viewer_state.py)     # owns all mutable state; broadcasts events
+    ├─ StructureSet                           # ROI masks keyed by integer ROI number
+    └─ ViewerCacheManager (state/viewer_cache.py)
 
-DicomViewer (ttk.Frame)
-    ├─ DrawingManager     # 60 FPS blit-based render loop
-    └─ ViewerEventHandler # routes canvas events to sub-handlers
+DicomViewer (ttk.Frame, viewer.py)
+    ├─ DrawingManager (rendering/)     # idle-driven blit-redraw coalescing
+    ├─ IsoDoseOverlay (rendering/)     # isodose fill bands + contour lines
+    ├─ DvhPanel (rendering/)           # cumulative DVH panel
+    ├─ LayoutManager (rendering/)      # mpr / mpr_wide GridSpec layouts
+    └─ ViewerEventHandler              # routes canvas events to sub-handlers
         ├─ CrosshairEventHandler
         ├─ BrushEventHandler
         └─ BboxEventHandler
 ```
+
+Every collaborator under `rendering/` is constructed by `DicomViewer` with
+the state, figure, or callback it needs rather than importing the viewer
+itself, so each one can be exercised independently of Tkinter in tests.
 
 ## License
 

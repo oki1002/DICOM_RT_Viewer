@@ -1,0 +1,74 @@
+"""layout.py — MPR / DVH figure layout (GridSpec axes) construction.
+
+LayoutManager builds the matplotlib Axes for each supported layout mode.
+It depends only on a Figure and a DVH-axes styling callback supplied at
+construction (typically DvhPanel.style_axes), so it never imports or
+touches DicomViewer.
+"""
+
+from typing import Callable
+
+import matplotlib.gridspec as gridspec
+from matplotlib.axes import Axes
+from matplotlib.figure import Figure
+
+
+class LayoutManager:
+    """Builds the Axes layout for a given mode inside a shared Figure.
+
+    Supported modes:
+        ``"mpr_wide"`` — left column: large Axial; right column: Coronal /
+            Sagittal stacked (default, no DVH panel).
+        ``"mpr"``      — 2x2 grid: top row Axial + DVH; bottom row Coronal
+            and Sagittal.
+    """
+
+    def __init__(self, fig: Figure, style_dvh_axes: Callable[[Axes], None]) -> None:
+        """Initialise the layout manager.
+
+        Args:
+            fig: The Figure that Axes are added to. The caller is
+                responsible for calling ``fig.clear()`` before :meth:`build`
+                when replacing an existing layout.
+            style_dvh_axes: Callback applying dark-theme styling to a
+                newly-created DVH Axes (typically ``DvhPanel.style_axes``).
+                Injected so this class never needs to depend on DvhPanel.
+        """
+        self._fig = fig
+        self._style_dvh_axes = style_dvh_axes
+
+    def build(self, mode: str) -> tuple[dict[str, Axes], Axes | None]:
+        """Create Axes for *mode* and return ``(axs, dvh_ax)``.
+
+        Args:
+            mode: ``"mpr_wide"`` or ``"mpr"``. See the class docstring.
+
+        Returns:
+            A ``({"axial": Axes, "coronal": Axes, "sagittal": Axes}, dvh_ax)``
+            tuple. ``dvh_ax`` is ``None`` for ``"mpr_wide"``.
+        """
+        if mode == "mpr_wide":
+            gs = gridspec.GridSpec(2, 2, figure=self._fig, width_ratios=[2, 1])
+            axs = {
+                "axial": self._fig.add_subplot(gs[:, 0]),
+                "coronal": self._fig.add_subplot(gs[0, 1]),
+                "sagittal": self._fig.add_subplot(gs[1, 1]),
+            }
+            dvh_ax = None
+        else:
+            # "mpr": 2x2 grid — top row (Axial + DVH), bottom row (Coronal + Sagittal)
+            gs = gridspec.GridSpec(2, 2, figure=self._fig)
+            axs = {
+                "axial": self._fig.add_subplot(gs[0, 0]),
+                "coronal": self._fig.add_subplot(gs[1, 0]),
+                "sagittal": self._fig.add_subplot(gs[1, 1]),
+            }
+            dvh_ax = self._fig.add_subplot(gs[0, 1])
+            self._style_dvh_axes(dvh_ax)
+
+        for ax in axs.values():
+            ax.set_facecolor("black")
+            ax.tick_params(colors="white")
+            ax.set_axis_off()
+
+        return axs, dvh_ax

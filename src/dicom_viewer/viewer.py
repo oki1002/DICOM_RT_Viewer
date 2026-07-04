@@ -1,11 +1,16 @@
 """viewer.py — DicomViewer: Tkinter-embeddable MPR viewer widget.
 
 Architecture:
-    - Rendering uses DrawingManager with ~60 FPS blit-based updates.
+    - Rendering uses rendering.DrawingManager with idle-driven blit updates.
     - State changes are received through the Observer callbacks on
       SliceViewerState; the viewer never mutates state directly.
     - All input events are delegated to ViewerEventHandler.
     - Default layout: left column — large Axial; right column — Coronal / Sagittal.
+    - Rendering collaborators (DrawingManager, IsoDoseOverlay, DvhPanel,
+      LayoutManager, the RGBA LUT helpers) live under dicom_viewer.rendering
+      and are constructed here with the state / figure / callbacks they need,
+      so DicomViewer only wires them together instead of containing their
+      logic inline.
 
 Slice navigation:
     - Drag a crosshair line.
@@ -24,10 +29,10 @@ Secondary image & blend:
 
 IsoDose display:
     When an RT-DOSE volume is loaded, the isodose display is rendered by
-    :class:`~dicom_viewer.isodose.IsoDoseOverlay`: band fills come from a
-    persistent per-axis AxesImage driven by ListedColormap + BoundaryNorm,
-    and contour lines from a persistent per-axis LineCollection fed by
-    contourpy. See isodose.py for the full design notes.
+    :class:`~dicom_viewer.rendering.isodose.IsoDoseOverlay`: band fills come
+    from a persistent per-axis AxesImage driven by ListedColormap +
+    BoundaryNorm, and contour lines from a persistent per-axis LineCollection
+    fed by contourpy. See rendering/isodose.py for the full design notes.
 
     - Contour lines: always rendered at alpha=1.0.
     - Fill: alpha = (1.0 - blend_alpha) * 0.4, baked into the colormap
@@ -51,14 +56,14 @@ Performance optimisations:
        single draw_artist call per axis regardless of the number of active
        ROIs — the per-artist Python overhead no longer scales with ROI count.
 
-    2. Pre-composed RGBA slices (render.py)
+    2. Pre-composed RGBA slices (rendering/render.py)
        Primary and secondary slices are windowed and colourised into uint8
        RGBA arrays in NumPy before reaching the AxesImage, bypassing
        matplotlib's per-draw Normalize + colormap pipeline. This roughly
        halves the per-blit-frame cost of the base image, which is redrawn
        on every crosshair / brush / window-level interaction frame.
 
-    3. BoundaryNorm-based isodose bands (isodose.py)
+    3. BoundaryNorm-based isodose bands (rendering/isodose.py)
        Dose fills are discretised bands on a persistent image artist
        (set_data per slice change) instead of per-slice contourf artist
        creation, removing both the tessellation cost and the unbounded
@@ -71,8 +76,8 @@ Performance optimisations:
        Agg buffer only (never pushed to Tk mid-rebuild) so overlays cannot
        visibly blink while the background bitmap is being refreshed.
 
-    5. DVH from histograms
-       _update_dvh_panel derives each cumulative DVH curve from a fixed
+    5. DVH from histograms (rendering/dvh.py)
+       DvhPanel.update derives each cumulative DVH curve from a fixed
        512-bin histogram instead of plotting one vertex per voxel, keeping
        the DVH line at a few hundred points regardless of ROI size.
 
@@ -88,10 +93,8 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Any
 
-import matplotlib.gridspec as gridspec
 import numpy as np
 import SimpleITK as sitk
-from matplotlib.axes import Axes
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.collections import PathCollection
@@ -101,78 +104,14 @@ from matplotlib.patches import Rectangle
 
 from .event_controllers.viewer_events import ViewerEventHandler
 from .geometry import mask_slice_to_paths
-from .isodose import IsoDoseOverlay
-from .render import GRAY_LUT, build_cmap_lut, slice_to_rgba
-from .viewer_state import AXES, SliceViewerState
+from .rendering.drawing_manager import DrawingManager
+from .rendering.dvh import DvhPanel
+from .rendering.isodose import IsoDoseOverlay
+from .rendering.layout import LayoutManager
+from .rendering.render import GRAY_LUT, build_cmap_lut, slice_to_rgba
+from .state.viewer_state import AXES, SliceViewerState
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# DrawingManager
-# ---------------------------------------------------------------------------
-class DrawingManager:
-    """Coalesces blit-redraw requests into a single Tk idle-callback.
-
-    There is no polling timer. The first ``add_request()`` call after the
-    pending set was empty schedules one ``after_idle`` callback; every
-    ``add_request()`` call that arrives before that callback actually runs
-    (e.g. several axes updated inside the same state-change handler) is
-    merged into the same redraw pass. This gives real-time rendering — a
-    change is drawn on the very next Tk event-loop iteration rather than
-    waiting for the next tick of a fixed-interval timer — while still
-    coalescing bursts of requests into one pass per axis, and it costs
-    nothing while the viewer is idle.
-    """
-
-    def __init__(self, viewer: "DicomViewer") -> None:
-        self.viewer = viewer
-        self._pending_axes: set[str] = set()
-        self._idle_handle: str | None = None
-
-    def add_request(self, axis: str) -> None:
-        """Queue a blit redraw for *axis* and arm the idle callback."""
-        if not axis or axis not in self.viewer.axs:
-            return
-        self._pending_axes.add(axis)
-        if self._idle_handle is None:
-            self._idle_handle = self.viewer.after_idle(self._process_pending)
-
-    def flush(self) -> None:
-        """Run the pending redraw now instead of waiting for the idle loop.
-
-        Called from interactive paths (e.g. scroll / key-press commit) so
-        the new slice appears in the same event-handling turn rather than
-        one Tk iteration later.
-        """
-        self._cancel_idle_callback()
-        self._process_pending()
-
-    def cancel(self) -> None:
-        """Cancel any scheduled idle callback and discard pending requests.
-
-        Call this when the owning viewer is being destroyed so the callback
-        never fires against a widget that no longer exists.
-        """
-        self._cancel_idle_callback()
-        self._pending_axes.clear()
-
-    def _process_pending(self) -> None:
-        """Redraw every axis currently queued, then clear the queue."""
-        self._idle_handle = None
-        axes_to_redraw = self._pending_axes
-        self._pending_axes = set()
-        for axis in axes_to_redraw:
-            self.viewer._redraw_axis_blit(axis)
-
-    def _cancel_idle_callback(self) -> None:
-        if self._idle_handle is None:
-            return
-        try:
-            self.viewer.after_cancel(self._idle_handle)
-        except tk.TclError:
-            pass
-        self._idle_handle = None
 
 
 # ---------------------------------------------------------------------------
@@ -192,13 +131,6 @@ class DicomViewer(ttk.Frame):
         viewer.pack(fill="both", expand=True)
         viewer.load_ct("/path/to/dicom")
     """
-
-    # Number of histogram bins used to build each cumulative DVH curve.
-    # A fixed bin count keeps the plotted line at a few hundred vertices
-    # regardless of ROI size; plotting one vertex per voxel (the previous
-    # sort-based approach) produced multi-million-point lines that took
-    # hundreds of milliseconds to draw for large ROIs.
-    _DVH_BINS: int = 512
 
     # Idle time (ms) before the background cache is rebuilt after scrolling stops.
     # The rebuild is suppressed as long as scroll events arrive within this window.
@@ -256,10 +188,13 @@ class DicomViewer(ttk.Frame):
         self._cache_rebuild_after_id: str | None = None
 
         # --- Layout ---
-        self._dvh_ax: Axes | None = None
+        # DvhPanel is created before LayoutManager because LayoutManager
+        # needs a DVH-axes styling callback to apply when it creates the
+        # DVH Axes for the "mpr" layout.
+        self.dvh_panel = DvhPanel(self.state)
+        self.layout = LayoutManager(self.fig, style_dvh_axes=self.dvh_panel.style_axes)
         self._layout_mode: str = "mpr_wide"
-        self.axs: dict[str, Axes] = {}
-        self._setup_axes("mpr_wide")
+        self.axs, self._dvh_ax = self.layout.build(self._layout_mode)
 
         # Reentrancy guard for _on_draw: _cache_backgrounds() below fires a
         # draw_event, which re-enters _on_draw synchronously. Without this
@@ -1057,56 +992,14 @@ class DicomViewer(ttk.Frame):
     # ------------------------------------------------------------------
     # Layout management
     # ------------------------------------------------------------------
-    def _setup_axes(self, mode: str) -> None:
-        """Create matplotlib axes for *mode*.
-
-        Supported modes:
-            ``"mpr"``      — top row: Axial + DVH; bottom row: Coronal + Sagittal
-            ``"mpr_wide"`` — left column: large Axial; right column: Coronal / Sagittal (default, no DVH)
-        """
-        self._layout_mode = mode
-
-        if mode == "mpr_wide":
-            gs = gridspec.GridSpec(2, 2, figure=self.fig, width_ratios=[2, 1])
-            self.axs = {
-                "axial": self.fig.add_subplot(gs[:, 0]),
-                "coronal": self.fig.add_subplot(gs[0, 1]),
-                "sagittal": self.fig.add_subplot(gs[1, 1]),
-            }
-            self._dvh_ax = None
-        else:
-            # "mpr": 2x2 grid — top row (Axial + DVH), bottom row (Coronal + Sagittal)
-            gs = gridspec.GridSpec(2, 2, figure=self.fig)
-            self.axs = {
-                "axial": self.fig.add_subplot(gs[0, 0]),
-                "coronal": self.fig.add_subplot(gs[1, 0]),
-                "sagittal": self.fig.add_subplot(gs[1, 1]),
-            }
-            self._dvh_ax = self.fig.add_subplot(gs[0, 1])
-            self._style_dvh_axes(self._dvh_ax)
-
-        for ax in self.axs.values():
-            ax.set_facecolor("black")
-            ax.tick_params(colors="white")
-            ax.set_axis_off()
-
-    def _style_dvh_axes(self, ax: Any) -> None:
-        """Apply dark-theme styling to the DVH axes."""
-        ax.set_facecolor((0.05, 0.05, 0.05))
-        ax.tick_params(colors="white", labelsize=7)
-        for spine in ax.spines.values():
-            spine.set_color("gray")
-        ax.xaxis.label.set_color("white")
-        ax.yaxis.label.set_color("white")
-        ax.title.set_color("white")
-
     def _rebuild_layout(self, mode: str) -> None:
         """Switch to *mode* and re-render all content."""
         if self._layout_mode == mode:
             return
 
         self.fig.clear()
-        self._setup_axes(mode)
+        self._layout_mode = mode
+        self.axs, self._dvh_ax = self.layout.build(mode)
         self._reset_artists()
 
         if self._has_valid_primary_image():
@@ -1127,92 +1020,10 @@ class DicomViewer(ttk.Frame):
         self._update_blend_slider_visibility()
         self._update_dvh_panel()
 
-    def _draw_dvh_placeholder(self, ax, text: str) -> None:
-        """Render a centred grey placeholder message inside the DVH axes."""
-        ax.text(
-            0.5,
-            0.5,
-            text,
-            transform=ax.transAxes,
-            ha="center",
-            va="center",
-            color="gray",
-            fontsize=9,
-        )
-        self.canvas.draw_idle()
-
     def _update_dvh_panel(self) -> None:
-        """Render the DVH for all active contours into the DVH axes."""
-        ax = self._dvh_ax
-        if ax is None:
-            return
-
-        ax.clear()
-        self._style_dvh_axes(ax)
-        ax.set_xlabel("Dose (Gy)", fontsize=8)
-        ax.set_ylabel("Volume (%)", fontsize=8)
-        ax.set_title("DVH", fontsize=9)
-        ax.grid(True, alpha=0.3, color="gray")
-
-        # Use the dose resampled to the CT grid so voxel shapes match ROI masks.
-        dose = self.state.rt_dose_resampled
-        if dose is None:
-            self._draw_dvh_placeholder(ax, "RT-DOSE not loaded")
-            return
-
-        active = self.state.active_contours
-        if not active:
-            self._draw_dvh_placeholder(ax, "No contours selected")
-            return
-
-        # Reuse the pre-cast float32 array from the dose array cache to avoid a
-        # full sitk.GetArrayFromImage conversion on every DVH update.
-        dose_arr = self.state.get_dose_volume_cached()
-        if dose_arr is None:
-            dose_arr = sitk.GetArrayFromImage(dose).astype(np.float32)
-
-        plotted = False
-        for roi_number in active:
-            name = self.state.structure_set.get_name(roi_number) or str(roi_number)
-            color = self.state.structure_set.get_color(roi_number) or "white"
-            # Prefer the uint8 volume already held by the mask cache; fall
-            # back to a zero-copy sitk view when the cache is not built yet.
-            mask_arr = self.state.mask_slice_cache.get_volume(roi_number)
-            if mask_arr is None:
-                mask_sitk = self.state.structure_set.get_mask(roi_number)
-                if mask_sitk is None:
-                    continue
-                mask_arr = sitk.GetArrayViewFromImage(mask_sitk)
-            if mask_arr.shape != dose_arr.shape:
-                continue
-            voxels = dose_arr[mask_arr != 0]
-            if voxels.size == 0:
-                continue
-
-            # Cumulative DVH from a fixed-bin histogram. Plotting one vertex
-            # per voxel (sort-based) produced multi-million-point lines that
-            # took hundreds of milliseconds to draw for large ROIs; 512 bins
-            # are visually indistinguishable at panel size.
-            dose_max = max(float(voxels.max()), 1e-6)
-            hist, edges = np.histogram(voxels, bins=self._DVH_BINS, range=(0, dose_max))
-            volume_pct = (voxels.size - np.cumsum(hist)) / voxels.size * 100.0
-            xs = np.concatenate(([0.0], edges[1:]))
-            ys = np.concatenate(([100.0], volume_pct))
-            ax.plot(xs, ys, color=color, label=name, lw=1.5)
-            plotted = True
-
-        if plotted:
-            ax.legend(
-                loc="upper right",
-                fontsize=7,
-                labelcolor="white",
-                facecolor=(0.1, 0.1, 0.1),
-                edgecolor="gray",
-            )
-            ax.set_xlim(left=0)
-            ax.set_ylim(0, 105)
-
-        self.canvas.draw_idle()
+        """Render the DVH panel via DvhPanel, if the current layout has one."""
+        if self._dvh_ax is not None:
+            self.dvh_panel.update(self._dvh_ax)
 
     # ------------------------------------------------------------------
     # Public API

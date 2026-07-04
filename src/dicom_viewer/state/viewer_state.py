@@ -25,7 +25,7 @@ Performance:
     All performance caches (primary / secondary / dose array caches, the
     per-slice contour path cache, the per-ROI mask volume cache, and the
     background contour-build thread pool) are owned by
-    :class:`dicom_viewer.viewer_cache.ViewerCacheManager`, kept out of this
+    :class:`dicom_viewer.state.viewer_cache.ViewerCacheManager`, kept out of this
     class so that the state stays focused on observable logical state.
     ``SliceViewerState`` exposes thin ``get_*_slice_cached`` accessors and
     delegates cache lifecycle (build / invalidate / clear) to the manager.
@@ -43,7 +43,7 @@ from typing import Any, Callable
 import numpy as np
 import SimpleITK as sitk
 
-from .geometry import AXES, compute_extent, slice_along_axis
+from ..geometry import AXES, compute_extent, slice_along_axis
 from .viewer_cache import ContourPathCache, MaskSliceCache, ViewerCacheManager
 
 logger = logging.getLogger(__name__)

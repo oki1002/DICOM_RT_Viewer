@@ -23,7 +23,7 @@ from typing import Callable
 import numpy as np
 import SimpleITK as sitk
 
-from .geometry import AXES, compute_extent, mask_slice_to_paths, slice_along_axis
+from ..geometry import AXES, compute_extent, mask_slice_to_paths, slice_along_axis
 
 logger = logging.getLogger(__name__)
 

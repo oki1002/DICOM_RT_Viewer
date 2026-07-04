@@ -43,7 +43,7 @@ Quick start::
 """
 
 from .viewer import DicomViewer
-from .viewer_state import SliceViewerState, StructureSet
+from .state.viewer_state import SliceViewerState, StructureSet
 
 __all__ = ["DicomViewer", "SliceViewerState", "StructureSet"]
-__version__ = "0.4.0"
+__version__ = "0.4.1"
