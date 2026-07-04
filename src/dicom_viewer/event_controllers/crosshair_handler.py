@@ -11,8 +11,8 @@ Design:
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from ..state.viewer_state import SliceViewerState
     from ..viewer import DicomViewer
-    from ..viewer_state import SliceViewerState
 
 
 # Per-view mapping of (drag direction) -> (target axis, event-coord attribute).

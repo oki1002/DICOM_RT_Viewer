@@ -15,8 +15,8 @@ Supported interactions:
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from ..state.viewer_state import SliceViewerState
     from ..viewer import DicomViewer
-    from ..viewer_state import SliceViewerState
 
 
 class BboxEventHandler:

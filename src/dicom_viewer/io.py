@@ -139,15 +139,45 @@ def find_reg_matrices(dcm_root_dir: str | pathlib.Path) -> dict[str, np.ndarray]
     Returns:
         ``{referenced_sop_instance_uid: 4x4 ndarray}``
     """
+    _, reg_matrices = _scan_dicom_tree(dcm_root_dir)
+    return reg_matrices
+
+
+def _scan_dicom_tree(
+    dcm_root_dir: str | pathlib.Path,
+) -> tuple[set[pathlib.Path], dict[str, np.ndarray]]:
+    """Walk the directory tree once, collecting both the set of directories
+    containing DICOM files and the REG transformation matrices.
+
+    Previously, "does this directory contain DICOM" (``_dir_has_dicom``) and
+    "find REG files" (``find_reg_matrices``) each walked the whole tree
+    independently with ``rglob``, ``dcmread``-ing the same file twice (a
+    noticeable slowdown on large trees such as 4DCT). Here, a lightweight
+    magic-number check via ``pydicom.misc.is_dicom`` is done first, and
+    ``dcmread`` is only called once per file that passes it, gathering both
+    pieces of information in a single pass.
+
+    Args:
+        dcm_root_dir: Root directory to search.
+
+    Returns:
+        ``(dirs_with_dicom, reg_matrices)``. ``dirs_with_dicom`` is the set
+        of directories directly containing a DICOM file;
+        ``reg_matrices`` is ``{referenced_sop_instance_uid: 4x4 ndarray}``.
+    """
+    root = pathlib.Path(dcm_root_dir)
+    dirs_with_dicom: set[pathlib.Path] = set()
     reg_matrices: dict[str, np.ndarray] = {}
 
-    for file in pathlib.Path(dcm_root_dir).rglob("*"):
-        if not file.is_file():
+    for file in root.rglob("*"):
+        if not file.is_file() or not pydicom.misc.is_dicom(file):
             continue
         try:
             ds = pydicom.dcmread(str(file), stop_before_pixels=True)
         except InvalidDicomError:
             continue
+
+        dirs_with_dicom.add(file.parent)
 
         if (
             ds.get("Modality", "") != "REG"
@@ -165,25 +195,12 @@ def find_reg_matrices(dcm_root_dir: str | pathlib.Path) -> dict[str, np.ndarray]
             for ref_item in reg_item.ReferencedImageSequence:
                 reg_matrices[ref_item.ReferencedSOPInstanceUID] = inv_matrix
 
-    return reg_matrices
+    return dirs_with_dicom, reg_matrices
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-def _dir_has_dicom(directory: pathlib.Path) -> bool:
-    """Return ``True`` if *directory* contains at least one readable DICOM file."""
-    for f in directory.glob("*"):
-        if not f.is_file():
-            continue
-        try:
-            pydicom.dcmread(str(f), stop_before_pixels=True)
-            return True
-        except InvalidDicomError:
-            continue
-    return False
-
-
 def _read_series(
     reader: sitk.ImageSeriesReader,
     dcm_dir: pathlib.Path,
@@ -349,13 +366,12 @@ def load_all_series(dcm_root_dir: str | pathlib.Path) -> dict[str, SeriesInfo]:
     series_dict: dict[str, SeriesInfo] = {}
 
     logger.info(f"Searching for DICOM series in '{dcm_root_dir}'.")
-    reg_matrices = find_reg_matrices(dcm_root_dir)
-
-    candidate_dirs = [
-        d
-        for d in [dcm_root_dir, *dcm_root_dir.rglob("*")]
-        if d.is_dir() and _dir_has_dicom(d)
-    ]
+    # Walk the directory tree once, gathering directories that contain
+    # DICOM files together with the REG matrices (previously
+    # find_reg_matrices and _dir_has_dicom each walked the whole tree
+    # independently, dcmread-ing the same file twice).
+    dirs_with_dicom, reg_matrices = _scan_dicom_tree(dcm_root_dir)
+    candidate_dirs = sorted(dirs_with_dicom)
 
     for dcm_dir in candidate_dirs:
         for sid in reader.GetGDCMSeriesIDs(str(dcm_dir)):

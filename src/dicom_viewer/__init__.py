@@ -42,8 +42,8 @@ Quick start::
     root.mainloop()
 """
 
-from .viewer import DicomViewer
 from .state.viewer_state import SliceViewerState, StructureSet
+from .viewer import DicomViewer
 
 __all__ = ["DicomViewer", "SliceViewerState", "StructureSet"]
-__version__ = "0.4.1"
+__version__ = "0.4.2"

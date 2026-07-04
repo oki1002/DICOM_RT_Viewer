@@ -30,8 +30,8 @@ from .brush_handler import BrushEventHandler
 from .crosshair_handler import CrosshairEventHandler
 
 if TYPE_CHECKING:
+    from ..state.viewer_state import SliceViewerState
     from ..viewer import DicomViewer
-    from ..viewer_state import SliceViewerState
 
 # Debounce window (ms) for batching consecutive scroll events.
 # Kept short so that the commit-to-frame latency stays well under the

@@ -43,15 +43,13 @@ from typing import Any, Callable
 import numpy as np
 import SimpleITK as sitk
 
-from ..geometry import AXES, compute_extent, slice_along_axis
+from ..geometry import AXES
+from ..geometry import AXIS_TO_NUMPY_DIM as _AXIS_TO_NUMPY_DIM
+from ..geometry import AXIS_TO_XYZ_DIM as _AXIS_TO_XYZ_DIM
+from ..geometry import compute_extent, slice_along_axis
 from .viewer_cache import ContourPathCache, MaskSliceCache, ViewerCacheManager
 
 logger = logging.getLogger(__name__)
-
-# Axis-name to dimension lookup tables. Defined at module level so that
-# runtime lookups never rebuild a dict (a measurable cost during scroll).
-_AXIS_TO_NUMPY_DIM: dict[str, int] = {"axial": 0, "coronal": 1, "sagittal": 2}
-_AXIS_TO_XYZ_DIM: dict[str, int] = {"axial": 2, "coronal": 1, "sagittal": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +216,11 @@ class SliceViewerState:
     # Dose resampled to primary CT grid (used for DVH calculation with ROI masks).
     rt_dose_resampled: sitk.Image | None = field(repr=False, default=None)
     prescription_dose: float | None = None
+    # Dmax cache, computed once on set_rt_dose_image() (avoids rescanning
+    # every voxel on each prescription-dose change).
+    _dose_fallback_ref_gy: float | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     # --- Performance caches (not part of logical state) ---
     # Every performance cache (image/dose array caches, contour path cache,
@@ -371,15 +374,29 @@ class SliceViewerState:
         phys_point = self.primary_image.TransformIndexToPhysicalPoint(sitk_indices)
         return phys_point[_AXIS_TO_XYZ_DIM[axis]]
 
+    def _current_physical_point(self) -> tuple[float, float, float]:
+        """Return the physical (x, y, z) point at the current 3-axis indices.
+
+        Calling ``index_to_physical`` for each of the 3 axes individually
+        results in 3 calls to ``TransformIndexToPhysicalPoint`` on
+        effectively the same ``sitk_indices`` (each call passes the current
+        indices unchanged). This does it in a single call to reduce the
+        cost on hot paths such as crosshair dragging.
+        """
+        if self.primary_image is None:
+            return (0.0, 0.0, 0.0)
+        sitk_indices = (
+            self.indices.get("sagittal", 0),
+            self.indices.get("coronal", 0),
+            self.indices.get("axial", 0),
+        )
+        return self.primary_image.TransformIndexToPhysicalPoint(sitk_indices)
+
     def physical_to_index(self, axis: str, coord: float) -> int:
         """Convert a physical LPS coordinate along *axis* to the nearest index."""
         if self.primary_image is None:
             return 0
-        phys = [
-            self.index_to_physical("sagittal", self.indices["sagittal"]),
-            self.index_to_physical("coronal", self.indices["coronal"]),
-            self.index_to_physical("axial", self.indices["axial"]),
-        ]
+        phys = list(self._current_physical_point())
         phys[_AXIS_TO_XYZ_DIM[axis]] = coord
         idx_point = self.primary_image.TransformPhysicalPointToIndex(phys)
         numpy_idx = _AXIS_TO_NUMPY_DIM[axis]
@@ -453,6 +470,7 @@ class SliceViewerState:
         self,
         image: sitk.Image,
         transform: sitk.Transform | None = None,
+        default_pixel_value: float = -2048,
     ) -> sitk.Image:
         """Resample *image* to match the primary image geometry.
 
@@ -463,6 +481,9 @@ class SliceViewerState:
             image:     The source image to resample.
             transform: Optional pre-registered transform. When ``None`` an
                 identity transform is assumed.
+            default_pixel_value: Value used to fill the area outside the
+                reference image. Use ``-2048`` (air-equivalent HU) for CT,
+                or ``0.0`` for RT-DOSE (Gy).
 
         Returns:
             A ``sitk.Image`` resampled to the primary image grid.
@@ -473,7 +494,7 @@ class SliceViewerState:
         resample.SetTransform(
             transform if transform is not None else sitk.Transform(3, sitk.sitkIdentity)
         )
-        resample.SetDefaultPixelValue(-2048)
+        resample.SetDefaultPixelValue(default_pixel_value)
         return resample.Execute(image)
 
     # =========================================================
@@ -602,25 +623,50 @@ class SliceViewerState:
         """
         self.rt_dose_image = image
         if image is not None and self.primary_image is not None:
-            resample = sitk.ResampleImageFilter()
-            resample.SetReferenceImage(self.primary_image)
-            resample.SetInterpolator(sitk.sitkLinear)
-            resample.SetTransform(sitk.Transform(3, sitk.sitkIdentity))
-            resample.SetDefaultPixelValue(0.0)
-            self.rt_dose_resampled = resample.Execute(image)
+            self.rt_dose_resampled = self.get_resampled_image(
+                image, default_pixel_value=0.0
+            )
             self.set_blend_alpha(0.5)
         else:
             self.rt_dose_resampled = None
 
         self._cache.build_dose_array(self.rt_dose_resampled)
+        self._dose_fallback_ref_gy = self._compute_dose_dmax(image)
         self._notify("rt_dose_changed", image)
+
+    @staticmethod
+    def _compute_dose_dmax(image: sitk.Image | None) -> float | None:
+        """Compute Dmax (the maximum dose) from the original (pre-resample)
+        RT-DOSE image.
+
+        Computed once at load time as the fallback reference for when no
+        prescription dose is set; subsequent calls return the cached value
+        via ``get_dose_fallback_ref_gy`` (avoids rescanning every voxel on
+        each prescription-dose change).
+        """
+        if image is None:
+            return None
+        arr = sitk.GetArrayViewFromImage(image)
+        if arr.size == 0:
+            return None
+        max_val = float(arr.max())
+        return max_val if max_val > 0 else None
+
+    def get_dose_fallback_ref_gy(self) -> float | None:
+        """Return the Dmax used as the IsoDose reference when no prescription
+        dose is set.
+
+        Just returns the value cached once at :meth:`set_rt_dose_image`
+        time, so this call is constant-time.
+        """
+        return self._dose_fallback_ref_gy
 
     def set_prescription_dose(self, dose_gy: float | None) -> None:
         """Set the prescription dose in Gy.
 
-        When ``None``, ``DicomViewer._get_ref_dose`` falls back to the cached
-        maximum of the positive voxels in the original (pre-resampled)
-        RT-DOSE image as the 100% reference for IsoDose rendering.
+        When ``None``, ``DicomViewer._get_ref_dose`` falls back to
+        :meth:`get_dose_fallback_ref_gy` (the cached Dmax) as the 100%
+        reference for IsoDose rendering.
         """
         if self.prescription_dose != dose_gy:
             self.prescription_dose = dose_gy
@@ -801,9 +847,10 @@ class SliceViewerState:
         as the y data value; the display_extent in the viewer already maps
         physical z to the correct screen position without further adjustment.
         """
-        x = self.index_to_physical("sagittal", self.indices["sagittal"])
-        y = self.index_to_physical("coronal", self.indices["coronal"])
-        z = self.index_to_physical("axial", self.indices["axial"])
+        # Hot path called on every frame while dragging the crosshair, so
+        # compute all 3 axes in a single transform call instead of calling
+        # index_to_physical individually for each.
+        x, y, z = self._current_physical_point()
         new_pos = {
             "axial": (x, y),
             "coronal": (x, z),
@@ -903,7 +950,7 @@ class SliceViewerState:
         if self.overlay_contours != enable:
             self.overlay_contours = enable
             # Path objects remain valid; the facecolor is recomputed from
-            # to_rgba() inside _draw_axis_contours on every redraw.
+            # to_rgba() inside ContourOverlay.draw() on every redraw.
             self._notify("overlay_contours_changed", enable)
 
     def add_contour(self, name: str, mask: sitk.Image, color: str) -> int:

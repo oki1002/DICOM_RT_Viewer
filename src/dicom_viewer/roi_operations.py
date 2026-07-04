@@ -17,7 +17,7 @@ from enum import Enum, auto
 
 import numpy as np
 import SimpleITK as sitk
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, maximum_filter1d, minimum_filter1d
 
 logger = logging.getLogger(__name__)
 
@@ -101,26 +101,21 @@ def interpolate_contour(mask_image: sitk.Image) -> sitk.Image:
         return mask_image
 
     result = arr.copy()
-    first, last = nonempty[0], nonempty[-1]
+    n_filled = 0
 
-    for z in range(first, last + 1):
-        if result[z].any():
-            continue  # Slice already has mask data; skip.
-
-        # Find the nearest non-empty slice on each side.
-        prev_z = max((i for i in nonempty if i < z), default=None)
-        next_z = min((i for i in nonempty if i > z), default=None)
-        if prev_z is None or next_z is None:
+    # Non-empty slices are in ascending order, so each adjacent pair is
+    # filled once (avoids the O(N^2) full rescan for every empty slice).
+    for prev_z, next_z in zip(nonempty, nonempty[1:]):
+        gap = next_z - prev_z
+        if gap <= 1:
             continue
+        for z in range(prev_z + 1, next_z):
+            t = (z - prev_z) / gap
+            interpolated = (1 - t) * arr[prev_z] + t * arr[next_z]
+            result[z] = (interpolated >= 0.5).astype(np.float32)
+            if result[z].any():
+                n_filled += 1
 
-        # Linear interpolation between the two neighbouring slices.
-        t = (z - prev_z) / (next_z - prev_z)
-        interpolated = (1 - t) * arr[prev_z] + t * arr[next_z]
-        result[z] = (interpolated >= 0.5).astype(np.float32)
-
-    n_filled = sum(
-        1 for z in range(first, last + 1) if not arr[z].any() and result[z].any()
-    )
     logger.info(f"Interpolation complete: {n_filled} slices filled.")
 
     out = sitk.GetImageFromArray(result.astype(np.uint8))
@@ -191,17 +186,28 @@ def _shift_accumulate(
     positive: bool,
     expand: bool,
 ) -> np.ndarray:
-    """Apply an iterated shift-and-combine operation to a binary mask.
+    """Apply a one-sided cumulative shift-and-combine (dilation/erosion)
+    along *axis* with a single filter call.
 
-    Repeatedly shifts *arr* by one voxel along *axis* and combines the
-    result with the running accumulator. Used for both dilation and
-    erosion:
+    This used to iterate ``np.roll`` *n_voxels* times, stacking a full-volume
+    copy on every step. That is equivalent to taking an OR (dilation) / AND
+    (erosion) over a one-sided sliding window of width ``n_voxels + 1`` along
+    the axis, which can be replaced with a single call to
+    ``scipy.ndimage.maximum_filter1d`` / ``minimum_filter1d`` (the speed-up
+    grows with the margin size).
 
-    - ``expand=True``  — union (OR) with the shifted mask, edge filled
-      with ``False`` so the wrapped row / column does not contribute.
-    - ``expand=False`` — intersection (AND) with the shifted mask, edge
-      filled with ``True`` so the image boundary does not erode the
-      interior.
+    - ``expand=True``  — OR-equivalent. The border is filled with ``False``
+      (0) so wrap-around does not contribute.
+    - ``expand=False`` — AND-equivalent. The border is filled with ``True``
+      (1) so the image edge does not erode the interior.
+
+    ``origin`` is adjusted so the window is one-sided, covering the current
+    position plus *n_voxels* steps in the *positive* direction
+    (``n_voxels // 2`` when ``positive=True``,
+    ``-((n_voxels + 1) // 2)`` when ``positive=False``).
+    Verified to be numerically identical to the original ``np.roll``-based
+    implementation across a range of multi-dimensional / multi-parameter
+    combinations.
 
     Args:
         arr:      Input binary mask (bool, z y x).
@@ -214,24 +220,20 @@ def _shift_accumulate(
         Resulting mask (bool).
     """
     if n_voxels == 0:
-        return arr
+        return arr.copy()
 
-    result = arr.copy()
-    shift = 1 if positive else -1
-    edge_value = not expand  # dilation clears the wrap, erosion fills it
-    idx = [slice(None)] * 3
-    idx[axis] = 0 if positive else -1
-    edge_slice = tuple(idx)
-
-    shifted = arr
-    for _ in range(n_voxels):
-        shifted = np.roll(shifted, shift, axis=axis)
-        shifted[edge_slice] = edge_value
-        if expand:
-            result |= shifted
-        else:
-            result &= shifted
-    return result
+    size = n_voxels + 1
+    origin = (n_voxels // 2) if positive else -((n_voxels + 1) // 2)
+    arr_uint8 = arr.astype(np.uint8, copy=False)
+    if expand:
+        result = maximum_filter1d(
+            arr_uint8, size=size, axis=axis, mode="constant", cval=0, origin=origin
+        )
+    else:
+        result = minimum_filter1d(
+            arr_uint8, size=size, axis=axis, mode="constant", cval=1, origin=origin
+        )
+    return result.astype(bool)
 
 
 # ---------------------------------------------------------------------------

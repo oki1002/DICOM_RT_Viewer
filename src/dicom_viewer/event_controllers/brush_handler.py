@@ -16,8 +16,8 @@ from matplotlib.patches import Circle
 from scipy.ndimage import binary_fill_holes
 
 if TYPE_CHECKING:
+    from ..state.viewer_state import SliceViewerState
     from ..viewer import DicomViewer
-    from ..viewer_state import SliceViewerState
 
 
 class BrushEventHandler:

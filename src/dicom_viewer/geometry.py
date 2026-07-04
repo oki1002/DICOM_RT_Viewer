@@ -14,9 +14,12 @@ from skimage.measure import find_contours
 
 AXES = ("axial", "coronal", "sagittal")
 
-# Axis-name to NumPy dimension lookup. Defined at module level so that
-# runtime lookups never rebuild a dict (a measurable cost during scroll).
-_AXIS_TO_NUMPY_DIM: dict[str, int] = {"axial": 0, "coronal": 1, "sagittal": 2}
+# Axis-name to NumPy / (x, y, z) dimension lookup. Defined once here (rather
+# than duplicated in viewer_state.py / viewer_cache.py) so that runtime
+# lookups never rebuild a dict (a measurable cost during scroll) and every
+# module shares a single source of truth.
+AXIS_TO_NUMPY_DIM: dict[str, int] = {"axial": 0, "coronal": 1, "sagittal": 2}
+AXIS_TO_XYZ_DIM: dict[str, int] = {"axial": 2, "coronal": 1, "sagittal": 0}
 
 
 def slice_along_axis(arr: np.ndarray, axis: str, index: int) -> np.ndarray:
@@ -26,7 +29,7 @@ def slice_along_axis(arr: np.ndarray, axis: str, index: int) -> np.ndarray:
     cache (primary / secondary / dose / mask), avoiding the allocation of
     a slice tuple on every scroll step.
     """
-    dim = _AXIS_TO_NUMPY_DIM[axis]
+    dim = AXIS_TO_NUMPY_DIM[axis]
     if dim == 0:
         return arr[index, :, :]
     if dim == 1:

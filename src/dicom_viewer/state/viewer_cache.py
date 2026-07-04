@@ -23,14 +23,12 @@ from typing import Callable
 import numpy as np
 import SimpleITK as sitk
 
-from ..geometry import AXES, compute_extent, mask_slice_to_paths, slice_along_axis
+from ..geometry import AXES
+from ..geometry import AXIS_TO_NUMPY_DIM as _AXIS_TO_NUMPY_DIM
+from ..geometry import AXIS_TO_XYZ_DIM as _AXIS_TO_XYZ_DIM
+from ..geometry import compute_extent, mask_slice_to_paths, slice_along_axis
 
 logger = logging.getLogger(__name__)
-
-# Axis-name to NumPy dimension lookup used for dose slice retrieval.
-_AXIS_TO_NUMPY_DIM: dict[str, int] = {"axial": 0, "coronal": 1, "sagittal": 2}
-# Axis-name to (x, y, z) dimension lookup used to derive per-axis slice counts.
-_AXIS_TO_XYZ_DIM: dict[str, int] = {"axial": 2, "coronal": 1, "sagittal": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -52,29 +50,32 @@ class ContourPathCache:
     """
 
     def __init__(self) -> None:
-        # { (roi_number, axis, slice_index): list[matplotlib.path.Path] }
-        self._cache: dict[tuple[int, str, int], list] = {}
+        # { roi_number: { (axis, slice_index): list[matplotlib.path.Path] } }
+        # Nested per-ROI so invalidate_roi is O(1) (a flat dict required
+        # a full key scan).
+        self._cache: dict[int, dict[tuple[str, int], list]] = {}
 
     def get(self, roi_number: int, axis: str, index: int) -> list | None:
         """Return cached paths, or ``None`` when the entry is absent."""
-        return self._cache.get((roi_number, axis, index))
+        roi_cache = self._cache.get(roi_number)
+        if roi_cache is None:
+            return None
+        return roi_cache.get((axis, index))
 
     def set(self, roi_number: int, axis: str, index: int, paths: list) -> None:
         """Store *paths* for the given key."""
-        self._cache[(roi_number, axis, index)] = paths
+        self._cache.setdefault(roi_number, {})[(axis, index)] = paths
 
     def invalidate_roi(self, roi_number: int) -> None:
         """Remove all cached entries for *roi_number*."""
-        # Materialise the key list first: dict cannot be mutated during iteration.
-        for key in [k for k in self._cache if k[0] == roi_number]:
-            del self._cache[key]
+        self._cache.pop(roi_number, None)
 
     def clear(self) -> None:
         """Remove every cached entry."""
         self._cache.clear()
 
     def __len__(self) -> int:
-        return len(self._cache)
+        return sum(len(roi_cache) for roi_cache in self._cache.values())
 
 
 # ---------------------------------------------------------------------------
@@ -123,15 +124,19 @@ class MaskSliceCache:
             index:      Slice index along the given axis.
 
         Returns:
-            2-D NumPy array, or None when the entry is absent.
+            2-D NumPy array, or None when the entry is absent or *index* is
+            out of range.
         """
         arr = self._volumes.get(roi_number)
         if arr is None:
             return None
-        try:
-            return slice_along_axis(arr, axis, index)
-        except IndexError:
+        # NumPy allows negative indices (wrap-around), so an explicit range
+        # check is required here; a bare IndexError catch would silently
+        # accept negative values and return the slice from the opposite end.
+        dim = _AXIS_TO_NUMPY_DIM[axis]
+        if index < 0 or index >= arr.shape[dim]:
             return None
+        return slice_along_axis(arr, axis, index)
 
     def invalidate_roi(self, roi_number: int) -> None:
         """Remove the cached entry for *roi_number*."""
@@ -187,17 +192,27 @@ class ViewerCacheManager:
         self._contour_executor: ThreadPoolExecutor | None = None
         # In-flight background build futures keyed by roi_number.
         self._contour_futures: dict[int, Future] = {}
+        # Incremented on every clear_all() to prevent an in-flight
+        # background task from writing into a stale generation's cache
+        # after an image switch.
+        self._generation: int = 0
 
     # ------------------------------------------------------------------
     # Image / dose array caches
     # ------------------------------------------------------------------
     def build_primary_array(self, primary_image: sitk.Image | None) -> None:
-        """Convert the primary CT image to a float32 NumPy array and cache it."""
+        """Convert the primary CT image to a float32 NumPy array and cache it.
+
+        Goes through ``GetArrayViewFromImage`` (zero-copy) before casting to
+        float32, avoiding the double copy that would result from
+        ``GetArrayFromImage`` (a copy) followed by a separate ``astype``
+        (another copy).
+        """
         if primary_image is None:
             self.primary_array = None
             return
         self.primary_array = np.asarray(
-            sitk.GetArrayFromImage(primary_image), dtype=np.float32
+            sitk.GetArrayViewFromImage(primary_image), dtype=np.float32
         )
         logger.info(f"Primary array cache built: shape={self.primary_array.shape}.")
 
@@ -207,7 +222,7 @@ class ViewerCacheManager:
             self.secondary_array = None
             return
         self.secondary_array = np.asarray(
-            sitk.GetArrayFromImage(secondary_image), dtype=np.float32
+            sitk.GetArrayViewFromImage(secondary_image), dtype=np.float32
         )
         logger.info(f"Secondary array cache built: shape={self.secondary_array.shape}.")
 
@@ -215,13 +230,13 @@ class ViewerCacheManager:
         """Pre-cast the resampled dose volume to a float32 NumPy array.
 
         Clears the cache when no resampled dose is available.
-        (``GetArrayFromImage`` returns (z, y, x) order.)
+        (``GetArrayViewFromImage`` returns (z, y, x) order.)
         """
         if dose_resampled is None:
             self.dose_array = None
             return
         self.dose_array = np.asarray(
-            sitk.GetArrayFromImage(dose_resampled), dtype=np.float32
+            sitk.GetArrayViewFromImage(dose_resampled), dtype=np.float32
         )
         logger.info(
             f"Dose array cache built: shape={self.dose_array.shape}, "
@@ -283,6 +298,7 @@ class ViewerCacheManager:
         down permanently.
         """
         self.cancel_all_contour_builds()
+        self._generation += 1
         self.primary_array = None
         self.secondary_array = None
         self.dose_array = None
@@ -323,13 +339,22 @@ class ViewerCacheManager:
         the viewer can issue a redraw request.
         """
         self.cancel_contour_build(roi_number)
+        generation = self._generation
         executor = self._get_executor()
         future = executor.submit(
-            self.build_contour_paths_for_roi, roi_number, primary_image
+            self.build_contour_paths_for_roi, roi_number, primary_image, generation
         )
         self._contour_futures[roi_number] = future
 
         def _on_done(f: Future) -> None:
+            # Ignore this as a stale completion notification if the future
+            # currently tracked for this ROI is a different object (the task
+            # was replaced by a re-invocation of schedule_contour_build, or
+            # by cancel_contour_build). Checking cancelled() alone would not
+            # catch a task that was replaced while still running.
+            if self._contour_futures.get(roi_number) is not f:
+                return
+            del self._contour_futures[roi_number]
             if f.cancelled():
                 return
             exc = f.exception()
@@ -360,13 +385,24 @@ class ViewerCacheManager:
         self._contour_futures.clear()
 
     def build_contour_paths_for_roi(
-        self, roi_number: int, primary_image: sitk.Image | None
+        self, roi_number: int, primary_image: sitk.Image | None, generation: int
     ) -> None:
         """Run ``find_contours`` for every axis and slice of *roi_number*.
 
         This is the contour counterpart of the dose array cache for RT-DOSE.
         Running it on a background thread at load time ensures that
         ``find_contours`` is never called during scrolling.
+
+        Args:
+            roi_number: Target ROI number.
+            primary_image: Reference image used to derive the physical
+                coordinate extent of the contours.
+            generation: The generation number at the time this task was
+                scheduled. If ``clear_all`` (e.g. an image switch) occurs
+                while this task is running, it no longer matches the
+                current generation and subsequent cache writes are aborted.
+                This prevents paths computed with a stale extent from
+                leaking into a re-numbered ROI number for a new image.
 
         Thread safety: writes to ``contour_path_cache`` are not guarded by a
         lock, but the ``(roi_number, axis, index)`` keys written here are
@@ -388,8 +424,12 @@ class ViewerCacheManager:
         cache = self.contour_path_cache
 
         for axis in AXES:
+            if self._generation != generation:
+                return
             x0, x1, y0, y1 = compute_extent(primary_image, axis)
             for idx in range(n_slices[axis]):
+                if self._generation != generation:
+                    return
                 if cache.get(roi_number, axis, idx) is not None:
                     continue
 

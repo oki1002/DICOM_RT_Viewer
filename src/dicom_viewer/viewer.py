@@ -49,7 +49,7 @@ Performance optimisations:
        of polling an empty queue between interactions.
 
     1. Contour path cache + single PathCollection per axis
-       _draw_axis_contours reads pre-computed matplotlib Path objects from
+       ContourOverlay reads pre-computed matplotlib Path objects from
        SliceViewerState.contour_path_cache instead of calling find_contours on
        every slice change. All ROI paths for an axis are funnelled into one
        PathCollection (with per-path colours), so the blit layer issues a
@@ -97,13 +97,11 @@ import numpy as np
 import SimpleITK as sitk
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-from matplotlib.collections import PathCollection
-from matplotlib.colors import to_rgba
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 
 from .event_controllers.viewer_events import ViewerEventHandler
-from .geometry import mask_slice_to_paths
+from .rendering.contour_overlay import ContourOverlay
 from .rendering.drawing_manager import DrawingManager
 from .rendering.dvh import DvhPanel
 from .rendering.isodose import IsoDoseOverlay
@@ -211,15 +209,13 @@ class DicomViewer(ttk.Frame):
             axis: {"h": None, "v": None} for axis in AXES
         }
         self.bbox_patches: dict[str, Any] = {axis: None for axis in AXES}
-        # One PathCollection per axis holds every active ROI contour.
-        # Rendering N ROIs costs a single draw_artist call instead of N,
-        # which keeps scrolling smooth when many contours are displayed.
-        self.contour_collections: dict[str, PathCollection | None] = {
-            axis: None for axis in AXES
-        }
-        # IsoDose rendering (fill bands + contour lines) is owned by the
-        # overlay collaborator; the viewer only forwards lifecycle events
-        # and includes its artists in the blit layer.
+        # ROI contours (one PathCollection per axis) and IsoDose (fill
+        # bands + contour lines) are each rendered by a dedicated
+        # collaborator; the viewer only forwards lifecycle events and
+        # wires the resulting artists into the blit layer.
+        self.contours = ContourOverlay(
+            self.state, on_artists_changed=self._invalidate_blit_cache
+        )
         self.isodose = IsoDoseOverlay(
             self.state, on_artists_changed=self._invalidate_blit_cache
         )
@@ -311,7 +307,7 @@ class DicomViewer(ttk.Frame):
         """Invalidate the blit artist cache for *axis*.
 
         Call immediately after any change to img_displays,
-        secondary_img_displays, contour_collections, bbox_patches, or
+        secondary_img_displays, contours (ContourOverlay), bbox_patches, or
         crosshairs. IsoDoseOverlay reports its own artist changes via the
         on_artists_changed callback passed at construction, so isodose
         artists do not need to be handled here.
@@ -347,33 +343,52 @@ class DicomViewer(ttk.Frame):
             The full figure is always rendered because Matplotlib does not
             support per-axis rendering. axes_filter only limits which
             bitmaps are stored after the draw.
+
+        Reentrancy:
+            ``FigureCanvasAgg.draw`` below fires a ``draw_event``, which
+            re-enters ``_on_draw`` synchronously. On the very first render
+            the axis limits always look "changed" (there is no prior entry
+            in ``_last_axis_limits``), which would otherwise cause
+            ``_on_draw`` to call this method a second time while the
+            overlay artists are still forced invisible; that nested call
+            would build a blit-artist cache while crosshairs / contours
+            were hidden, and the cache would stay stale after visibility is
+            restored below. Setting ``_rebuilding_backgrounds`` for the
+            full duration of this method (not just inside ``_on_draw``)
+            makes that reentrant call a no-op.
         """
         target_axes = set(axes_filter) if axes_filter else set(AXES)
-        artists_to_hide = []
-        for axis in AXES:
-            for line in self.crosshairs[axis].values():
-                if line:
-                    artists_to_hide.append(line)
-            if self.bbox_patches.get(axis):
-                artists_to_hide.append(self.bbox_patches[axis])
-            # RT contour collections and isodose artists are rendered in the
-            # blit layer and must not be baked into the background bitmap.
-            if self.contour_collections.get(axis) is not None:
-                artists_to_hide.append(self.contour_collections[axis])
-            artists_to_hide.extend(self.isodose.all_artists(axis))
+        self._rebuilding_backgrounds = True
+        try:
+            artists_to_hide = []
+            for axis in AXES:
+                for line in self.crosshairs[axis].values():
+                    if line:
+                        artists_to_hide.append(line)
+                if self.bbox_patches.get(axis):
+                    artists_to_hide.append(self.bbox_patches[axis])
+                # RT contour collections and isodose artists are rendered in
+                # the blit layer and must not be baked into the background
+                # bitmap.
+                collection = self.contours.collection(axis)
+                if collection is not None:
+                    artists_to_hide.append(collection)
+                artists_to_hide.extend(self.isodose.all_artists(axis))
 
-        original_vis = {a: a.get_visible() for a in artists_to_hide}
-        for a in artists_to_hide:
-            a.set_visible(False)
+            original_vis = {a: a.get_visible() for a in artists_to_hide}
+            for a in artists_to_hide:
+                a.set_visible(False)
 
-        # Render to the Agg buffer without blitting the whole canvas to Tk.
-        FigureCanvasAgg.draw(self.canvas)
-        for axis, ax in self.axs.items():
-            if axis in target_axes:
-                self._backgrounds[axis] = self.canvas.copy_from_bbox(ax.bbox)
+            # Render to the Agg buffer without blitting the whole canvas to Tk.
+            FigureCanvasAgg.draw(self.canvas)
+            for axis, ax in self.axs.items():
+                if axis in target_axes:
+                    self._backgrounds[axis] = self.canvas.copy_from_bbox(ax.bbox)
 
-        for a, vis in original_vis.items():
-            a.set_visible(vis)
+            for a, vis in original_vis.items():
+                a.set_visible(vis)
+        finally:
+            self._rebuilding_backgrounds = False
 
         # Composite the blit layer back on top synchronously so the frames
         # pushed to the screen are always complete.
@@ -428,8 +443,9 @@ class DicomViewer(ttk.Frame):
 
         ``_cache_backgrounds()`` renders via ``FigureCanvasAgg.draw``, which
         still fires a ``draw_event`` and so re-enters this callback
-        synchronously. ``_rebuilding_backgrounds`` guards against that
-        reentrant call triggering a second, redundant rebuild.
+        synchronously. ``_rebuilding_backgrounds`` (set by
+        ``_cache_backgrounds`` itself for its full duration) guards against
+        that reentrant call triggering a second, redundant rebuild.
         """
         if self._rebuilding_backgrounds:
             return
@@ -439,11 +455,7 @@ class DicomViewer(ttk.Frame):
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(f"Axis limits changed for '{axis}'; recaching.")
                 self._last_axis_limits[axis] = cur
-                self._rebuilding_backgrounds = True
-                try:
-                    self._cache_backgrounds()
-                finally:
-                    self._rebuilding_backgrounds = False
+                self._cache_backgrounds()
                 break
 
     # ------------------------------------------------------------------
@@ -487,8 +499,7 @@ class DicomViewer(ttk.Frame):
         ):
             artists.append(self.secondary_img_displays[axis])
         artists.extend(self.isodose.blit_artists(axis))
-        if self.contour_collections.get(axis) is not None:
-            artists.append(self.contour_collections[axis])
+        artists.extend(self.contours.blit_artists(axis))
         if self.bbox_patches.get(axis) and self.bbox_patches[axis].get_visible():
             artists.append(self.bbox_patches[axis])
         for line in self.crosshairs[axis].values():
@@ -659,7 +670,7 @@ class DicomViewer(ttk.Frame):
             self._invalidate_blit_cache(axis)
 
     # ------------------------------------------------------------------
-    # Contour rendering
+    # Contour rendering (delegated to ContourOverlay)
     # ------------------------------------------------------------------
     def draw_axis_contours_with_override(
         self,
@@ -676,101 +687,10 @@ class DicomViewer(ttk.Frame):
             override_mask: Optional ``{roi_number: 2-D numpy array}`` that
                 takes precedence over ``state.structure_set`` for the given ROIs.
         """
-        self._draw_axis_contours(axis, override_mask=override_mask)
-
-    def _draw_axis_contours(
-        self,
-        axis: str,
-        override_mask: dict[int, np.ndarray] | None = None,
-    ) -> None:
-        """Render contours for all active ROIs on *axis* into one PathCollection.
-
-        Paths are computed by ``find_contours`` on the first visit and then
-        stored in ``state.contour_path_cache``. Subsequent visits to the
-        same ``(roi_number, axis, slice_index)`` tuple return the cached
-        result without re-running ``find_contours``.
-
-        All ROI paths are funnelled into a single :class:`PathCollection`
-        (with per-path colours) rather than one ``PathPatch`` per ROI, so
-        the blit layer draws every contour in one artist call regardless of
-        how many ROIs are active.
-
-        The cache is bypassed (but not populated) when *override_mask* is
-        supplied, because override data represents transient brush-dragging
-        state that must not be persisted.
-        """
-        ax = self.axs[axis]
-        effective_override = override_mask or {}
-        cache = self.state.contour_path_cache
-        current_index = self.state.indices[axis]
-        extent = self.state.get_extent(axis)
-        overlay = self.state.overlay_contours
-
-        all_paths: list = []
-        edge_colors: list = []
-        face_colors: list = []
-
-        for roi_number in self.state.active_contours:
-            using_override = roi_number in effective_override
-
-            # Paths are never cached for override data (transient brush state).
-            paths = (
-                None if using_override else cache.get(roi_number, axis, current_index)
-            )
-
-            if paths is None:
-                if using_override:
-                    mask_slice = effective_override[roi_number]
-                else:
-                    # Retrieve the slice from mask_slice_cache to avoid a
-                    # sitk round-trip; fall back to the sitk mask when absent.
-                    mask_slice = self.state.mask_slice_cache.get_slice(
-                        roi_number, axis, current_index
-                    )
-                    if mask_slice is None:
-                        mask_sitk = self.state.structure_set.get_mask(roi_number)
-                        if mask_sitk is None:
-                            continue
-                        mask_slice = self.state.get_slice_data(mask_sitk, axis)
-
-                if mask_slice.shape[0] < 2 or mask_slice.shape[1] < 2:
-                    continue
-
-                x0, x1, y0, y1 = extent
-                paths = mask_slice_to_paths(mask_slice, x0, x1, y0, y1)
-                if not using_override:
-                    cache.set(roi_number, axis, current_index, paths)
-
-            if not paths:
-                continue
-
-            color = self.state.structure_set.get_color(roi_number) or "white"
-            face = to_rgba(color, alpha=0.2) if overlay else "none"
-            all_paths.extend(paths)
-            edge_colors.extend([color] * len(paths))
-            face_colors.extend([face] * len(paths))
-
-        collection = self.contour_collections[axis]
-        if collection is None:
-            collection = PathCollection(
-                all_paths,
-                edgecolors=edge_colors,
-                facecolors=face_colors,
-                linewidths=1.0,
-            )
-            ax.add_collection(collection, autolim=False)
-            self.contour_collections[axis] = collection
-            # The artist composition changed only here; content updates below
-            # mutate the existing collection and keep the blit cache valid.
-            self._invalidate_blit_cache(axis)
-        else:
-            collection.set_paths(all_paths)
-            collection.set_edgecolor(edge_colors)
-            collection.set_facecolor(face_colors)
+        self.contours.draw(axis, self.axs[axis], override_mask=override_mask)
 
     def _update_all_contours(self) -> None:
-        for axis in AXES:
-            self._draw_axis_contours(axis)
+        self.contours.draw_all(self.axs)
         self._schedule_cache_backgrounds()
 
     # ------------------------------------------------------------------
@@ -789,7 +709,7 @@ class DicomViewer(ttk.Frame):
         self.isodose.reset()
         self.crosshairs = {axis: {"h": None, "v": None} for axis in AXES}
         self.bbox_patches = {axis: None for axis in AXES}
-        self.contour_collections = {axis: None for axis in AXES}
+        self.contours.reset()
         self._backgrounds = {axis: None for axis in AXES}
         # Reset the same-slice early-exit counters and blit caches so the
         # first slice of the new image is always rendered.
@@ -840,7 +760,7 @@ class DicomViewer(ttk.Frame):
         self._last_rendered_index[axis] = new_idx
 
         self._update_slice_display(axis)
-        self._draw_axis_contours(axis)
+        self.contours.draw(axis, self.axs[axis])
         if self.state.rt_dose_resampled is not None:
             self.isodose.update(axis, self.axs[axis])
         # NOTE: _schedule_cache_backgrounds is intentionally NOT called here.
@@ -952,18 +872,10 @@ class DicomViewer(ttk.Frame):
         """Update dose overlay and DVH panel when the RT-DOSE volume changes."""
         self._update_blend_slider_visibility()
 
-        # Compute the fallback reference dose (Dmax) from the original
-        # (pre-resampled) image so the value matches any application dialog
-        # that reads from the original; resampling interpolation can shift
-        # Dmax slightly.
-        fallback_ref_dose: float | None = None
-        if image is not None:
-            arr_orig = sitk.GetArrayViewFromImage(image)
-            if arr_orig.size > 0:
-                positive = arr_orig[arr_orig > 0]
-                if positive.size > 0:
-                    fallback_ref_dose = float(positive.max())
-                    logger.info(f"Reference dose (Dmax): {fallback_ref_dose:.3f} Gy.")
+        # Dmax was already computed once in state.set_rt_dose_image(), so
+        # only the cached value needs to be read here (avoids rescanning
+        # every voxel on each prescription-dose change).
+        fallback_ref_dose = self.state.get_dose_fallback_ref_gy()
         self.isodose.set_fallback_ref_dose(fallback_ref_dose)
 
         if self.state.rt_dose_resampled is None:
