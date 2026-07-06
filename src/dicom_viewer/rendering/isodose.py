@@ -47,6 +47,25 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _format_fill_cursor_data(value) -> str:
+    """Format the raw dose value under the cursor for the status bar.
+
+    Matplotlib's default cursor-data formatter special-cases
+    ``BoundaryNorm`` by taking ``np.diff`` of the two boundaries nearest
+    the cursor value. The fill norm appends a trailing ``np.inf``
+    boundary (see :meth:`_fill_norm`) so any cursor position in the
+    highest isodose band computes a diff against that ``inf``, which
+    then overflows inside Matplotlib's internal ``_g_sig_digits``
+    (``math.floor(math.log10(inf))``). ``format_cursor_data`` is
+    replaced with this simple, fixed-precision formatter to sidestep
+    that path entirely rather than relying on Matplotlib's generic
+    implementation.
+    """
+    if value is None or not np.isfinite(value):
+        return ""
+    return f"{value:.2f}"
+
+
 class IsoDoseOverlay:
     """Owns and renders the isodose fill / line artists for all axes.
 
@@ -300,6 +319,7 @@ class IsoDoseOverlay:
                 extent=extent,
                 zorder=2,
             )
+            fill.format_cursor_data = _format_fill_cursor_data
             self._fill[axis] = fill
             self._on_artists_changed(axis)
             return

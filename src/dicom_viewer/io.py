@@ -396,6 +396,15 @@ def load_all_series(dcm_root_dir: str | pathlib.Path) -> dict[str, SeriesInfo]:
 def find_rt_dose_files(folder_path: str | pathlib.Path) -> list[pathlib.Path]:
     """Return RT-DOSE DICOM files found (non-recursively) in *folder_path*.
 
+    Caution:
+        This only locates candidate files; it does not disambiguate which
+        one to load when a folder holds multiple RT-DOSE series. Callers
+        that need a *specific* RT-DOSE file (e.g. one selected by the user
+        from a series list) should resolve and pass that file's path
+        directly to :func:`load_rt_dose` instead of relying on the order
+        of this list, since always picking the first entry can silently
+        load the wrong dose.
+
     Args:
         folder_path: Directory to search.
 

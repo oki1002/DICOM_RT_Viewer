@@ -2,7 +2,7 @@
 
 Public API
 ----------
-load_rt_struct(ct_dir, rtstruct_path) -> dict[int, RoiInfo]
+load_rt_struct(ct_dir, rtstruct_path, progress_callback=None) -> dict[int, RoiInfo]
     Parse an RT-STRUCT file and return a mapping of ROI number to mask
     and display metadata.
 
@@ -21,7 +21,7 @@ random_hex_color() -> str
 import logging
 import pathlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, TypedDict
+from typing import Any, Callable, TypedDict
 
 import numpy as np
 import pydicom
@@ -95,6 +95,7 @@ def resample_mask_to_original_space(
 def load_rt_struct(
     ct_dir: str | pathlib.Path,
     rtstruct_path: str | pathlib.Path,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> dict[int, RoiInfo]:
     """Parse an RT-STRUCT file and return ROI masks indexed by ROI number.
 
@@ -107,6 +108,11 @@ def load_rt_struct(
     Args:
         ct_dir: Directory of the CT series referenced by the RT-STRUCT file.
         rtstruct_path: Path to the RT-STRUCT DICOM file.
+        progress_callback: Optional callback invoked as ``(completed, total)``
+            each time one ROI mask finishes loading. *completed* counts
+            finished ROIs regardless of completion order, so it can be used
+            to drive a determinate progress indicator. Safe to call from a
+            background thread; this function does not touch any UI itself.
 
     Returns:
         ``{roi_number: RoiInfo}`` mapping. Returns an empty dict when the
@@ -158,13 +164,18 @@ def load_rt_struct(
             return None
         return roi_number, RoiInfo(name=roi_name, mask=mask, color=color_hex)
 
-    n_workers = min(_ROI_LOAD_MAX_WORKERS, len(roi_tasks))
+    total_rois = len(roi_tasks)
+    n_workers = min(_ROI_LOAD_MAX_WORKERS, total_rois)
+    completed = 0
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
         futures = [executor.submit(_load_single_roi, *task) for task in roi_tasks]
         for future in as_completed(futures):
             result = future.result()
             if result is not None:
                 structures[result[0]] = result[1]
+            completed += 1
+            if progress_callback is not None:
+                progress_callback(completed, total_rois)
 
     logger.info(f"RTSTRUCT loaded: {len(structures)} ROIs.")
     return structures

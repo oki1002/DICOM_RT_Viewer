@@ -905,7 +905,12 @@ class DicomViewer(ttk.Frame):
     # Layout management
     # ------------------------------------------------------------------
     def _rebuild_layout(self, mode: str) -> None:
-        """Switch to *mode* and re-render all content."""
+        """Switch to *mode* and re-render all content.
+
+        A full ``canvas.draw()`` is required at the end (see below) because
+        the subplot geometry itself changes here — unlike per-slice updates,
+        which only need the per-axis partial blit path.
+        """
         if self._layout_mode == mode:
             return
 
@@ -923,14 +928,20 @@ class DicomViewer(ttk.Frame):
             self._update_all_contours()
             self.state.refresh_crosshair()
             self._cache_backgrounds()
-            for axis in AXES:
-                self.drawing_manager.add_request(axis)
-        else:
-            self.canvas.draw()
 
         # Restore blend slider visibility after rebuild.
         self._update_blend_slider_visibility()
         self._update_dvh_panel()
+
+        # Axes were just added, removed, or resized, so their bboxes no
+        # longer match the previous layout. The per-axis partial blit used
+        # for ordinary slice updates only repaints pixels inside the
+        # *current* axis bboxes, so any screen region that belonged to a
+        # now-removed or now-shrunk axis (e.g. the DVH panel when switching
+        # to the wide MPR layout) would otherwise keep showing stale pixels
+        # from the previous layout. A full canvas draw repaints every pixel
+        # from the freshly rendered figure, so no remnants can remain.
+        self.canvas.draw()
 
     def _update_dvh_panel(self) -> None:
         """Render the DVH panel via DvhPanel, if the current layout has one."""

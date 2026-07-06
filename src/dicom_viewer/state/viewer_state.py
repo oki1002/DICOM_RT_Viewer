@@ -29,9 +29,11 @@ Performance:
     class so that the state stays focused on observable logical state.
     ``SliceViewerState`` exposes thin ``get_*_slice_cached`` accessors and
     delegates cache lifecycle (build / invalidate / clear) to the manager.
-    For backward compatibility the ``contour_path_cache``, ``mask_slice_cache``
-    and ``dose_array_cache`` attributes remain accessible as read-only
-    properties that proxy to the manager.
+    For backward compatibility the ``contour_path_cache`` and
+    ``mask_slice_cache`` attributes remain accessible as read-only
+    properties that proxy to the manager. The pre-cast dose volume is
+    exposed via :meth:`get_dose_volume_cached`, and the fallback reference
+    dose (Dmax) via :meth:`get_dose_fallback_ref_gy`.
 """
 
 import logging
@@ -929,6 +931,38 @@ class SliceViewerState:
         y0 = self.physical_to_index(y_axis, y0_p)
         y1 = self.physical_to_index(y_axis, y1_p)
         return min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y0)
+
+    def set_bbox_from_pixel_coords(
+        self, axis: str, x_min: int, y_min: int, width: int, height: int
+    ) -> None:
+        """Set the bounding box for *axis* from pixel coordinates.
+
+        Inverse of :meth:`get_bbox_pixel_coords`; converts a pixel-space
+        box back to the physical LPS bounding box stored internally, so
+        callers do not need to know which physical axis (sagittal /
+        coronal / axial) backs the x/y pixel axes for a given view.
+
+        Args:
+            axis:   View axis ("axial", "coronal", or "sagittal").
+            x_min:  Left edge in pixel indices.
+            y_min:  Top edge in pixel indices.
+            width:  Box width in pixel indices.
+            height: Box height in pixel indices.
+        """
+        axis_mapping = {
+            "axial": ("sagittal", "coronal"),
+            "coronal": ("sagittal", "axial"),
+            "sagittal": ("coronal", "axial"),
+        }
+        x_axis, y_axis = axis_mapping[axis]
+        x0_p = self.index_to_physical(x_axis, x_min)
+        x1_p = self.index_to_physical(x_axis, x_min + width)
+        y0_p = self.index_to_physical(y_axis, y_min)
+        y1_p = self.index_to_physical(y_axis, y_min + height)
+        self.set_bounding_box(
+            axis,
+            (min(x0_p, x1_p), min(y0_p, y1_p), abs(x1_p - x0_p), abs(y1_p - y0_p)),
+        )
 
     # =========================================================
     # ROI / contour management (delegates to StructureSet + notifies)
