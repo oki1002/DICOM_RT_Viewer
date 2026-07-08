@@ -155,8 +155,13 @@ class ContourOverlay:
             collection.set_facecolor(face_colors)
 
     def draw_all(self, axs: dict[str, Axes]) -> None:
-        """Redraw contours for every axis."""
-        for axis in AXES:
+        """Redraw contours for every axis currently present in *axs*.
+
+        Iterates over *axs* rather than the fixed ``AXES`` tuple so that
+        layout modes with fewer panels (e.g. ``"single"``) do not raise a
+        ``KeyError`` for axes that were never built.
+        """
+        for axis in axs:
             self.draw(axis, axs[axis])
 
     # ------------------------------------------------------------------

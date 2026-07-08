@@ -21,6 +21,9 @@ class LayoutManager:
             Sagittal stacked (default, no DVH panel).
         ``"mpr"``      — 2x2 grid: top row Axial + DVH; bottom row Coronal
             and Sagittal.
+        ``"single"``   — one Axes filling the whole figure. Keyed as
+            ``"axial"`` so callers that scroll/window the axial view work
+            unchanged; no Coronal, Sagittal, or DVH panel is created.
     """
 
     def __init__(self, fig: Figure, style_dvh_axes: Callable[[Axes], None]) -> None:
@@ -41,13 +44,19 @@ class LayoutManager:
         """Create Axes for *mode* and return ``(axs, dvh_ax)``.
 
         Args:
-            mode: ``"mpr_wide"`` or ``"mpr"``. See the class docstring.
+            mode: ``"mpr_wide"``, ``"mpr"``, or ``"single"``. See the class
+                docstring.
 
         Returns:
-            A ``({"axial": Axes, "coronal": Axes, "sagittal": Axes}, dvh_ax)``
-            tuple. ``dvh_ax`` is ``None`` for ``"mpr_wide"``.
+            A ``(axs, dvh_ax)`` tuple. For ``"mpr_wide"`` and ``"mpr"``,
+            ``axs`` is ``{"axial": Axes, "coronal": Axes, "sagittal": Axes}``.
+            For ``"single"``, ``axs`` is ``{"axial": Axes}``. ``dvh_ax`` is
+            ``None`` except for ``"mpr"``.
         """
-        if mode == "mpr_wide":
+        if mode == "single":
+            axs = {"axial": self._fig.add_subplot(111)}
+            dvh_ax = None
+        elif mode == "mpr_wide":
             gs = gridspec.GridSpec(2, 2, figure=self._fig, width_ratios=[2, 1])
             axs = {
                 "axial": self._fig.add_subplot(gs[:, 0]),

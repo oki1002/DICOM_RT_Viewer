@@ -727,6 +727,19 @@ class DicomViewer(ttk.Frame):
             self._update_all_contours()
             self.state.refresh_crosshair()
             self._cache_backgrounds()
+            # _cache_backgrounds() ends by compositing through
+            # _redraw_axis_blit(), which pushes only self.axs[axis].bbox to
+            # the screen via canvas.blit(). With constrained_layout enabled,
+            # swapping to an image of a different aspect ratio changes each
+            # axes' bbox (position and/or size) relative to the previous
+            # image. Whenever the new bbox is smaller than, or offset from,
+            # the old one, blit() never touches the screen pixels the old
+            # bbox used to occupy, so remnants of the previous image stay
+            # visible outside the new bbox. A full canvas.draw() repaints
+            # every pixel unconditionally, eliminating that gap. This only
+            # runs once per image load (not per scroll step), so the extra
+            # cost is negligible.
+            self.canvas.draw()
         else:
             self.canvas.draw()
 

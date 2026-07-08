@@ -542,6 +542,34 @@ class SliceViewerState:
         self._cache.clear_all()
         self._invalidate_extent_cache()
 
+        # Clamp the slice indices to the new image's bounds *before* firing
+        # any notification, and build the array cache immediately.
+        #
+        # Listeners for secondary_image_data_changed / rt_dose_changed (e.g.
+        # DicomViewer._on_secondary_image_data_changed) re-render the primary
+        # slice using self.indices as it stands at notification time. If the
+        # previous image had more slices along an axis than the new one,
+        # self.indices still held an out-of-range value here, and the plain
+        # NumPy indexing in slice_along_axis() raised IndexError. That
+        # exception propagated out of this method *before*
+        # primary_image_data_changed was notified, so _reset_artists() and
+        # the subsequent redraw never ran, leaving the previous image on
+        # screen while self.primary_image had already been swapped
+        # internally. Clamping here (without notifying index_changed)
+        # guarantees every index is valid for the new image by the time the
+        # first listener runs, while preserving the existing mid-slice jump
+        # performed by the set_index() calls below.
+        if image is not None:
+            self.indices = {
+                axis: int(
+                    np.clip(self.indices.get(axis, 0), 0, self.get_max_index(axis))
+                )
+                for axis in AXES
+            }
+            self._cache.build_primary_array(image)
+        else:
+            self.indices = {axis: 0 for axis in AXES}
+
         self._notify("secondary_image_data_changed", None)
         self._notify("rt_dose_changed", None)
 
@@ -550,9 +578,6 @@ class SliceViewerState:
             self.set_index("axial", z_dim // 2, update_crosshair=False)
             self.set_index("coronal", y_dim // 2, update_crosshair=False)
             self.set_index("sagittal", x_dim // 2, update_crosshair=False)
-            self._cache.build_primary_array(image)
-        else:
-            self.indices = {axis: 0 for axis in AXES}
 
         self._notify("primary_image_data_changed", image)
 
