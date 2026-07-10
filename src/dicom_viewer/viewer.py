@@ -261,6 +261,17 @@ class DicomViewer(ttk.Frame):
         self.canvas.mpl_connect("key_press_event", eh.on_key_press)
         self.canvas.mpl_connect("draw_event", self._on_draw)
 
+        # Tk only delivers key events to the widget that currently holds
+        # keyboard focus. Without this, "key_press_event" (used for arrow-key
+        # slice navigation, Enter-triggered actions, and any modifier key a
+        # host application tracks, e.g. Ctrl for a custom tool) silently
+        # never fires until the canvas happens to already have focus for some
+        # unrelated reason. Grabbing focus on hover means a key works as soon
+        # as the mouse is over the plot, with no separate click required.
+        self.canvas.get_tk_widget().bind(
+            "<Enter>", lambda _event: self.canvas.get_tk_widget().focus_set()
+        )
+
         s = self.state
         s.add_listener(
             "primary_image_data_changed", self._on_primary_image_data_changed
@@ -528,6 +539,10 @@ class DicomViewer(ttk.Frame):
         subsequent blit frame. Window/level changes therefore re-enter this
         method instead of calling ``set_clim``.
         """
+        if axis not in self.axs:
+            # Not rendered in the current layout mode (e.g. "single").
+            return
+
         primary_data = self.state.get_primary_slice_cached(axis)
         secondary_data = self.state.get_secondary_slice_cached(axis)
 
@@ -630,6 +645,9 @@ class DicomViewer(ttk.Frame):
     # ------------------------------------------------------------------
     def _update_dose_display(self, axis: str) -> None:
         """Public entry point kept for backward compatibility."""
+        if axis not in self.axs:
+            # Not rendered in the current layout mode (e.g. "single").
+            return
         self.isodose.update(axis, self.axs[axis])
 
     # ------------------------------------------------------------------
@@ -647,6 +665,10 @@ class DicomViewer(ttk.Frame):
         actually changes, so a plain crosshair drag reuses the cached blit
         list.
         """
+        if axis not in self.axs:
+            # Not rendered in the current layout mode (e.g. "single").
+            return
+
         ax = self.axs[axis]
         show = self.state.crosshair_visible and pos is not None
         cache_invalidated = False
@@ -696,6 +718,9 @@ class DicomViewer(ttk.Frame):
             override_mask: Optional ``{roi_number: 2-D numpy array}`` that
                 takes precedence over ``state.structure_set`` for the given ROIs.
         """
+        if axis not in self.axs:
+            # Not rendered in the current layout mode (e.g. "single").
+            return
         self.contours.draw(axis, self.axs[axis], override_mask=override_mask)
 
     def _update_all_contours(self) -> None:
@@ -778,6 +803,14 @@ class DicomViewer(ttk.Frame):
         self._schedule_cache_backgrounds()
 
     def _on_index_changed(self, axis: str, new_idx: int) -> None:
+        if axis not in self.axs:
+            # Not rendered in the current layout mode (e.g. "single").
+            # set_index() also updates the other MPR axes for crosshair
+            # alignment and notifies for each of them regardless of which
+            # axes are actually built, so this guard is required even
+            # though the caller only ever scrolls the visible axis.
+            return
+
         # Skip redundant redraws of the same slice (e.g. crosshair drag that
         # does not change the index).
         if self._last_rendered_index.get(axis) == new_idx:
@@ -908,7 +941,7 @@ class DicomViewer(ttk.Frame):
                 self.isodose.clear(axis)
 
         if self.state.primary_image is not None:
-            for axis in AXES:
+            for axis in self.axs:
                 self.isodose.update(axis, self.axs[axis])
             self.state.refresh_crosshair()
             # Deferred scheduling suppresses a full re-render on rapid
@@ -948,7 +981,7 @@ class DicomViewer(ttk.Frame):
             for axis in AXES:
                 self._update_slice_display(axis)
             if self.state.rt_dose_resampled is not None:
-                for axis in AXES:
+                for axis in self.axs:
                     self.isodose.update(axis, self.axs[axis])
             self._update_all_contours()
             self.state.refresh_crosshair()
@@ -988,7 +1021,7 @@ class DicomViewer(ttk.Frame):
         self.isodose.set_custom_levels(list(gy_pairs) if gy_pairs else [])
 
         if self.state.rt_dose_resampled is not None:
-            for axis in AXES:
+            for axis in self.axs:
                 self.isodose.update(axis, self.axs[axis])
                 self.drawing_manager.add_request(axis)
             self.drawing_manager.flush()
