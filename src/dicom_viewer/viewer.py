@@ -209,6 +209,11 @@ class DicomViewer(ttk.Frame):
             axis: {"h": None, "v": None} for axis in AXES
         }
         self.bbox_patches: dict[str, Any] = {axis: None for axis in AXES}
+        # Host-application overlay artists registered via add_overlay_artist
+        # (e.g. manual point markers). Kept separate from the built-in
+        # containers above so DicomViewer never needs to know what they
+        # represent, only that they belong in the blit layer.
+        self._extra_blit_artists: dict[str, list] = {axis: [] for axis in AXES}
         # ROI contours (one PathCollection per axis) and IsoDose (fill
         # bands + contour lines) are each rendered by a dedicated
         # collaborator; the viewer only forwards lifecycle events and
@@ -374,6 +379,7 @@ class DicomViewer(ttk.Frame):
                 if collection is not None:
                     artists_to_hide.append(collection)
                 artists_to_hide.extend(self.isodose.all_artists(axis))
+                artists_to_hide.extend(self._extra_blit_artists.get(axis, []))
 
             original_vis = {a: a.get_visible() for a in artists_to_hide}
             for a in artists_to_hide:
@@ -505,6 +511,9 @@ class DicomViewer(ttk.Frame):
         for line in self.crosshairs[axis].values():
             if line and line.get_visible():
                 artists.append(line)
+        artists.extend(
+            a for a in self._extra_blit_artists.get(axis, []) if a.get_visible()
+        )
         return artists
 
     # ------------------------------------------------------------------
@@ -709,6 +718,9 @@ class DicomViewer(ttk.Frame):
         self.isodose.reset()
         self.crosshairs = {axis: {"h": None, "v": None} for axis in AXES}
         self.bbox_patches = {axis: None for axis in AXES}
+        # ax.clear() invalidates any host-application overlay artists too;
+        # drop the references so the blit layer never touches a removed artist.
+        self._extra_blit_artists = {axis: [] for axis in AXES}
         self.contours.reset()
         self._backgrounds = {axis: None for axis in AXES}
         # Reset the same-slice early-exit counters and blit caches so the
@@ -1027,6 +1039,43 @@ class DicomViewer(ttk.Frame):
         if self.state.primary_image is None:
             raise RuntimeError("No image loaded.")
         return self.state.get_slice_data(self.state.primary_image, view)
+
+    def add_overlay_artist(self, axis: str, artist) -> None:
+        """Register a host-application artist to survive the blit cycle.
+
+        DicomViewer repaints each axis by restoring a cached background
+        bitmap and redrawing only a fixed set of known artists (image,
+        contours, isodose, bounding box, crosshairs) on top of it via
+        ``canvas.blit()``. Any artist a host application adds directly to
+        ``viewer.axs[axis]`` (e.g. a manual point marker or a measurement
+        line) is invisible to that bookkeeping: the very next blit-restore
+        — triggered by something as small as a one-pixel window/level
+        drag — repaints from the stale background and erases it.
+
+        Call this once right after adding *artist* to ``self.axs[axis]``
+        so it is included in every future blit pass, and excluded from
+        the background bitmap the next time it is rebuilt (so it is never
+        baked in at a stale position). Call :meth:`remove_overlay_artist`
+        when the artist is removed.
+
+        Args:
+            axis: The axis the artist was added to.
+            artist: Any Matplotlib artist (e.g. a ``Line2D`` or ``Text``)
+                that already belongs to ``self.axs[axis]``.
+        """
+        self._extra_blit_artists.setdefault(axis, []).append(artist)
+        self._invalidate_blit_cache(axis)
+
+    def remove_overlay_artist(self, axis: str, artist) -> None:
+        """Unregister an artist previously added via :meth:`add_overlay_artist`.
+
+        This does not remove *artist* from the Axes; the caller is still
+        responsible for calling ``artist.remove()`` itself.
+        """
+        artists = self._extra_blit_artists.get(axis)
+        if artists and artist in artists:
+            artists.remove(artist)
+        self._invalidate_blit_cache(axis)
 
     @property
     def axis_vars(self) -> dict[str, Any]:

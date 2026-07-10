@@ -4,7 +4,7 @@ A SimpleITK-based DICOM MPR viewer widget for Tkinter.
 
 ## Features
 
-- **Three-plane MPR display** — Axial (large left), Coronal, and Sagittal views in a single widget.
+- **Three-plane MPR display** — Axial (large left), Coronal, and Sagittal views in a single widget. A single-Axes `"single"` layout mode is also available for host applications that only ever display one plane (e.g. a fluoroscopy or portal-imaging sequence).
 - **Blit-based rendering** — Idle-driven blit updates via `DrawingManager`; redraw requests are coalesced into a single Tk `after_idle` callback instead of a fixed-interval polling timer.
 - **Observer-pattern state management** — All view state lives in `SliceViewerState`; the widget reacts to changes without polling.
 - **SimpleITK-native coordinates** — Physical LPS coordinates, origin, spacing, and direction cosines are preserved throughout; axis reordering between SimpleITK and NumPy conventions is handled internally by the library.
@@ -14,6 +14,7 @@ A SimpleITK-based DICOM MPR viewer widget for Tkinter.
 - **ROI operations** — Inter-slice interpolation, directional margin (uniform or 6-direction), Gaussian smoothing, and boolean operations (union / intersection / subtraction).
 - **Bounding box tool** — Create, move, and resize a bounding box with click-drag interactions.
 - **RT-DOSE overlay** — RT-DOSE volumes are displayed as isodose fills and contour lines; a DVH panel is available in the `"mpr"` layout mode.
+- **Custom overlay artists** — Host applications can register their own Matplotlib artists (e.g. manual point markers) via `add_overlay_artist` so they survive the blit-restore cycle like any built-in overlay, without `DicomViewer` needing to know what they represent.
 
 ## Requirements
 
@@ -241,17 +242,24 @@ viewer.set_isodose_lines([(18.0, "#0000cc"), (54.0, "#ffcc00"), (60.0, "#ff0000"
 
 ## Layout modes
 
-The viewer supports two layout modes controlled via `state.set_layout_mode()`:
+The viewer supports three layout modes controlled via `state.set_layout_mode()`:
 
 | Mode | Description |
 |---|---|
 | `"mpr_wide"` | **Default.** Large Axial on the left; Coronal and Sagittal stacked on the right. No DVH panel. |
 | `"mpr"` | 2×2 grid: top row — Axial + DVH panel; bottom row — Coronal + Sagittal. |
+| `"single"` | One Axes filling the whole figure, keyed as `"axial"`. No Coronal, Sagittal, or DVH panel is built. Intended for modalities that only ever have one plane to show (e.g. fluoroscopy). |
 
 ```python
 state.set_layout_mode("mpr")       # switch to DVH layout
 state.set_layout_mode("mpr_wide")  # switch back to wide layout
+state.set_layout_mode("single")    # switch to a single full-figure Axes
 ```
+
+Everything that operates per-axis (scrolling, window/level, the bounding
+box tool, crosshair, contours, isodose) works unchanged in `"single"` mode
+against the `"axial"` key — host code does not need a separate code path
+for it.
 
 ## Embedding in a larger application
 
@@ -265,6 +273,35 @@ viewer.grid(row=0, column=0, sticky="nsew")
 
 Multiple viewers can share the same `SliceViewerState` instance — they will
 all update in response to the same state changes.
+
+## Adding custom overlay artists
+
+`DicomViewer` repaints each axis by restoring a cached background bitmap
+and redrawing a fixed set of known artists (image, contours, isodose,
+bounding box, crosshairs) on top of it via `canvas.blit()`. Any artist a
+host application adds directly to `viewer.axs[axis]` — a manual point
+marker, a measurement line, anything not built into the library — is
+invisible to that bookkeeping: the very next blit restore, which can be
+triggered by something as small as a one-pixel window/level drag, repaints
+from the stale background and erases it.
+
+`add_overlay_artist` / `remove_overlay_artist` close that gap without
+`DicomViewer` needing to know what the artist represents:
+
+```python
+marker = viewer.axs["axial"].plot(x, y, marker="+", markersize=25, color="red")[0]
+viewer.add_overlay_artist("axial", marker)   # survives every future blit pass
+
+# ... later, when the marker should disappear:
+viewer.remove_overlay_artist("axial", marker)
+marker.remove()
+```
+
+Call `add_overlay_artist` once, right after adding the artist to the axes.
+The artist is also excluded from the background bitmap the next time it is
+rebuilt, so it is never baked in at a stale position. `remove_overlay_artist`
+only drops the bookkeeping entry — the caller is still responsible for
+calling the artist's own `remove()`.
 
 ## Architecture overview
 

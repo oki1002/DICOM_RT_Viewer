@@ -85,16 +85,42 @@ class BboxEventHandler:
 
     def handle_motion(self, event) -> None:
         """Update the bounding box as the mouse moves during a drag."""
-        axis = self._active_axis
         if (
             not self._is_dragging
-            or not axis
+            or not self._active_axis
             or event.xdata is None
             or event.ydata is None
         ):
             return
+        self._apply_drag(event.xdata, event.ydata)
 
-        px, py = event.xdata, event.ydata
+    def handle_release(self, event) -> None:
+        """End the current interaction on left-button release.
+
+        Tk can coalesce or simply drop ``motion_notify_event`` callbacks
+        during a fast drag, so the geometry last committed by
+        :meth:`handle_motion` is not guaranteed to reflect the pixel the
+        mouse was actually released at. Without a final update here, a
+        quick drag can commit a box shaped like an early, still-thin
+        intermediate frame — visually indistinguishable from a single
+        line — instead of the box the user actually drew. Applying one
+        last update using the release event's own coordinates closes
+        that gap.
+        """
+        if event.button != 1:
+            return
+        if self._is_dragging and event.xdata is not None and event.ydata is not None:
+            self._apply_drag(event.xdata, event.ydata)
+        self._is_dragging = False
+        self._interaction_mode = None
+        self._resize_handle = None
+        self._active_axis = None
+        self._drag_start_pos_data = None
+        self._original_pos = None
+
+    def _apply_drag(self, px: float, py: float) -> None:
+        """Update the box currently being created/moved/resized to (px, py)."""
+        axis = self._active_axis
         x0, y0 = self._drag_start_pos_data
         mode = self._interaction_mode
 
@@ -109,16 +135,6 @@ class BboxEventHandler:
             self.state.set_bounding_box(axis, (x + px - x0, y + py - y0, w, h))
         elif mode == "resize":
             self._resize_bbox(px - x0, py - y0)
-
-    def handle_release(self, event) -> None:
-        """End the current interaction on left-button release."""
-        if event.button == 1:
-            self._is_dragging = False
-            self._interaction_mode = None
-            self._resize_handle = None
-            self._active_axis = None
-            self._drag_start_pos_data = None
-            self._original_pos = None
 
     # ------------------------------------------------------------------
     # Internal helpers
