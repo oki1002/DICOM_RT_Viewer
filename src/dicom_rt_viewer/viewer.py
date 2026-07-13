@@ -7,7 +7,7 @@ Architecture:
     - All input events are delegated to ViewerEventHandler.
     - Default layout: left column — large Axial; right column — Coronal / Sagittal.
     - Rendering collaborators (DrawingManager, IsoDoseOverlay, DvhPanel,
-      LayoutManager, the RGBA LUT helpers) live under dicom_viewer.rendering
+      LayoutManager, the RGBA LUT helpers) live under dicom_rt_viewer.rendering
       and are constructed here with the state / figure / callbacks they need,
       so DicomViewer only wires them together instead of containing their
       logic inline.
@@ -29,7 +29,7 @@ Secondary image & blend:
 
 IsoDose display:
     When an RT-DOSE volume is loaded, the isodose display is rendered by
-    :class:`~dicom_viewer.rendering.isodose.IsoDoseOverlay`: band fills come
+    :class:`~dicom_rt_viewer.rendering.isodose.IsoDoseOverlay`: band fills come
     from a persistent per-axis AxesImage driven by ListedColormap +
     BoundaryNorm, and contour lines from a persistent per-axis LineCollection
     fed by contourpy. See rendering/isodose.py for the full design notes.
@@ -1142,7 +1142,7 @@ class DicomViewer(ttk.Frame):
         """Load a DICOM CT series from *ct_dir* and display it.
 
         Window / level is taken from the DICOM metadata via
-        :func:`~dicom_viewer.io.load_dcm_series`. Pass *window* to override.
+        :func:`~dicom_rt_viewer.io.load_dcm_series`. Pass *window* to override.
 
         Args:
             ct_dir: Path to the DICOM folder.

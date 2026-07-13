@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 import SimpleITK as sitk
 
-from dicom_viewer.geometry import (
+from dicom_rt_viewer.geometry import (
     AXES,
     compute_extent,
     mask_slice_to_paths,

@@ -13,9 +13,9 @@ matplotlib.use("Agg")
 import numpy as np
 import SimpleITK as sitk
 
-from dicom_viewer.rendering.render import GRAY_LUT, slice_to_rgba
-from dicom_viewer.state.viewer_cache import ViewerCacheManager
-from dicom_viewer.state.viewer_state import SliceViewerState
+from dicom_rt_viewer.rendering.render import GRAY_LUT, slice_to_rgba
+from dicom_rt_viewer.state.viewer_cache import ViewerCacheManager
+from dicom_rt_viewer.state.viewer_state import SliceViewerState
 
 
 class TestSliceToRgbaBufferReuse:
@@ -129,7 +129,7 @@ class TestContourBuildSkipEmpty:
 
         # Every slice on every axis must have a cache entry (complete cache),
         # and non-empty slices must yield at least one path.
-        from dicom_viewer.geometry import AXES, AXIS_TO_XYZ_DIM
+        from dicom_rt_viewer.geometry import AXES, AXIS_TO_XYZ_DIM
 
         cache = mgr.contour_path_cache
         for axis in AXES:

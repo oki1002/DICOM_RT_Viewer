@@ -8,8 +8,8 @@ import numpy as np
 import pytest
 import SimpleITK as sitk
 
-from dicom_viewer import events
-from dicom_viewer.state.viewer_state import RoiEntry, SliceViewerState, StructureSet
+from dicom_rt_viewer import events
+from dicom_rt_viewer.state.viewer_state import RoiEntry, SliceViewerState, StructureSet
 
 
 def make_state_with_image() -> SliceViewerState:

@@ -5,8 +5,9 @@ build-backend = "hatchling.build"
 [project]
 # Distribution name: "dicom-rt-viewer" (RT support is the differentiator and
 # plain "dicom-viewer" is too generic to be discoverable on PyPI). The import
-# package remains "dicom_viewer" — distribution and import names differing is
-# a standard pattern (e.g. scikit-image / skimage).
+# package is "dicom_rt_viewer" — hyphens are not valid in Python identifiers,
+# so the import name mirrors the distribution name with underscores in
+# place of hyphens, keeping the two names aligned.
 name = "dicom-rt-viewer"
 dynamic = ["version"]
 description = "SimpleITK-based DICOM-RT MPR viewer widget for Tkinter (CT, RT-DOSE, RT-STRUCT, DVH)"
@@ -69,12 +70,12 @@ dev = [
 [tool.hatch.version]
 # __init__.py's __version__ is the single source of truth; pyproject.toml
 # no longer duplicates it, so the two can no longer drift apart.
-path = "src/dicom_viewer/__init__.py"
+path = "src/dicom_rt_viewer/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 # src layout: only the package under src/ is included in the wheel.
 # py.typed is picked up automatically because it lives inside the package.
-packages = ["src/dicom_viewer"]
+packages = ["src/dicom_rt_viewer"]
 
 [tool.mypy]
 python_version = "3.12"

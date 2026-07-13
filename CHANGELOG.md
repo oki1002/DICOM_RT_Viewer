@@ -4,9 +4,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.6.0] — Unreleased
-
-First release prepared for public distribution.
+## [0.6.0] — 2026
 
 ### Fixed
 
@@ -42,8 +40,14 @@ First release prepared for public distribution.
 
 ### Changed
 
-- **Distribution renamed to `dicom-rt-viewer`** (import package remains
-  `dicom_viewer`).
+- **Breaking: import package renamed from `dicom_viewer` to
+  `dicom_rt_viewer`**, matching the distribution name (hyphens are not
+  valid in Python identifiers, so the import name uses underscores in
+  their place). Update `from dicom_viewer import ...` to
+  `from dicom_rt_viewer import ...`.
+- **Distribution renamed to `dicom-rt-viewer`.** The import package was
+  initially left as `dicom_viewer`; see the entry above for its rename to
+  `dicom_rt_viewer`.
 - **`load_rt_struct` raises `RtStructLoadError`** when the file cannot be
   parsed, instead of returning an empty dict indistinguishable from an
   empty structure set. ROI mask decoding is now sequential by default;
@@ -53,7 +57,7 @@ First release prepared for public distribution.
   instead of `dict[int, dict[str, Any]]`; `StructureSet.update` rejects
   unknown property keys with `ValueError`.
 - **Event names are constants.** All `SliceViewerState` event names are
-  declared in the new `dicom_viewer.events` module; `_notify` validates
+  declared in the new `dicom_rt_viewer.events` module; `_notify` validates
   event names at dispatch time.
 - **Direct writes to observable state fields are redirected through their
   setters** (e.g. `state.blend_alpha = 0.5` now notifies listeners), so

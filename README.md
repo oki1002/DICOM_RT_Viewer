@@ -9,10 +9,7 @@ RT-STRUCT contours, RT-DOSE isodose overlay, DVH panel, and mask-editing
 tools, embeddable in any Tkinter application.
 
 The distribution name on PyPI is `dicom-rt-viewer`; the import package is
-`dicom_viewer` (`from dicom_viewer import DicomViewer`).
-
-<!-- TODO: replace with an actual screenshot / GIF before release -->
-![Screenshot placeholder](docs/screenshot.png)
+`dicom_rt_viewer` (`from dicom_rt_viewer import DicomViewer`).
 
 > **Disclaimer** — This software is **not a medical device**. It is
 > intended for research, education, and QA-support use only, and must not
@@ -67,7 +64,7 @@ pip install -e .
 ## Package structure
 
 ```
-dicom_viewer/
+dicom_rt_viewer/
 ├── __init__.py
 ├── py.typed                    # PEP 561 marker: the package ships inline types
 ├── events.py                   # Event-name constants for SliceViewerState listeners
@@ -102,7 +99,7 @@ caches; `rendering/` holds the canvas-rendering collaborators that
 
 ```python
 import tkinter as tk
-from dicom_viewer import DicomViewer, SliceViewerState
+from dicom_rt_viewer import DicomViewer, SliceViewerState
 
 root = tk.Tk()
 root.title("DICOM Viewer")
@@ -119,7 +116,7 @@ root.mainloop()
 ## Loading a DICOM series
 
 ```python
-from dicom_viewer.io import load_dcm_series, validate_dicom_files
+from dicom_rt_viewer.io import load_dcm_series, validate_dicom_files
 
 if validate_dicom_files("/path/to/dicom"):
     info = load_dcm_series("/path/to/dicom")
@@ -167,7 +164,7 @@ the CT's geometry before being added:
 
 ```python
 import SimpleITK as sitk
-from dicom_viewer.rtstruct_io import RtStructLoadError, load_rt_struct
+from dicom_rt_viewer.rtstruct_io import RtStructLoadError, load_rt_struct
 
 try:
     # max_workers defaults to 1 (sequential). rt-utils does not document
@@ -193,11 +190,11 @@ roi_numbers = state.add_contours(
 
 ## ROI operations
 
-`dicom_viewer.roi_operations` provides pure-function utilities that take and
+`dicom_rt_viewer.roi_operations` provides pure-function utilities that take and
 return `sitk.Image`:
 
 ```python
-from dicom_viewer.roi_operations import (
+from dicom_rt_viewer.roi_operations import (
     interpolate_contour,
     apply_margin,
     smooth_contour,
@@ -261,7 +258,7 @@ state.set_bounding_box("axial", None)
 ## RT-DOSE & IsoDose display
 
 ```python
-from dicom_viewer.io import load_rt_dose
+from dicom_rt_viewer.io import load_rt_dose
 
 dose_image = load_rt_dose("/path/to/RTDOSE.dcm")
 state.set_rt_dose_image(dose_image)
@@ -363,13 +360,13 @@ itself, so each one can be exercised independently of Tkinter in tests.
 ## Listening to state changes
 
 `SliceViewerState` broadcasts every change through an observer API. Event
-names are declared as constants in `dicom_viewer.events` — prefer them over
+names are declared as constants in `dicom_rt_viewer.events` — prefer them over
 string literals so a typo becomes an import-time error instead of a
 listener that silently never fires (`_notify` also validates event names at
 dispatch time):
 
 ```python
-from dicom_viewer import events
+from dicom_rt_viewer import events
 
 def on_index_changed(axis: str, index: int) -> None:
     print(f"{axis} -> {index}")
@@ -425,7 +422,7 @@ when the last user of it is gone.
 pip install -e ".[dev]"
 
 pytest            # run the test suite (headless: MPLBACKEND=Agg)
-mypy src/dicom_viewer
+mypy src/dicom_rt_viewer
 black src tests
 isort src tests
 ```

@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import SimpleITK as sitk
 
-from dicom_viewer.roi_operations import (
+from dicom_rt_viewer.roi_operations import (
     BooleanOp,
     MarginConfig,
     apply_margin,

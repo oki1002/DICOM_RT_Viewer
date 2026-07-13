@@ -1,4 +1,4 @@
-"""dicom_viewer — SimpleITK-based DICOM MPR viewer widget for Tkinter.
+"""dicom_rt_viewer — SimpleITK-based DICOM MPR viewer widget for Tkinter.
 
 Public API (re-exported here)
 -----------------------------
@@ -13,7 +13,7 @@ SliceViewerState
     Observable state container.  Holds all mutable state: images, indices,
     window/level, ROI masks, brush settings, bounding boxes, crosshair
     positions, and 4DCT phase data. Change events are declared as constants
-    in :mod:`dicom_viewer.events`.
+    in :mod:`dicom_rt_viewer.events`.
 
 StructureSet / RoiEntry
     ROI mask container keyed by integer ROI number, and the typed entry it
@@ -22,25 +22,25 @@ StructureSet / RoiEntry
 
 Submodule API (import from the submodule)
 -----------------------------------------
-``dicom_viewer.io``
+``dicom_rt_viewer.io``
     validate_dicom_files, find_reg_matrices,
     load_all_series, load_dcm_series, normalize_phase_label
 
-``dicom_viewer.rtstruct_io``
+``dicom_rt_viewer.rtstruct_io``
     load_rt_struct, mask2rtstruct, resample_mask_to_original_space,
     random_hex_color, RtStructLoadError
 
-``dicom_viewer.roi_operations``
+``dicom_rt_viewer.roi_operations``
     interpolate_contour, apply_margin, smooth_contour,
     boolean_operation, thin_slices
 
-``dicom_viewer.events``
+``dicom_rt_viewer.events``
     Event-name constants for ``SliceViewerState.add_listener``.
 
 Quick start::
 
     import tkinter as tk
-    from dicom_viewer import DicomViewer, SliceViewerState
+    from dicom_rt_viewer import DicomViewer, SliceViewerState
 
     root = tk.Tk()
     state = SliceViewerState()
@@ -54,4 +54,4 @@ from .state.viewer_state import RoiEntry, SliceViewerState, StructureSet
 from .viewer import DicomViewer
 
 __all__ = ["DicomViewer", "RoiEntry", "SliceViewerState", "StructureSet"]
-__version__ = "0.6.2"
+__version__ = "0.7.0"

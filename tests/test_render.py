@@ -12,7 +12,7 @@ import numpy as np
 from matplotlib import colormaps
 from matplotlib.colors import Normalize
 
-from dicom_viewer.rendering.render import GRAY_LUT, build_cmap_lut, slice_to_rgba
+from dicom_rt_viewer.rendering.render import GRAY_LUT, build_cmap_lut, slice_to_rgba
 
 
 class TestBuildCmapLut:

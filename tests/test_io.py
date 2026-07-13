@@ -2,7 +2,7 @@
 
 import pytest
 
-from dicom_viewer.io import _first_float, normalize_phase_label
+from dicom_rt_viewer.io import _first_float, normalize_phase_label
 
 
 class TestFirstFloat:
