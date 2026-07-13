@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from .. import events
 from .bbox_handler import BboxEventHandler
 from .brush_handler import BrushEventHandler
 from .crosshair_handler import CrosshairEventHandler
@@ -39,6 +40,10 @@ if TYPE_CHECKING:
 # into a single redraw because consecutive events arrive faster than
 # this window.
 SCROLL_DEBOUNCE_MS: int = 30
+
+# Slice step for the PageUp / PageDown keys (Up / Down move by 1). Larger
+# than one so paging is meaningfully faster than single stepping.
+_PAGE_STEP: int = 10
 
 
 class ViewerEventHandler:
@@ -55,7 +60,7 @@ class ViewerEventHandler:
         # Window / level drag state
         self._dragging_wl: bool = False
         self._wl_start_pos: tuple[int, int] | None = None
-        self._wl_initial: tuple[int, int] | None = None
+        self._wl_initial: tuple[float, float] | None = None
 
         # Scroll debounce state. All fields are touched only from the Tk
         # main thread, so no lock is required. ``_scroll_after_id`` holds
@@ -66,7 +71,7 @@ class ViewerEventHandler:
         self._scroll_axis: str | None = None
 
         self.state.add_listener(
-            "brush_tool_active_changed", self._on_brush_tool_active_changed
+            events.BRUSH_TOOL_ACTIVE_CHANGED, self._on_brush_tool_active_changed
         )
 
     # ------------------------------------------------------------------
@@ -181,14 +186,19 @@ class ViewerEventHandler:
         self.viewer.drawing_manager.flush()
 
     def cancel_pending(self) -> None:
-        """Cancel any pending debounced scroll flush without applying it.
+        """Cancel any pending debounced scroll flush without applying it,
+        and unregister this handler's state listener.
 
         Call this when the owning viewer is being destroyed so that a
         ``widget.after`` callback never fires against a widget that no
-        longer exists.
+        longer exists, and so a shared (injected) state does not keep a
+        reference to — and keep notifying — a dead handler.
         """
         self._cancel_scroll_timer()
         self._scroll_accum = 0
+        self.state.remove_listener(
+            events.BRUSH_TOOL_ACTIVE_CHANGED, self._on_brush_tool_active_changed
+        )
         self._scroll_axis = None
 
     def _tk_widget(self):
@@ -244,12 +254,18 @@ class ViewerEventHandler:
 
         # Priority 3: window / level.
         # Horizontal drag -> window width; vertical drag -> window level.
-        if self._dragging_wl and event.x is not None and event.y is not None:
+        if (
+            self._dragging_wl
+            and self._wl_start_pos is not None
+            and self._wl_initial is not None
+            and event.x is not None
+            and event.y is not None
+        ):
             dx = event.x - self._wl_start_pos[0]
             dy = event.y - self._wl_start_pos[1]
             init_w, init_l = self._wl_initial
-            new_w = max(1, int(init_w + dx * 1.0))
-            new_l = int(init_l - dy * 0.2)
+            new_w = max(1.0, init_w + dx)
+            new_l = init_l - dy * 0.2
             self.state.set_window_level(new_w, new_l)
             return
 
@@ -278,14 +294,18 @@ class ViewerEventHandler:
     # Keyboard
     # ------------------------------------------------------------------
     def on_key_press(self, event) -> None:
-        """Navigate slices with Up / Down / PageUp / PageDown keys."""
+        """Navigate slices with Up / Down (±1) and PageUp / PageDown (±10) keys."""
         axis = self.state.current_axis
         if not axis or self.state.primary_image is None:
             return
-        if event.key in ("up", "pageup"):
+        if event.key == "up":
             delta = 1
-        elif event.key in ("down", "pagedown"):
+        elif event.key == "down":
             delta = -1
+        elif event.key == "pageup":
+            delta = _PAGE_STEP
+        elif event.key == "pagedown":
+            delta = -_PAGE_STEP
         else:
             return
         current = self.state.indices[axis]

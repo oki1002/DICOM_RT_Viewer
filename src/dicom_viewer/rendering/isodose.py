@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 from contourpy import LineType, contour_generator
+from matplotlib.artist import Artist
 from matplotlib.axes import Axes
 from matplotlib.collections import LineCollection
 from matplotlib.colors import BoundaryNorm, ListedColormap, to_rgba
@@ -277,13 +278,18 @@ class IsoDoseOverlay:
         # slicing keeps samples at indices 0, step, 2*step, ..., so the
         # grid must not be stretched to the full extent — that would shift
         # the overlay by up to (step - 1) voxels at the high-index side.
+        # get_extent() uses the pixel-center convention (see geometry.py):
+        # x0/y0 are the *edge* of pixel 0, half a native pixel outside its
+        # center. dx/dy below are native (pre-downsample) pixel spacing;
+        # the +0.5 term recovers the physical center of raw pixel 0 before
+        # striding by `step` native pixels per downsampled sample.
         x0, x1, y0, y1 = self._state.get_extent(axis)
         full_h, full_w = full.shape
         h, w = raw.shape
-        dx = (x1 - x0) / max(full_w - 1, 1)
-        dy = (y1 - y0) / max(full_h - 1, 1)
-        xs = x0 + np.arange(w) * step * dx
-        ys = y0 + np.arange(h) * step * dy
+        dx = (x1 - x0) / max(full_w, 1)
+        dy = (y1 - y0) / max(full_h, 1)
+        xs = x0 + (np.arange(w) * step + 0.5) * dx
+        ys = y0 + (np.arange(h) * step + 0.5) * dy
 
         self._update_fill(axis, ax, raw, xs, ys, step * dx, step * dy, pairs)
         self._update_lines(axis, ax, raw, xs, ys, pairs)
@@ -319,7 +325,11 @@ class IsoDoseOverlay:
                 extent=extent,
                 zorder=2,
             )
-            fill.format_cursor_data = _format_fill_cursor_data
+            # Per-instance override of AxesImage.format_cursor_data is a
+            # documented matplotlib pattern for customising the toolbar
+            # readout; mypy flags any assignment to a method, hence the
+            # targeted ignore.
+            fill.format_cursor_data = _format_fill_cursor_data  # type: ignore[method-assign,assignment]
             self._fill[axis] = fill
             self._on_artists_changed(axis)
             return
@@ -345,7 +355,10 @@ class IsoDoseOverlay:
         segments: list[np.ndarray] = []
         colors: list[str] = []
         for level_gy, color in pairs:
-            level_lines = generator.lines(level_gy)
+            # With LineType.Separate, lines() returns a flat list of (N, 2)
+            # vertex arrays; the stub's return type is a union over every
+            # LineType, so narrow it explicitly for the type checker.
+            level_lines = [np.asarray(line) for line in generator.lines(level_gy)]
             segments.extend(level_lines)
             colors.extend([color] * len(level_lines))
 
@@ -366,9 +379,9 @@ class IsoDoseOverlay:
     # ------------------------------------------------------------------
     # Artist access for the blit layer / background caching
     # ------------------------------------------------------------------
-    def blit_artists(self, axis: str) -> list:
+    def blit_artists(self, axis: str) -> list[Artist]:
         """Return the visible artists for *axis* in draw order (fill, lines)."""
-        artists = []
+        artists: list[Artist] = []
         fill = self._fill[axis]
         if fill is not None and fill.get_visible():
             artists.append(fill)
@@ -377,7 +390,7 @@ class IsoDoseOverlay:
             artists.append(lines)
         return artists
 
-    def all_artists(self, axis: str) -> list:
+    def all_artists(self, axis: str) -> list[Artist]:
         """Return every existing artist for *axis*, visible or not.
 
         Used by the background cache to hide blit-layer artists before the

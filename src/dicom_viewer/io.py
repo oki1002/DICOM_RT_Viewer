@@ -185,13 +185,26 @@ def _scan_dicom_tree(
         ):
             continue
 
-        for reg_item in ds[0x0070, 0x0308].value:
-            matrix = np.array(
-                reg_item.MatrixRegistrationSequence[0]
-                .MatrixSequence[0]
-                .FrameOfReferenceTransformationMatrix
-            ).reshape(4, 4)
-            inv_matrix = np.linalg.inv(matrix)
+        # A single malformed REG file (missing sequence, singular matrix,
+        # ...) must not abort loading of every other series in the tree,
+        # so failures here are logged and skipped rather than propagated.
+        try:
+            reg_sequence = ds[0x0070, 0x0308].value
+        except KeyError:
+            logger.warning(f"REG file '{file}' has no RegistrationSequence; skipped.")
+            continue
+
+        for reg_item in reg_sequence:
+            try:
+                matrix = np.array(
+                    reg_item.MatrixRegistrationSequence[0]
+                    .MatrixSequence[0]
+                    .FrameOfReferenceTransformationMatrix
+                ).reshape(4, 4)
+                inv_matrix = np.linalg.inv(matrix)
+            except (AttributeError, IndexError, KeyError, np.linalg.LinAlgError) as exc:
+                logger.warning(f"Failed to parse REG matrix in '{file}': {exc}")
+                continue
             for ref_item in reg_item.ReferencedImageSequence:
                 reg_matrices[ref_item.ReferencedSOPInstanceUID] = inv_matrix
 
@@ -244,6 +257,16 @@ def _orient_to_lps(image: sitk.Image) -> tuple[sitk.Image, sitk.Image]:
     return resample.Execute(image_lps), original_image
 
 
+def _first_float(value: str) -> float:
+    """Parse the first component of a DICOM DS (decimal string) value.
+
+    Multi-valued window width / centre tags (e.g. ``"40\\400"``, common on
+    GE consoles when multiple presets are stored) use ``\\`` as the value
+    separator. Only the first value is used for the initial display window.
+    """
+    return float(value.split("\\")[0])
+
+
 def _get_window_level(
     reader: sitk.ImageSeriesReader,
     image: sitk.Image,
@@ -260,8 +283,8 @@ def _get_window_level(
                 0, "0028|1051"
             ):
                 return (
-                    float(reader.GetMetaData(0, "0028|1051")),
-                    float(reader.GetMetaData(0, "0028|1050")),
+                    _first_float(reader.GetMetaData(0, "0028|1051")),
+                    _first_float(reader.GetMetaData(0, "0028|1050")),
                 )
         except (ValueError, TypeError):
             logger.warning("Failed to parse DICOM window tags; using defaults.")
@@ -276,7 +299,7 @@ def _get_window_level(
 def _get_modality(reader: sitk.ImageSeriesReader) -> str:
     """Return the modality string from DICOM tag 0008|0060, or ``'UNKNOWN'``."""
     if reader.HasMetaDataKey(0, "0008|0060"):
-        return reader.GetMetaData(0, "0008|0060").strip()
+        return str(reader.GetMetaData(0, "0008|0060")).strip()
     logger.warning("Modality metadata not found; defaulting to 'UNKNOWN'.")
     return "UNKNOWN"
 

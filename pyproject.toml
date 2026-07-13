@@ -3,12 +3,42 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "dicom-viewer"
+# Distribution name: "dicom-rt-viewer" (RT support is the differentiator and
+# plain "dicom-viewer" is too generic to be discoverable on PyPI). The import
+# package remains "dicom_viewer" — distribution and import names differing is
+# a standard pattern (e.g. scikit-image / skimage).
+name = "dicom-rt-viewer"
 dynamic = ["version"]
-description = "SimpleITK-based DICOM MPR viewer widget for Tkinter"
+description = "SimpleITK-based DICOM-RT MPR viewer widget for Tkinter (CT, RT-DOSE, RT-STRUCT, DVH)"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
+authors = [{ name = "oki1002" }]
+keywords = [
+    "dicom",
+    "dicom-rt",
+    "radiotherapy",
+    "medical-imaging",
+    "mpr",
+    "viewer",
+    "rt-struct",
+    "rt-dose",
+    "dvh",
+    "simpleitk",
+    "tkinter",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Healthcare Industry",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+    "Topic :: Scientific/Engineering :: Visualization",
+    "Typing :: Typed",
+]
 
 dependencies = [
     "SimpleITK>=2.3",
@@ -21,11 +51,19 @@ dependencies = [
     "scipy>=1.11",
 ]
 
+[project.urls]
+Homepage = "https://github.com/oki1002/DICOM_RT_Viewer"
+Repository = "https://github.com/oki1002/DICOM_RT_Viewer"
+Issues = "https://github.com/oki1002/DICOM_RT_Viewer/issues"
+Changelog = "https://github.com/oki1002/DICOM_RT_Viewer/blob/main/CHANGELOG.md"
+
 [project.optional-dependencies]
-# Install with: pip install dicom-viewer[dev]
+# Install with: pip install dicom-rt-viewer[dev]
 dev = [
     "pytest>=7",
     "mypy>=1.0",
+    "black>=24",
+    "isort>=5.13",
 ]
 
 [tool.hatch.version]
@@ -35,8 +73,28 @@ path = "src/dicom_viewer/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 # src layout: only the package under src/ is included in the wheel.
+# py.typed is picked up automatically because it lives inside the package.
 packages = ["src/dicom_viewer"]
 
 [tool.mypy]
 python_version = "3.12"
-strict = true
+# Realistic baseline: full --strict requires annotating every Tk/Matplotlib
+# event-handler signature, which adds noise without catching real bugs in
+# this codebase. The flags below keep the valuable checks (untyped-def
+# bodies are still checked, Any-returns flagged) while allowing untyped
+# callback parameters. Tightening back to strict is tracked in CHANGELOG.
+check_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_return_any = true
+no_implicit_optional = true
+ignore_missing_imports = true
+
+[tool.black]
+target-version = ["py312"]
+
+[tool.isort]
+profile = "black"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

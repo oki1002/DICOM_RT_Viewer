@@ -2,9 +2,10 @@
 
 Public API
 ----------
-load_rt_struct(ct_dir, rtstruct_path, progress_callback=None) -> dict[int, RoiInfo]
+load_rt_struct(ct_dir, rtstruct_path, progress_callback=None, max_workers=1) -> dict[int, RoiInfo]
     Parse an RT-STRUCT file and return a mapping of ROI number to mask
-    and display metadata.
+    and display metadata. Raises RtStructLoadError if the file itself
+    cannot be parsed.
 
 mask2rtstruct(ct_dir, rtss_path, structures) -> None
     Convert NumPy mask arrays to an RT-STRUCT DICOM file, creating or
@@ -30,12 +31,27 @@ from rt_utils import RTStructBuilder
 
 logger = logging.getLogger(__name__)
 
-# Maximum number of worker threads for parallel ROI mask retrieval.
+
+class RtStructLoadError(Exception):
+    """Raised when an RT-STRUCT file cannot be parsed at all.
+
+    Distinguishes "the file could not be read" from "the file was read
+    and legitimately contains zero ROIs" — both of which previously
+    returned the same empty ``{}`` from :func:`load_rt_struct`, leaving
+    callers unable to tell a load failure from an empty structure set.
+    """
+
+
+# Default number of worker threads for parallel ROI mask retrieval.
 # Each ROI can be decoded independently via RTStructBuilder.
 # NOTE: rt-utils does not document thread safety; this parallelism relies on
-# each call constructing independent intermediate NumPy arrays. If any
-# thread-related issues surface, reduce this constant to 1.
-_ROI_LOAD_MAX_WORKERS: int = 8
+# each call constructing independent intermediate NumPy arrays. The default
+# is kept at 1 (sequential) because that lack of a documented guarantee
+# makes concurrent execution an opt-in choice for callers who have verified
+# it's safe with their rt-utils version, not something safe to default to
+# for a public library. Pass a higher ``max_workers`` to load_rt_struct
+# to opt in.
+_DEFAULT_ROI_LOAD_MAX_WORKERS: int = 1
 
 # Module-level RNG reused for random fallback colours. Allocating a fresh
 # RNG per ROI (as the previous implementation did) has noticeable overhead
@@ -86,7 +102,8 @@ def resample_mask_to_original_space(
     resampler.SetInterpolator(sitk.sitkNearestNeighbor)
     resampler.SetDefaultPixelValue(0)
     resampler.SetTransform(sitk.Transform(3, sitk.sitkIdentity))
-    return resampler.Execute(lps_mask)
+    resampled: sitk.Image = resampler.Execute(lps_mask)
+    return resampled
 
 
 # ---------------------------------------------------------------------------
@@ -96,11 +113,12 @@ def load_rt_struct(
     ct_dir: str | pathlib.Path,
     rtstruct_path: str | pathlib.Path,
     progress_callback: Callable[[int, int], None] | None = None,
+    max_workers: int = _DEFAULT_ROI_LOAD_MAX_WORKERS,
 ) -> dict[int, RoiInfo]:
     """Parse an RT-STRUCT file and return ROI masks indexed by ROI number.
 
-    Uses a ``ThreadPoolExecutor`` to fetch each ROI mask in parallel,
-    reducing load time when many ROIs are present.
+    Uses a ``ThreadPoolExecutor`` to fetch ROI masks, optionally in
+    parallel (see *max_workers*).
 
     Each ROI mask is transposed from the rt-utils ``(H, W, D)`` convention
     to ``(D, H, W)`` before being returned.
@@ -113,10 +131,22 @@ def load_rt_struct(
             finished ROIs regardless of completion order, so it can be used
             to drive a determinate progress indicator. Safe to call from a
             background thread; this function does not touch any UI itself.
+        max_workers: Number of worker threads used to fetch ROI masks.
+            Defaults to 1 (sequential) because rt-utils does not document
+            thread safety for concurrent ``get_roi_mask_by_name`` calls;
+            pass a higher value only after verifying it's safe for the
+            rt-utils version in use.
 
     Returns:
-        ``{roi_number: RoiInfo}`` mapping. Returns an empty dict when the
-        file cannot be read or no ROI can be decoded.
+        ``{roi_number: RoiInfo}`` mapping. An RT-STRUCT that was read
+        successfully but legitimately contains zero ROI entries returns
+        an empty dict; a file that could not be parsed at all raises
+        :class:`RtStructLoadError` instead, so callers can tell the two
+        cases apart.
+
+    Raises:
+        RtStructLoadError: If *rtstruct_path* cannot be parsed (missing
+            file, corrupt DICOM, mismatched *ct_dir*, etc.).
     """
     ct_dir = pathlib.Path(ct_dir)
     rtstruct_path = pathlib.Path(rtstruct_path)
@@ -131,8 +161,9 @@ def load_rt_struct(
         )
         ds = pydicom.dcmread(str(rtstruct_path))
     except Exception as exc:
-        logger.error(f"Failed to create RTStructBuilder from '{rtstruct_path}': {exc}")
-        return structures
+        raise RtStructLoadError(
+            f"Failed to create RTStructBuilder from '{rtstruct_path}': {exc}"
+        ) from exc
 
     roi_name_map: dict[int, str] = {
         roi.ROINumber: roi.ROIName for roi in ds.StructureSetROISequence
@@ -165,7 +196,7 @@ def load_rt_struct(
         return roi_number, RoiInfo(name=roi_name, mask=mask, color=color_hex)
 
     total_rois = len(roi_tasks)
-    n_workers = min(_ROI_LOAD_MAX_WORKERS, total_rois)
+    n_workers = min(max_workers, total_rois)
     completed = 0
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
         futures = [executor.submit(_load_single_roi, *task) for task in roi_tasks]

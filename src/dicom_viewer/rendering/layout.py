@@ -12,6 +12,8 @@ import matplotlib.gridspec as gridspec
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 
+from ..geometry import LAYOUT_MODES
+
 
 class LayoutManager:
     """Builds the Axes layout for a given mode inside a shared Figure.
@@ -64,8 +66,8 @@ class LayoutManager:
                 "sagittal": self._fig.add_subplot(gs[1, 1]),
             }
             dvh_ax = None
-        else:
-            # "mpr": 2x2 grid — top row (Axial + DVH), bottom row (Coronal + Sagittal)
+        elif mode == "mpr":
+            # 2x2 grid — top row (Axial + DVH), bottom row (Coronal + Sagittal)
             gs = gridspec.GridSpec(2, 2, figure=self._fig)
             axs = {
                 "axial": self._fig.add_subplot(gs[0, 0]),
@@ -74,6 +76,13 @@ class LayoutManager:
             }
             dvh_ax = self._fig.add_subplot(gs[0, 1])
             self._style_dvh_axes(dvh_ax)
+        else:
+            # A silent fallback to "mpr" would mask a typo'd mode name as a
+            # different-looking-but-valid layout, which is far harder to
+            # notice than an immediate error.
+            raise ValueError(
+                f"Unknown layout mode: {mode!r}. Expected one of: {LAYOUT_MODES}."
+            )
 
         for ax in axs.values():
             ax.set_facecolor("black")

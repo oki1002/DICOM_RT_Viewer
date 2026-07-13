@@ -202,18 +202,26 @@ def _shift_accumulate(
       (1) so the image edge does not erode the interior.
 
     ``origin`` is adjusted so the window is one-sided, covering the current
-    position plus *n_voxels* steps in the *positive* direction
-    (``n_voxels // 2`` when ``positive=True``,
-    ``-((n_voxels + 1) // 2)`` when ``positive=False``).
-    Verified to be numerically identical to the original ``np.roll``-based
-    implementation across a range of multi-dimensional / multi-parameter
-    combinations.
+    position plus *n_voxels* steps toward the face being modified.
+
+    Direction semantics: *positive* names the face being grown or shaved
+    (e.g. ``axis=0, positive=True`` is the superior face). For dilation
+    the window therefore extends in the *negative* direction (each new
+    voxel beyond the positive face copies its neighbour below), while for
+    erosion it extends in the *positive* direction (a voxel survives only
+    if its neighbours toward that face are also inside, which removes
+    that face's outermost layer). The previous implementation used the
+    dilation window for both, so a negative margin shaved the *opposite*
+    face from the one requested — e.g. ``superior=-2`` removed the two
+    inferior-most slices. Numerical equivalence with the historical
+    ``np.roll`` implementation is therefore intentionally preserved only
+    for dilation.
 
     Args:
         arr:      Input binary mask (bool, z y x).
         n_voxels: Number of one-voxel shifts to perform. No-op when 0.
         axis:     NumPy axis to shift (0=z, 1=y, 2=x).
-        positive: True to shift toward increasing index, False otherwise.
+        positive: True when the modified face lies toward increasing index.
         expand:   True for dilation, False for erosion.
 
     Returns:
@@ -222,8 +230,12 @@ def _shift_accumulate(
     if n_voxels == 0:
         return arr.copy()
 
+    # Erosion of the `positive` face needs the window on the opposite side
+    # of the one dilation uses (see docstring), so flip here.
+    window_positive = positive if expand else not positive
+
     size = n_voxels + 1
-    origin = (n_voxels // 2) if positive else -((n_voxels + 1) // 2)
+    origin = (n_voxels // 2) if window_positive else -((n_voxels + 1) // 2)
     arr_uint8 = arr.astype(np.uint8, copy=False)
     if expand:
         result = maximum_filter1d(
@@ -233,7 +245,8 @@ def _shift_accumulate(
         result = minimum_filter1d(
             arr_uint8, size=size, axis=axis, mode="constant", cval=1, origin=origin
         )
-    return result.astype(bool)
+    filtered: "np.ndarray" = result.astype(bool)
+    return filtered
 
 
 # ---------------------------------------------------------------------------

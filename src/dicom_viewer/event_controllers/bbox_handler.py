@@ -14,6 +14,8 @@ Supported interactions:
 
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 if TYPE_CHECKING:
     from ..state.viewer_state import SliceViewerState
     from ..viewer import DicomViewer
@@ -64,13 +66,15 @@ class BboxEventHandler:
         bbox = self.state.bounding_boxes.get(axis)
         handle = self._detect_handle(event, axis)
 
-        if handle:
-            # Resize an existing box.
+        if handle and bbox is not None:
+            # Resize an existing box. _detect_handle only returns a handle
+            # when a box exists, so the bbox check is for the type checker
+            # and against future refactors breaking that invariant.
             self._begin_drag(axis, "resize", (px, py), list(bbox))
             self._resize_handle = handle
             return True
 
-        if bbox and (
+        if bbox is not None and (
             bbox[0] <= px <= bbox[0] + bbox[2] and bbox[1] <= py <= bbox[1] + bbox[3]
         ):
             # Move the existing box.
@@ -119,8 +123,15 @@ class BboxEventHandler:
         self._original_pos = None
 
     def _apply_drag(self, px: float, py: float) -> None:
-        """Update the box currently being created/moved/resized to (px, py)."""
+        """Update the box currently being created/moved/resized to (px, py).
+
+        Callers guarantee a drag is in progress; the guard below encodes
+        that invariant explicitly (and narrows the Optionals for type
+        checking) rather than assuming it.
+        """
         axis = self._active_axis
+        if axis is None or self._drag_start_pos_data is None:
+            return
         x0, y0 = self._drag_start_pos_data
         mode = self._interaction_mode
 
@@ -131,6 +142,8 @@ class BboxEventHandler:
                 axis, (x_start, y_start, x_end - x_start, y_end - y_start)
             )
         elif mode == "move":
+            if self._original_pos is None:
+                return
             x, y, w, h = self._original_pos
             self.state.set_bounding_box(axis, (x + px - x0, y + py - y0, w, h))
         elif mode == "resize":
@@ -180,14 +193,17 @@ class BboxEventHandler:
         x_min, x_max = x, x + w
         y_min, y_max = y, y + h
 
-        # Convert the pixel tolerance to data units via the inverse display transform.
+        # Convert the pixel tolerance to data units via the inverse display
+        # transform. Before the axes has been drawn its transform can be
+        # singular, so a non-invertible / degenerate transform falls back to
+        # a 1-data-unit tolerance rather than swallowing unrelated errors.
         try:
             inv = ax.transData.inverted()
             p0 = inv.transform((0, 0))
             p1 = inv.transform((self.TOLERANCE_PIXELS, self.TOLERANCE_PIXELS))
             tol_x = abs(p1[0] - p0[0])
             tol_y = abs(p1[1] - p0[1])
-        except Exception:
+        except (np.linalg.LinAlgError, ValueError):
             tol_x = tol_y = 1.0
 
         ex, ey = event.xdata, event.ydata
@@ -226,6 +242,9 @@ class BboxEventHandler:
             dragging "b" down (dy < 0) -> decrease y_min -> y += dy; h -= dy
         """
         handle = self._resize_handle
+        axis = self._active_axis
+        if handle is None or axis is None or self._original_pos is None:
+            return
         x, y, w, h = self._original_pos
         min_size = self._MIN_SIZE
 
@@ -248,4 +267,4 @@ class BboxEventHandler:
                 y += dy
                 h = new_h
 
-        self.state.set_bounding_box(self._active_axis, (x, y, w, h))
+        self.state.set_bounding_box(axis, (x, y, w, h))

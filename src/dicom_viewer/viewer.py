@@ -91,7 +91,7 @@ Performance optimisations:
 import logging
 import tkinter as tk
 from tkinter import ttk
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import SimpleITK as sitk
@@ -101,6 +101,25 @@ from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 
 from .event_controllers.viewer_events import ViewerEventHandler
+from .events import (
+    ACTIVE_CONTOURS_CHANGED,
+    ALL_CONTOURS_CHANGED,
+    BLEND_ALPHA_CHANGED,
+    BOUNDING_BOXES_CHANGED,
+    CONTOUR_CACHE_BUILT,
+    CROSSHAIR_CHANGED,
+    CROSSHAIR_VISIBLE_CHANGED,
+    INDEX_CHANGED,
+    LAYOUT_MODE_CHANGED,
+    OVERLAY_CONTOURS_CHANGED,
+    PRIMARY_IMAGE_DATA_CHANGED,
+    RT_DOSE_CHANGED,
+    SECONDARY_CLIM_CHANGED,
+    SECONDARY_IMAGE_CMAP_CHANGED,
+    SECONDARY_IMAGE_DATA_CHANGED,
+    WINDOW_LEVEL_CHANGED,
+)
+from .io import load_dcm_series
 from .rendering.contour_overlay import ContourOverlay
 from .rendering.drawing_manager import DrawingManager
 from .rendering.dvh import DvhPanel
@@ -147,7 +166,19 @@ class DicomViewer(ttk.Frame):
         self.rowconfigure(0, weight=1)
         self.columnconfigure(0, weight=1)
 
-        self.state = state if state is not None else SliceViewerState()
+        # Whether this instance created its own state (and therefore owns
+        # its lifecycle) or received one via dependency injection. Only an
+        # owned state is closed in destroy() — closing an injected state
+        # would stop its thread pool out from under whatever else holds a
+        # reference to it (see destroy() below).
+        self._owns_state = state is None
+        if state is None:
+            state = SliceViewerState()
+        # Note: this attribute intentionally shadows the inherited
+        # ``ttk.Frame.state()`` method; the explicit annotation tells type
+        # checkers the attribute type instead of the inherited callable,
+        # and the targeted ignore acknowledges the deliberate shadowing.
+        self.state: SliceViewerState = state  # type: ignore[assignment]
 
         # --- Figure / Canvas / Toolbar ---
         kw: dict = {
@@ -191,7 +222,9 @@ class DicomViewer(ttk.Frame):
         # DVH Axes for the "mpr" layout.
         self.dvh_panel = DvhPanel(self.state)
         self.layout = LayoutManager(self.fig, style_dvh_axes=self.dvh_panel.style_axes)
-        self._layout_mode: str = "mpr_wide"
+        # Honour the layout mode already present on an injected state,
+        # rather than silently overriding it with a hardcoded default.
+        self._layout_mode: str = self.state.layout_mode
         self.axs, self._dvh_ax = self.layout.build(self._layout_mode)
 
         # Reentrancy guard for _on_draw: _cache_backgrounds() below fires a
@@ -272,27 +305,31 @@ class DicomViewer(ttk.Frame):
             "<Enter>", lambda _event: self.canvas.get_tk_widget().focus_set()
         )
 
-        s = self.state
-        s.add_listener(
-            "primary_image_data_changed", self._on_primary_image_data_changed
-        )
-        s.add_listener(
-            "secondary_image_data_changed", self._on_secondary_image_data_changed
-        )
-        s.add_listener("blend_alpha_changed", self._on_blend_alpha_changed)
-        s.add_listener("secondary_image_cmap_changed", self._on_secondary_cmap_changed)
-        s.add_listener("secondary_clim_changed", self._on_secondary_clim_changed)
-        s.add_listener("rt_dose_changed", self._on_rt_dose_changed)
-        s.add_listener("layout_mode_changed", self._on_layout_mode_changed)
-        s.add_listener("index_changed", self._on_index_changed)
-        s.add_listener("window_level_changed", self._on_window_level_changed)
-        s.add_listener("crosshair_changed", self._on_crosshair_changed)
-        s.add_listener("crosshair_visible_changed", self._on_crosshair_visible_changed)
-        s.add_listener("bounding_boxes_changed", self._on_bounding_boxes_changed)
-        s.add_listener("all_contours_changed", self._on_all_contours_changed)
-        s.add_listener("active_contours_changed", self._on_active_contours_changed)
-        s.add_listener("overlay_contours_changed", self._on_overlay_contours_changed)
-        s.add_listener("contour_cache_built", self._on_contour_cache_built)
+        # Every (event, callback) pair is recorded so destroy() can
+        # unregister them all. Without this, a destroyed viewer sharing an
+        # injected state would stay subscribed forever — the state would
+        # keep invoking callbacks on dead Tk widgets (TclError spam) and
+        # the viewer object could never be garbage collected.
+        self._state_listeners: list[tuple[str, Callable]] = [
+            (PRIMARY_IMAGE_DATA_CHANGED, self._on_primary_image_data_changed),
+            (SECONDARY_IMAGE_DATA_CHANGED, self._on_secondary_image_data_changed),
+            (BLEND_ALPHA_CHANGED, self._on_blend_alpha_changed),
+            (SECONDARY_IMAGE_CMAP_CHANGED, self._on_secondary_cmap_changed),
+            (SECONDARY_CLIM_CHANGED, self._on_secondary_clim_changed),
+            (RT_DOSE_CHANGED, self._on_rt_dose_changed),
+            (LAYOUT_MODE_CHANGED, self._on_layout_mode_changed),
+            (INDEX_CHANGED, self._on_index_changed),
+            (WINDOW_LEVEL_CHANGED, self._on_window_level_changed),
+            (CROSSHAIR_CHANGED, self._on_crosshair_changed),
+            (CROSSHAIR_VISIBLE_CHANGED, self._on_crosshair_visible_changed),
+            (BOUNDING_BOXES_CHANGED, self._on_bounding_boxes_changed),
+            (ALL_CONTOURS_CHANGED, self._on_all_contours_changed),
+            (ACTIVE_CONTOURS_CHANGED, self._on_active_contours_changed),
+            (OVERLAY_CONTOURS_CHANGED, self._on_overlay_contours_changed),
+            (CONTOUR_CACHE_BUILT, self._on_contour_cache_built),
+        ]
+        for event_name, callback in self._state_listeners:
+            self.state.add_listener(event_name, callback)
 
     # ------------------------------------------------------------------
     # Shared helpers
@@ -592,7 +629,7 @@ class DicomViewer(ttk.Frame):
         axis: str,
         secondary_data: np.ndarray,
         clim: tuple[float, float],
-        extent: list[float],
+        extent: tuple[float, float, float, float],
     ) -> None:
         """Create or update the secondary image overlay artist for *axis*.
 
@@ -673,7 +710,7 @@ class DicomViewer(ttk.Frame):
         show = self.state.crosshair_visible and pos is not None
         cache_invalidated = False
 
-        if show:
+        if show and pos is not None:
             c1, c2 = pos
             h_line = self.crosshairs[axis]["h"]
             if h_line is None:
@@ -910,10 +947,24 @@ class DicomViewer(ttk.Frame):
     def _on_contour_cache_built(self, roi_number: int) -> None:
         """Redraw all axes when a background contour cache build completes.
 
-        This callback is invoked from a background thread, so the actual
-        redraw is dispatched to the main thread via Tkinter after().
+        This callback originates on a background worker thread (the
+        contour-build thread pool owned by the state), so it must not
+        touch Tk or Matplotlib directly. It instead marshals the redraw
+        onto the Tk main loop via ``after(0, ...)``.
+
+        Note: ``Tk.after`` is only documented as thread-safe on a Tcl
+        interpreter built with threads enabled (the default for CPython's
+        bundled Tk on all mainstream platforms). This viewer relies on
+        that assumption; see the "Threading model" note in the README.
         """
-        self.after(0, self._update_all_contours)
+        try:
+            self.after(0, self._update_all_contours)
+        except RuntimeError:
+            # "main thread is not in main loop": the mainloop has already
+            # exited (application shutdown) while a background contour
+            # build was still finishing. The redraw is moot at that point,
+            # so the race is benign and intentionally swallowed.
+            logger.debug("Contour cache built after mainloop exit; redraw skipped.")
 
     def _on_secondary_clim_changed(self, clim: tuple | None) -> None:
         """Apply or clear the secondary image colour-limit override.
@@ -1032,18 +1083,33 @@ class DicomViewer(ttk.Frame):
         Without this, a ``widget.after`` callback scheduled by the drawing
         manager, the background-cache debounce, or the scroll debounce could
         fire after the underlying Tk widget is gone and raise ``TclError``.
-        The contour-build thread pool is also shut down here so it does not
-        outlive the viewer.
+
+        The contour-build thread pool is shut down here too, but only when
+        this viewer created its own ``state`` (i.e. no ``state`` was passed
+        in). "Whoever creates a resource is responsible for releasing it":
+        an injected state may still be referenced by whatever constructed
+        it, so closing its thread pool here would break that owner even
+        though this viewer is done with it. ``SliceViewerState.close()``
+        itself documents that its thread pool is lazily recreated on next
+        use, which would otherwise leak a new pool if a caller reused a
+        state across viewer instances.
         """
         self.drawing_manager.cancel()
         self.event_handler.cancel_pending()
+        # Unsubscribe from the state before anything else: after this point
+        # no state change can reach this (now dying) widget. Essential for
+        # injected states, which outlive the viewer.
+        for event_name, callback in self._state_listeners:
+            self.state.remove_listener(event_name, callback)
+        self._state_listeners.clear()
         if self._cache_rebuild_after_id is not None:
             try:
                 self.after_cancel(self._cache_rebuild_after_id)
             except tk.TclError:
                 pass
             self._cache_rebuild_after_id = None
-        self.state.close()
+        if self._owns_state:
+            self.state.close()
         super().destroy()
 
     def load_ct(self, ct_dir: Any, window: tuple[int, int] | None = None) -> None:
@@ -1056,16 +1122,14 @@ class DicomViewer(ttk.Frame):
             ct_dir: Path to the DICOM folder.
             window: Optional ``(window_width, window_level)`` override.
         """
-        from .io import load_dcm_series
-
         info = load_dcm_series(ct_dir)
         self.state.set_primary_image_data(info["sitk_image"], image_dir=ct_dir)
         ww, wl = window if window is not None else info["window_level"]
-        self.state.set_window_level(int(ww), int(wl))
+        self.state.set_window_level(float(ww), float(wl))
 
     def set_window(self, vmin: float, vmax: float) -> None:
         """Set the display window using vmin / vmax HU values."""
-        self.state.set_window_level(int(vmax - vmin), int((vmax + vmin) / 2))
+        self.state.set_window_level(vmax - vmin, (vmax + vmin) / 2)
 
     def get_slice(self, view: str) -> np.ndarray:
         """Return the current 2-D slice for *view* as a NumPy array."""
@@ -1111,51 +1175,18 @@ class DicomViewer(ttk.Frame):
         self._invalidate_blit_cache(axis)
 
     @property
-    def axis_vars(self) -> dict[str, Any]:
-        return _IndexVarProxy(self.state)
-
-    @property
     def metadata(self) -> dict[str, Any]:
+        """Return the primary image geometry as a fixed-key dict.
+
+        Always exposes the same keys (``spacing`` / ``origin`` / ``size``)
+        so callers can index them unconditionally; each is ``None`` when
+        no primary image is loaded, rather than the key being absent.
+        """
         img = self.state.primary_image
         if img is None:
-            return {"spacing": None}
+            return {"spacing": None, "origin": None, "size": None}
         return {
             "spacing": img.GetSpacing(),
             "origin": img.GetOrigin(),
             "size": img.GetSize(),
         }
-
-
-# ---------------------------------------------------------------------------
-# Backward-compatibility helpers
-# ---------------------------------------------------------------------------
-class _IndexVarProxy:
-    """Tk-style IntVar dict proxy over SliceViewerState indices."""
-
-    _AXIS_CHAR_MAP = {"x": "sagittal", "y": "coronal", "z": "axial"}
-
-    def __init__(self, state: SliceViewerState) -> None:
-        self._state = state
-
-    def __getitem__(self, axis_char: str) -> "_SingleVar":
-        axis = self._AXIS_CHAR_MAP.get(axis_char)
-        if axis is None:
-            raise KeyError(
-                f"Unknown axis character '{axis_char}'. "
-                f"Expected one of: {list(self._AXIS_CHAR_MAP)}"
-            )
-        return _SingleVar(self._state, axis)
-
-
-class _SingleVar:
-    """IntVar-like adapter around a single ``SliceViewerState`` axis index."""
-
-    def __init__(self, state: SliceViewerState, axis: str) -> None:
-        self._state = state
-        self._axis = axis
-
-    def get(self) -> int:
-        return self._state.indices[self._axis]
-
-    def set(self, value: int) -> None:
-        self._state.set_index(self._axis, int(value), update_crosshair=True)

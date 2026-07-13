@@ -29,26 +29,61 @@ Performance:
     class so that the state stays focused on observable logical state.
     ``SliceViewerState`` exposes thin ``get_*_slice_cached`` accessors and
     delegates cache lifecycle (build / invalidate / clear) to the manager.
-    For backward compatibility the ``contour_path_cache`` and
-    ``mask_slice_cache`` attributes remain accessible as read-only
-    properties that proxy to the manager. The pre-cast dose volume is
-    exposed via :meth:`get_dose_volume_cached`, and the fallback reference
-    dose (Dmax) via :meth:`get_dose_fallback_ref_gy`.
+    The ``contour_path_cache`` and ``mask_slice_cache`` attributes are
+    exposed as read-only properties that proxy to the manager, so the
+    rendering layer can read cached paths / mask volumes without reaching
+    into the manager directly. The pre-cast dose volume is exposed via
+    :meth:`get_dose_volume_cached`, and the fallback reference dose (Dmax)
+    via :meth:`get_dose_fallback_ref_gy`.
 """
 
+import dataclasses
+import inspect
 import logging
 import pathlib
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, ClassVar
 
 import numpy as np
 import SimpleITK as sitk
 
-from ..geometry import AXES
+from ..events import (
+    ACTIVE_CONTOURS_CHANGED,
+    ALL_CONTOURS_CHANGED,
+    ALL_EVENTS,
+    BLEND_ALPHA_CHANGED,
+    BOUNDING_BOXES_CHANGED,
+    BRUSH_FILL_INSIDE_CHANGED,
+    BRUSH_SIZE_MM_CHANGED,
+    BRUSH_TOOL_ACTIVE_CHANGED,
+    CONTOUR_CACHE_BUILT,
+    CROSSHAIR_CHANGED,
+    CROSSHAIR_VISIBLE_CHANGED,
+    INDEX_CHANGED,
+    LAYOUT_MODE_CHANGED,
+    OVERLAY_CONTOURS_CHANGED,
+    PHASE_CHANGED,
+    PHASES_DATA_LOADED,
+    PRIMARY_IMAGE_DATA_CHANGED,
+    RT_DOSE_CHANGED,
+    SECONDARY_CLIM_CHANGED,
+    SECONDARY_IMAGE_CMAP_CHANGED,
+    SECONDARY_IMAGE_DATA_CHANGED,
+    SELECTED_ROI_CHANGED,
+    WINDOW_LEVEL_CHANGED,
+)
+from ..geometry import (
+    AXES,
+)
 from ..geometry import AXIS_TO_NUMPY_DIM as _AXIS_TO_NUMPY_DIM
 from ..geometry import AXIS_TO_XYZ_DIM as _AXIS_TO_XYZ_DIM
-from ..geometry import compute_extent, slice_along_axis
+from ..geometry import (
+    LAYOUT_MODES,
+    VIEW_TO_PIXEL_AXES,
+    compute_extent,
+    slice_along_axis,
+)
 from .viewer_cache import ContourPathCache, MaskSliceCache, ViewerCacheManager
 
 logger = logging.getLogger(__name__)
@@ -57,6 +92,21 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # StructureSet
 # ---------------------------------------------------------------------------
+@dataclass
+class RoiEntry:
+    """A single ROI's stored properties inside :class:`StructureSet`.
+
+    Replaces the previous ``dict[str, Any]`` entry shape so that field
+    names and types (``name: str``, ``mask: sitk.Image``, ``color: str``)
+    are checked statically instead of relying on string keys that a typo
+    could silently miss.
+    """
+
+    name: str
+    mask: sitk.Image
+    color: str
+
+
 class StructureSet:
     """Container for RT-STRUCT ROI masks, keyed by integer ROI number.
 
@@ -75,8 +125,7 @@ class StructureSet:
     """
 
     def __init__(self) -> None:
-        # { roi_number: {"name": str, "mask": sitk.Image, "color": "#RRGGBB"} }
-        self._data: dict[int, dict[str, Any]] = {}
+        self._data: dict[int, RoiEntry] = {}
         self._next_number: int = 1
 
     def add(self, name: str, mask: sitk.Image, color: str) -> int:
@@ -92,7 +141,7 @@ class StructureSet:
         """
         roi_number = self._next_number
         self._next_number += 1
-        self._data[roi_number] = {"name": name, "mask": mask, "color": color}
+        self._data[roi_number] = RoiEntry(name=name, mask=mask, color=color)
         return roi_number
 
     def remove(self, roi_number: int) -> None:
@@ -100,14 +149,30 @@ class StructureSet:
         self._data.pop(roi_number, None)
 
     def update(self, roi_number: int, props: dict[str, Any]) -> None:
-        """Update properties (``name``, ``mask``, ``color``) for *roi_number*."""
-        if roi_number in self._data:
-            self._data[roi_number].update(props)
+        """Update properties (``name``, ``mask``, ``color``) for *roi_number*.
+
+        Raises:
+            ValueError: If *props* contains a key that is not a field of
+                :class:`RoiEntry` — this used to update a plain dict with
+                no feedback, so a typo'd key (e.g. ``"colour"``) would be
+                silently stored and never actually applied.
+        """
+        entry = self._data.get(roi_number)
+        if entry is None:
+            return
+        valid_fields = {f.name for f in dataclasses.fields(RoiEntry)}
+        unknown = props.keys() - valid_fields
+        if unknown:
+            raise ValueError(
+                f"Unknown RoiEntry field(s) {sorted(unknown)}; expected one of {sorted(valid_fields)}."
+            )
+        for key, value in props.items():
+            setattr(entry, key, value)
 
     def get_name(self, roi_number: int) -> str | None:
         """Return the structure name for *roi_number*, or ``None``."""
         entry = self._data.get(roi_number)
-        return entry["name"] if entry else None
+        return entry.name if entry else None
 
     def generate_unique_name(self, base_name: str) -> str:
         """Return a name that does not collide with any existing ROI name.
@@ -124,7 +189,7 @@ class StructureSet:
         Returns:
             A name guaranteed not to collide with any existing ROI name.
         """
-        existing_names = {entry["name"] for entry in self._data.values()}
+        existing_names = {entry.name for entry in self._data.values()}
         if base_name not in existing_names:
             return base_name
 
@@ -138,19 +203,25 @@ class StructureSet:
     def get_mask(self, roi_number: int) -> sitk.Image | None:
         """Return the binary mask for *roi_number*, or ``None``."""
         entry = self._data.get(roi_number)
-        return entry["mask"] if entry else None
+        return entry.mask if entry else None
 
     def get_color(self, roi_number: int) -> str | None:
         """Return the hex colour string for *roi_number*, or ``None``."""
         entry = self._data.get(roi_number)
-        return entry["color"] if entry else None
+        return entry.color if entry else None
 
     def get_roi_numbers(self) -> list[int]:
         """Return a list of all ROI numbers in insertion order."""
         return list(self._data.keys())
 
-    def get_all(self) -> dict[int, dict[str, Any]]:
-        """Return a shallow copy of the internal data dict."""
+    def get_all(self) -> dict[int, RoiEntry]:
+        """Return a shallow copy of the internal ``{roi_number: RoiEntry}`` mapping.
+
+        The copy is of the outer dict only; ``RoiEntry`` instances (and the
+        ``sitk.Image`` masks they hold) are shared with the internal
+        storage, consistent with the rest of this class's shallow-copy
+        semantics elsewhere.
+        """
         return dict(self._data)
 
     def __len__(self) -> int:
@@ -196,6 +267,13 @@ class SliceViewerState:
         ``"overlay_contours_changed"``     — ``(enable: bool)``
         ``"brush_tool_active_changed"``    — ``(is_active: bool)``
         ``"brush_size_mm_changed"``        — ``(size_mm: float)``
+        ``"brush_fill_inside_changed"``    — ``(fill: bool)``
+        ``"selected_roi_changed"``         — ``(roi_number: int | None)``
+        ``"contour_cache_built"``          — ``(roi_number: int)``
+
+    Every event name above has a matching constant in
+    :mod:`dicom_viewer.events` (e.g. ``events.INDEX_CHANGED``); prefer those
+    over string literals when calling :meth:`add_listener`.
     """
 
     # --- Primary image ---
@@ -236,7 +314,7 @@ class SliceViewerState:
 
     # --- Slice state ---
     current_axis: str = ""
-    window_level: tuple[int, int] = (300, 25)  # (window_width, window_level)
+    window_level: tuple[float, float] = (300.0, 25.0)  # (window_width, window_level)
     indices: dict[str, int] = field(default_factory=lambda: {axis: 0 for axis in AXES})
 
     # --- ROI ---
@@ -272,7 +350,7 @@ class SliceViewerState:
     )
 
     # Cache for get_extent() results, keyed by axis name.
-    _extent_cache: dict[str, list[float]] = field(
+    _extent_cache: dict[str, tuple[float, float, float, float]] = field(
         default_factory=dict,
         compare=False,
         repr=False,
@@ -287,12 +365,62 @@ class SliceViewerState:
         """
         self._cache = ViewerCacheManager(
             on_contour_built=lambda roi_number: self._notify(
-                "contour_cache_built", roi_number
+                CONTOUR_CACHE_BUILT, roi_number
             )
         )
 
+    # Every field that has a dedicated ``set_*`` method (and therefore a
+    # notification listeners rely on) is listed here, mapped to that
+    # method's name. See __setattr__ below.
+    _OBSERVABLE_SETTERS: ClassVar[dict[str, str]] = {
+        "blend_alpha": "set_blend_alpha",
+        "secondary_image_cmap": "set_secondary_image_cmap",
+        "secondary_clim": "set_secondary_clim",
+        "prescription_dose": "set_prescription_dose",
+        "layout_mode": "set_layout_mode",
+        "window_level": "set_window_level",
+        "crosshair_visible": "set_crosshair_visible",
+        "bbox_visible": "set_bbox_visible",
+        "active_contours": "set_active_contours",
+        "selected_roi_number": "set_selected_roi",
+        "overlay_contours": "set_overlay_contours",
+        "brush_tool_active": "set_brush_tool_active",
+        "brush_size_mm": "set_brush_size_mm",
+        "brush_fill_inside": "set_brush_fill_inside",
+    }
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Redirect external direct writes to observable fields through their setter.
+
+        Assigning e.g. ``state.blend_alpha = 0.5`` directly (instead of
+        calling ``state.set_blend_alpha(0.5)``) would silently skip the
+        ``"blend_alpha_changed"`` notification, leaving listeners — and
+        therefore the on-screen rendering — out of sync with the new
+        value. This class's own methods still need to write these fields
+        directly without re-entering a setter (the dataclass-generated
+        ``__init__``, and the coordinated multi-field reset performed by
+        :meth:`set_primary_image_data`, both rely on that), so only
+        writes originating from *outside* this module are redirected:
+        the immediate caller's module is inspected, and only a mismatch
+        triggers the redirect.
+        """
+        setter_name = type(self)._OBSERVABLE_SETTERS.get(name)
+        if setter_name is not None:
+            frame = inspect.currentframe()
+            caller_frame = frame.f_back if frame is not None else None
+            caller_module = (
+                caller_frame.f_globals.get("__name__") if caller_frame else None
+            )
+            if caller_module != __name__:
+                if name == "window_level":
+                    getattr(self, setter_name)(value[0], value[1])
+                else:
+                    getattr(self, setter_name)(value)
+                return
+        object.__setattr__(self, name, value)
+
     # =========================================================
-    # Performance-cache accessors (backward-compatible proxies)
+    # Performance-cache accessors
     # =========================================================
     @property
     def contour_path_cache(self) -> ContourPathCache:
@@ -329,7 +457,19 @@ class SliceViewerState:
 
         The listener set is snapshotted so a listener that mutates the
         registry during iteration does not raise RuntimeError.
+
+        Raises:
+            ValueError: If *event_type* is not one of the names declared in
+                :mod:`dicom_viewer.events`. Every call site in this class
+                uses those constants rather than string literals, so this
+                only fires for a genuinely unknown event — e.g. a typo in
+                third-party code driving the state directly.
         """
+        if event_type not in ALL_EVENTS:
+            raise ValueError(
+                f"Unknown event type: {event_type!r}. "
+                f"See dicom_viewer.events for the full list."
+            )
         for listener in list(self._listeners[event_type]):
             try:
                 listener(*args, **kwargs)
@@ -354,10 +494,6 @@ class SliceViewerState:
         """
         return _AXIS_TO_NUMPY_DIM[axis]
 
-    # Backward-compatible aliases for internal callers.
-    _axis_to_xyz_index = axis_to_xyz_index
-    _axis_to_numpy_index = axis_to_numpy_index
-
     # =========================================================
     # Physical <-> index conversion
     # =========================================================
@@ -374,7 +510,7 @@ class SliceViewerState:
         # Reverse (z, y, x) to SimpleITK's (x, y, z) ordering.
         sitk_indices = tuple(numpy_indices[::-1])
         phys_point = self.primary_image.TransformIndexToPhysicalPoint(sitk_indices)
-        return phys_point[_AXIS_TO_XYZ_DIM[axis]]
+        return float(phys_point[_AXIS_TO_XYZ_DIM[axis]])
 
     def _current_physical_point(self) -> tuple[float, float, float]:
         """Return the physical (x, y, z) point at the current 3-axis indices.
@@ -392,7 +528,8 @@ class SliceViewerState:
             self.indices.get("coronal", 0),
             self.indices.get("axial", 0),
         )
-        return self.primary_image.TransformIndexToPhysicalPoint(sitk_indices)
+        px, py, pz = self.primary_image.TransformIndexToPhysicalPoint(sitk_indices)
+        return (float(px), float(py), float(pz))
 
     def physical_to_index(self, axis: str, coord: float) -> int:
         """Convert a physical LPS coordinate along *axis* to the nearest index."""
@@ -410,7 +547,7 @@ class SliceViewerState:
         if self.primary_image is None:
             return 0
         numpy_idx = _AXIS_TO_NUMPY_DIM[axis]
-        return self.primary_image.GetSize()[::-1][numpy_idx] - 1
+        return int(self.primary_image.GetSize()[::-1][numpy_idx]) - 1
 
     # =========================================================
     # Slice data access
@@ -424,8 +561,8 @@ class SliceViewerState:
             return np.array([])
         return slice_along_axis(arr, axis, self.indices[axis])
 
-    def get_extent(self, axis: str) -> list[float]:
-        """Return ``[left, right, bottom, top]`` in physical coordinates.
+    def get_extent(self, axis: str) -> tuple[float, float, float, float]:
+        """Return ``(left, right, bottom, top)`` in physical coordinates.
 
         Results are cached in ``_extent_cache`` to avoid repeated
         GetSize/GetSpacing/GetOrigin calls during scrolling. The cache is
@@ -435,7 +572,7 @@ class SliceViewerState:
         if cached is not None:
             return cached
         if self.primary_image is None:
-            return [0.0, 1.0, 0.0, 1.0]
+            return (0.0, 1.0, 0.0, 1.0)
         extent = compute_extent(self.primary_image, axis)
         self._extent_cache[axis] = extent
         return extent
@@ -454,14 +591,13 @@ class SliceViewerState:
         """Set the slice index for *axis* and notify listeners.
 
         *value* is clamped to ``[0, get_max_index(axis)]`` here so that every
-        caller (scroll, keyboard, crosshair drag, ``_SingleVar``) shares one
-        range-checking rule instead of duplicating ``max(0, min(...))`` at
-        each call site.
+        caller (scroll, keyboard, crosshair drag) shares one range-checking
+        rule instead of duplicating ``max(0, min(...))`` at each call site.
         """
         clamped = int(np.clip(value, 0, self.get_max_index(axis)))
         if self.indices.get(axis) != clamped:
             self.indices[axis] = clamped
-            self._notify("index_changed", axis, clamped)
+            self._notify(INDEX_CHANGED, axis, clamped)
             if update_crosshair:
                 self.update_crosshair_by_index()
 
@@ -497,7 +633,8 @@ class SliceViewerState:
             transform if transform is not None else sitk.Transform(3, sitk.sitkIdentity)
         )
         resample.SetDefaultPixelValue(default_pixel_value)
-        return resample.Execute(image)
+        result: sitk.Image = resample.Execute(image)
+        return result
 
     # =========================================================
     # Primary image
@@ -570,8 +707,8 @@ class SliceViewerState:
         else:
             self.indices = {axis: 0 for axis in AXES}
 
-        self._notify("secondary_image_data_changed", None)
-        self._notify("rt_dose_changed", None)
+        self._notify(SECONDARY_IMAGE_DATA_CHANGED, None)
+        self._notify(RT_DOSE_CHANGED, None)
 
         if image is not None:
             x_dim, y_dim, z_dim = image.GetSize()
@@ -579,7 +716,7 @@ class SliceViewerState:
             self.set_index("coronal", y_dim // 2, update_crosshair=False)
             self.set_index("sagittal", x_dim // 2, update_crosshair=False)
 
-        self._notify("primary_image_data_changed", image)
+        self._notify(PRIMARY_IMAGE_DATA_CHANGED, image)
 
     # =========================================================
     # Secondary image & blend
@@ -602,7 +739,7 @@ class SliceViewerState:
             self.set_blend_alpha(0.5)
         # Pre-cast once at load time to eliminate sitk round-trips during scroll.
         self._cache.build_secondary_array(self.secondary_image)
-        self._notify("secondary_image_data_changed", self.secondary_image)
+        self._notify(SECONDARY_IMAGE_DATA_CHANGED, self.secondary_image)
 
     def set_blend_alpha(self, alpha: float) -> None:
         """Set the primary-image opacity for the blend slider (0.0-1.0).
@@ -612,13 +749,13 @@ class SliceViewerState:
         """
         if self.blend_alpha != alpha:
             self.blend_alpha = alpha
-            self._notify("blend_alpha_changed", alpha)
+            self._notify(BLEND_ALPHA_CHANGED, alpha)
 
     def set_secondary_image_cmap(self, cmap_name: str) -> None:
         """Change the colourmap used to display the secondary image."""
         if self.secondary_image_cmap != cmap_name:
             self.secondary_image_cmap = cmap_name
-            self._notify("secondary_image_cmap_changed", cmap_name)
+            self._notify(SECONDARY_IMAGE_CMAP_CHANGED, cmap_name)
 
     def set_secondary_clim(self, clim: tuple[float, float] | None) -> None:
         """Override the colour limits for the secondary image display.
@@ -627,7 +764,7 @@ class SliceViewerState:
         """
         if self.secondary_clim != clim:
             self.secondary_clim = clim
-            self._notify("secondary_clim_changed", clim)
+            self._notify(SECONDARY_CLIM_CHANGED, clim)
 
     def set_rt_dose_image(self, image: sitk.Image | None) -> None:
         """Set (or clear) the RT-DOSE volume.
@@ -659,7 +796,7 @@ class SliceViewerState:
 
         self._cache.build_dose_array(self.rt_dose_resampled)
         self._dose_fallback_ref_gy = self._compute_dose_dmax(image)
-        self._notify("rt_dose_changed", image)
+        self._notify(RT_DOSE_CHANGED, image)
 
     @staticmethod
     def _compute_dose_dmax(image: sitk.Image | None) -> float | None:
@@ -697,7 +834,7 @@ class SliceViewerState:
         """
         if self.prescription_dose != dose_gy:
             self.prescription_dose = dose_gy
-            self._notify("rt_dose_changed", self.rt_dose_image)
+            self._notify(RT_DOSE_CHANGED, self.rt_dose_image)
 
     # =========================================================
     # Slice accessors backed by the performance caches
@@ -752,13 +889,13 @@ class SliceViewerState:
     # =========================================================
     # RT-DOSE geometry helpers
     # =========================================================
-    def get_dose_extent(self, axis: str) -> list[float]:
-        """Return ``[left, right, bottom, top]`` for the dose image.
+    def get_dose_extent(self, axis: str) -> tuple[float, float, float, float]:
+        """Return ``(left, right, bottom, top)`` for the dose image.
 
         Uses the dose image's own geometry (not the primary CT geometry).
         """
         if self.rt_dose_image is None:
-            return [0.0, 1.0, 0.0, 1.0]
+            return (0.0, 1.0, 0.0, 1.0)
         return compute_extent(self.rt_dose_image, axis)
 
     def get_dose_slice(self, axis: str) -> np.ndarray:
@@ -795,12 +932,20 @@ class SliceViewerState:
         """Switch the viewer layout mode.
 
         Args:
-            mode: ``"mpr"`` (top row: Axial + DVH, bottom row: Coronal + Sagittal)
-                or ``"mpr_wide"`` (left column: large Axial, right column: Coronal / Sagittal).
+            mode: ``"mpr"`` (top row: Axial + DVH, bottom row: Coronal + Sagittal),
+                ``"mpr_wide"`` (left column: large Axial, right column: Coronal /
+                Sagittal), or ``"single"`` (one Axes, keyed as ``"axial"``).
+
+        Raises:
+            ValueError: If *mode* is not one of :data:`~dicom_viewer.geometry.LAYOUT_MODES`.
         """
+        if mode not in LAYOUT_MODES:
+            raise ValueError(
+                f"Unknown layout mode: {mode!r}. Expected one of: {LAYOUT_MODES}."
+            )
         if self.layout_mode != mode:
             self.layout_mode = mode
-            self._notify("layout_mode_changed", mode)
+            self._notify(LAYOUT_MODE_CHANGED, mode)
 
     # =========================================================
     # 4DCT phases
@@ -816,7 +961,7 @@ class SliceViewerState:
         After resampling the images are cached in :attr:`all_phases_data` and
         listeners are notified with ``"phases_data_loaded"``.
         """
-        if not self.primary_image:
+        if self.primary_image is None:
             logger.error("Cannot set phases: primary image not loaded.")
             return
 
@@ -831,7 +976,7 @@ class SliceViewerState:
             for phase, series_dict in phases_data.items()
         }
         self.current_phase = None
-        self._notify("phases_data_loaded", self.all_phases_data)
+        self._notify(PHASES_DATA_LOADED, self.all_phases_data)
 
     def set_active_phase_as_secondary(self, phase_name: str) -> None:
         """Activate a 4DCT phase as the secondary overlay image."""
@@ -842,16 +987,21 @@ class SliceViewerState:
         self.current_phase = phase_name
         phase_image = self.all_phases_data[phase_name]["sitk_image"]
         self.set_secondary_image_data(phase_image)
-        self._notify("phase_changed", phase_name)
+        self._notify(PHASE_CHANGED, phase_name)
 
     # =========================================================
     # Window / level
     # =========================================================
-    def set_window_level(self, window: int, level: int) -> None:
-        """Update the display window width and level (in HU)."""
+    def set_window_level(self, window: float, level: float) -> None:
+        """Update the display window width and level (in HU or dose units).
+
+        Values are kept as floats: MR percentile-derived windows and dose
+        images (Gy) legitimately need sub-integer precision, and CT integer
+        HU values are unaffected by float storage.
+        """
         if self.window_level != (window, level):
-            self.window_level = (window, level)
-            self._notify("window_level_changed", window, level)
+            self.window_level = (float(window), float(level))
+            self._notify(WINDOW_LEVEL_CHANGED, window, level)
 
     # =========================================================
     # Crosshair
@@ -878,23 +1028,20 @@ class SliceViewerState:
         # compute all 3 axes in a single transform call instead of calling
         # index_to_physical individually for each.
         x, y, z = self._current_physical_point()
-        new_pos = {
+        new_pos: dict[str, tuple[float, float] | None] = {
             "axial": (x, y),
             "coronal": (x, z),
             "sagittal": (y, z),
         }
         if self.crosshair_pos != new_pos:
             self.crosshair_pos = new_pos
-            self._notify("crosshair_changed")
-
-    # Backward-compatible alias for internal callers.
-    _update_crosshair_by_index = update_crosshair_by_index
+            self._notify(CROSSHAIR_CHANGED)
 
     def set_crosshair_visible(self, visible: bool) -> None:
         """Show or hide the crosshair lines in all views."""
         if self.crosshair_visible != visible:
             self.crosshair_visible = visible
-            self._notify("crosshair_visible_changed", visible)
+            self._notify(CROSSHAIR_VISIBLE_CHANGED, visible)
 
     # =========================================================
     # Bounding box
@@ -917,9 +1064,9 @@ class SliceViewerState:
             for other in AXES:
                 if other != axis and self.bounding_boxes.get(other) is not None:
                     self.bounding_boxes[other] = None
-                    self._notify("bounding_boxes_changed", other, None)
+                    self._notify(BOUNDING_BOXES_CHANGED, other, None)
         self.bounding_boxes[axis] = bbox
-        self._notify("bounding_boxes_changed", axis, bbox)
+        self._notify(BOUNDING_BOXES_CHANGED, axis, bbox)
 
     def set_bbox_visible(self, visible: bool) -> None:
         """Show or hide the bounding-box overlay."""
@@ -944,13 +1091,7 @@ class SliceViewerState:
             raise ValueError(f"No bounding box set for axis '{axis}'")
         x0_p, y0_p, w_p, h_p = bbox
         x1_p, y1_p = x0_p + w_p, y0_p + h_p
-        # Map each physical axis to the corresponding index axis per view.
-        axis_mapping = {
-            "axial": ("sagittal", "coronal"),
-            "coronal": ("sagittal", "axial"),
-            "sagittal": ("coronal", "axial"),
-        }
-        x_axis, y_axis = axis_mapping[axis]
+        x_axis, y_axis = VIEW_TO_PIXEL_AXES[axis]
         x0 = self.physical_to_index(x_axis, x0_p)
         x1 = self.physical_to_index(x_axis, x1_p)
         y0 = self.physical_to_index(y_axis, y0_p)
@@ -974,12 +1115,7 @@ class SliceViewerState:
             width:  Box width in pixel indices.
             height: Box height in pixel indices.
         """
-        axis_mapping = {
-            "axial": ("sagittal", "coronal"),
-            "coronal": ("sagittal", "axial"),
-            "sagittal": ("coronal", "axial"),
-        }
-        x_axis, y_axis = axis_mapping[axis]
+        x_axis, y_axis = VIEW_TO_PIXEL_AXES[axis]
         x0_p = self.index_to_physical(x_axis, x_min)
         x1_p = self.index_to_physical(x_axis, x_min + width)
         y0_p = self.index_to_physical(y_axis, y_min)
@@ -996,13 +1132,13 @@ class SliceViewerState:
         """Set which ROIs are displayed."""
         if self.active_contours != active_roi_numbers:
             self.active_contours = active_roi_numbers
-            self._notify("active_contours_changed", active_roi_numbers)
+            self._notify(ACTIVE_CONTOURS_CHANGED, active_roi_numbers)
 
     def set_selected_roi(self, roi_number: int | None) -> None:
         """Set the ROI that the brush tool will edit."""
         if self.selected_roi_number != roi_number:
             self.selected_roi_number = roi_number
-            self._notify("selected_roi_changed", roi_number)
+            self._notify(SELECTED_ROI_CHANGED, roi_number)
 
     def set_overlay_contours(self, enable: bool) -> None:
         """Enable or disable filled (semi-transparent) contour overlay."""
@@ -1010,7 +1146,7 @@ class SliceViewerState:
             self.overlay_contours = enable
             # Path objects remain valid; the facecolor is recomputed from
             # to_rgba() inside ContourOverlay.draw() on every redraw.
-            self._notify("overlay_contours_changed", enable)
+            self._notify(OVERLAY_CONTOURS_CHANGED, enable)
 
     def add_contour(self, name: str, mask: sitk.Image, color: str) -> int:
         """Add an ROI to the :class:`StructureSet` and return its ROI number."""
@@ -1018,7 +1154,7 @@ class SliceViewerState:
         # Cache the mask as a NumPy array to eliminate sitk round-trips during scrolling.
         self._cache.register_mask_volume(roi_number, mask)
         self._cache.schedule_contour_build(roi_number, self.primary_image)
-        self._notify("all_contours_changed", self.structure_set)
+        self._notify(ALL_CONTOURS_CHANGED, self.structure_set)
         return roi_number
 
     def add_contours(self, rois: list[tuple[str, sitk.Image, str]]) -> list[int]:
@@ -1046,7 +1182,7 @@ class SliceViewerState:
             self._cache.schedule_contour_build(roi_number, self.primary_image)
             roi_numbers.append(roi_number)
         if roi_numbers:
-            self._notify("all_contours_changed", self.structure_set)
+            self._notify(ALL_CONTOURS_CHANGED, self.structure_set)
         return roi_numbers
 
     def delete_contour(self, roi_number: int) -> None:
@@ -1055,8 +1191,8 @@ class SliceViewerState:
         self.active_contours.discard(roi_number)
         self._cache.cancel_contour_build(roi_number)
         self._cache.invalidate_roi(roi_number)
-        self._notify("all_contours_changed", self.structure_set)
-        self._notify("active_contours_changed", self.active_contours)
+        self._notify(ALL_CONTOURS_CHANGED, self.structure_set)
+        self._notify(ACTIVE_CONTOURS_CHANGED, self.active_contours)
 
     def update_contour_properties(self, roi_number: int, props: dict[str, Any]) -> None:
         """Update properties (``name``, ``mask``, ``color``) for *roi_number*."""
@@ -1067,7 +1203,7 @@ class SliceViewerState:
             self._cache.invalidate_contour_paths(roi_number)
             self._cache.register_mask_volume(roi_number, props["mask"])
             self._cache.schedule_contour_build(roi_number, self.primary_image)
-        self._notify("all_contours_changed", self.structure_set)
+        self._notify(ALL_CONTOURS_CHANGED, self.structure_set)
 
     def refresh_contours(self) -> None:
         """Force a contour redraw and DVH update without modifying any mask.
@@ -1075,7 +1211,7 @@ class SliceViewerState:
         Call this when leaving the edit tab so that brush-painted changes are
         reflected in the DVH even if no ``update_contour_properties`` was issued.
         """
-        self._notify("all_contours_changed", self.structure_set)
+        self._notify(ALL_CONTOURS_CHANGED, self.structure_set)
 
     # =========================================================
     # Brush tool
@@ -1084,19 +1220,19 @@ class SliceViewerState:
         """Activate or deactivate the brush editing tool."""
         if self.brush_tool_active != is_active:
             self.brush_tool_active = is_active
-            self._notify("brush_tool_active_changed", is_active)
+            self._notify(BRUSH_TOOL_ACTIVE_CHANGED, is_active)
 
     def set_brush_size_mm(self, size_mm: float) -> None:
         """Set the brush radius in millimetres."""
         if self.brush_size_mm != size_mm:
             self.brush_size_mm = size_mm
-            self._notify("brush_size_mm_changed", size_mm)
+            self._notify(BRUSH_SIZE_MM_CHANGED, size_mm)
 
     def set_brush_fill_inside(self, fill: bool) -> None:
         """Enable or disable hole-filling after each brush stroke."""
         if self.brush_fill_inside != fill:
             self.brush_fill_inside = fill
-            self._notify("brush_fill_inside_changed", fill)
+            self._notify(BRUSH_FILL_INSIDE_CHANGED, fill)
 
     # =========================================================
     # Utilities

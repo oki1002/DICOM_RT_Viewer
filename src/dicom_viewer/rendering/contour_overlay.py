@@ -110,14 +110,16 @@ class ContourOverlay:
                 else:
                     # Retrieve the slice from mask_slice_cache to avoid a
                     # sitk round-trip; fall back to the sitk mask when absent.
-                    mask_slice = state.mask_slice_cache.get_slice(
+                    cached_slice = state.mask_slice_cache.get_slice(
                         roi_number, axis, current_index
                     )
-                    if mask_slice is None:
+                    if cached_slice is None:
                         mask_sitk = state.structure_set.get_mask(roi_number)
                         if mask_sitk is None:
                             continue
                         mask_slice = state.get_slice_data(mask_sitk, axis)
+                    else:
+                        mask_slice = cached_slice
 
                 if mask_slice.shape[0] < 2 or mask_slice.shape[1] < 2:
                     continue

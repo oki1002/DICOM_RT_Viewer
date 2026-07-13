@@ -1,6 +1,22 @@
-# dicom-viewer
+# dicom-rt-viewer
 
-A SimpleITK-based DICOM MPR viewer widget for Tkinter.
+[![CI](https://github.com/oki1002/DICOM_RT_Viewer/actions/workflows/ci.yml/badge.svg)](https://github.com/oki1002/DICOM_RT_Viewer/actions/workflows/ci.yml)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
+A SimpleITK-based DICOM-RT MPR viewer widget for Tkinter — CT display with
+RT-STRUCT contours, RT-DOSE isodose overlay, DVH panel, and mask-editing
+tools, embeddable in any Tkinter application.
+
+The distribution name on PyPI is `dicom-rt-viewer`; the import package is
+`dicom_viewer` (`from dicom_viewer import DicomViewer`).
+
+<!-- TODO: replace with an actual screenshot / GIF before release -->
+![Screenshot placeholder](docs/screenshot.png)
+
+> **Disclaimer** — This software is **not a medical device**. It is
+> intended for research, education, and QA-support use only, and must not
+> be used for primary clinical decision-making, diagnosis, or treatment.
 
 ## Features
 
@@ -30,20 +46,32 @@ A SimpleITK-based DICOM MPR viewer widget for Tkinter.
 
 ## Installation
 
-Install directly from source (editable mode — changes take effect immediately):
+From PyPI:
 
 ```bash
-git clone https://github.com/yourname/dicom-viewer.git
-cd dicom-viewer
+pip install dicom-rt-viewer
+```
+
+Or directly from source (editable mode — changes take effect immediately):
+
+```bash
+git clone https://github.com/oki1002/DICOM_RT_Viewer.git
+cd DICOM_RT_Viewer
 pip install -e .
 ```
+
+> **Note** — Tkinter is part of the CPython standard library but is *not*
+> pip-installable; on some Linux distributions it ships as a separate OS
+> package (e.g. `sudo apt install python3-tk` on Debian/Ubuntu).
 
 ## Package structure
 
 ```
 dicom_viewer/
 ├── __init__.py
-├── viewer.py                  # DicomViewer widget (wires up the collaborators below)
+├── py.typed                    # PEP 561 marker: the package ships inline types
+├── events.py                   # Event-name constants for SliceViewerState listeners
+├── viewer.py                   # DicomViewer widget (wires up the collaborators below)
 ├── geometry.py                 # Pure geometric helpers (slicing, extent, contour paths)
 ├── io.py                       # DICOM series loading utilities (CT, RT-DOSE, REG)
 ├── rtstruct_io.py               # RT-STRUCT read / write utilities
@@ -56,7 +84,7 @@ dicom_viewer/
 │   ├── render.py                  # RGBA colormap LUT helpers
 │   ├── isodose.py                 # IsoDoseOverlay (fill bands + contour lines)
 │   ├── dvh.py                     # DvhPanel (cumulative DVH panel)
-│   └── layout.py                  # LayoutManager (mpr / mpr_wide GridSpec layouts)
+│   └── layout.py                  # LayoutManager (single / mpr / mpr_wide layouts)
 └── event_controllers/
     ├── viewer_events.py      # ViewerEventHandler (top-level dispatcher)
     ├── crosshair_handler.py
@@ -139,9 +167,16 @@ the CT's geometry before being added:
 
 ```python
 import SimpleITK as sitk
-from dicom_viewer.rtstruct_io import load_rt_struct
+from dicom_viewer.rtstruct_io import RtStructLoadError, load_rt_struct
 
-structures = load_rt_struct(ct_dir, rtstruct_path)
+try:
+    # max_workers defaults to 1 (sequential). rt-utils does not document
+    # thread safety, so parallel decoding is opt-in: pass a higher value
+    # only after verifying it with the rt-utils version you ship.
+    structures = load_rt_struct(ct_dir, rtstruct_path)
+except RtStructLoadError as exc:
+    ...  # the file itself could not be parsed (an empty structure set
+    # returns {} instead, so the two cases are distinguishable)
 
 def to_sitk_mask(mask_arr):
     mask_image = sitk.GetImageFromArray(mask_arr.astype("uint8"))
@@ -314,7 +349,7 @@ DicomViewer (ttk.Frame, viewer.py)
     ├─ DrawingManager (rendering/)     # idle-driven blit-redraw coalescing
     ├─ IsoDoseOverlay (rendering/)     # isodose fill bands + contour lines
     ├─ DvhPanel (rendering/)           # cumulative DVH panel
-    ├─ LayoutManager (rendering/)      # mpr / mpr_wide GridSpec layouts
+    ├─ LayoutManager (rendering/)      # single / mpr / mpr_wide GridSpec layouts
     └─ ViewerEventHandler              # routes canvas events to sub-handlers
         ├─ CrosshairEventHandler
         ├─ BrushEventHandler
@@ -324,6 +359,62 @@ DicomViewer (ttk.Frame, viewer.py)
 Every collaborator under `rendering/` is constructed by `DicomViewer` with
 the state, figure, or callback it needs rather than importing the viewer
 itself, so each one can be exercised independently of Tkinter in tests.
+
+## Listening to state changes
+
+`SliceViewerState` broadcasts every change through an observer API. Event
+names are declared as constants in `dicom_viewer.events` — prefer them over
+string literals so a typo becomes an import-time error instead of a
+listener that silently never fires (`_notify` also validates event names at
+dispatch time):
+
+```python
+from dicom_viewer import events
+
+def on_index_changed(axis: str, index: int) -> None:
+    print(f"{axis} -> {index}")
+
+state.add_listener(events.INDEX_CHANGED, on_index_changed)
+```
+
+Observable fields should be changed through their `set_*` methods
+(`set_blend_alpha`, `set_window_level`, ...). As a safety net, direct
+attribute assignment from outside the state module (e.g.
+`state.blend_alpha = 0.5`) is transparently redirected through the matching
+setter so listeners are still notified.
+
+## Threading model
+
+Contour paths for ROI overlays are built on a background thread pool owned
+by `SliceViewerState`; completion is marshalled back onto the Tk main loop
+with `Tk.after`. Calling `after` from a non-main thread is safe only on a
+Tcl interpreter built with thread support — which is the default for
+CPython's bundled Tk on all mainstream platforms, but is stated here as an
+explicit assumption. Everything else (rendering, event handling, mask
+editing) runs on the main thread.
+
+`load_rt_struct` decodes ROI masks sequentially by default; parallel
+decoding is opt-in via `max_workers` because rt-utils does not document
+thread safety.
+
+Ownership note: `DicomViewer.destroy()` shuts the state's thread pool down
+only when the viewer created the state itself. If you inject a shared
+`SliceViewerState`, you own its lifecycle — call `state.close()` yourself
+when the last user of it is gone.
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+
+pytest            # run the test suite (headless: MPLBACKEND=Agg)
+mypy src/dicom_viewer
+black src tests
+isort src tests
+```
+
+CI (GitHub Actions) runs Black, isort, mypy, and pytest on every push and
+pull request. See `CHANGELOG.md` for release history.
 
 ## License
 

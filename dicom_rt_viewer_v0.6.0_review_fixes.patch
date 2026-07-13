@@ -1,0 +1,3094 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+new file mode 100644
+index 0000000..7980a03
+--- /dev/null
++++ b/.github/workflows/ci.yml
+@@ -0,0 +1,42 @@
++name: CI
++
++on:
++  push:
++    branches: [main]
++  pull_request:
++    branches: [main]
++
++jobs:
++  test:
++    runs-on: ubuntu-latest
++    strategy:
++      matrix:
++        python-version: ["3.12"]
++
++    steps:
++      - uses: actions/checkout@v4
++
++      - name: Set up Python ${{ matrix.python-version }}
++        uses: actions/setup-python@v5
++        with:
++          python-version: ${{ matrix.python-version }}
++
++      - name: Install system dependencies (Tk for the widget import)
++        run: sudo apt-get update && sudo apt-get install -y python3-tk
++
++      - name: Install package with dev extras
++        run: pip install -e ".[dev]"
++
++      - name: Check formatting (Black)
++        run: black --check src tests
++
++      - name: Check import order (isort)
++        run: isort --check-only src tests
++
++      - name: Type check (mypy)
++        run: mypy src/dicom_viewer
++
++      - name: Run tests
++        env:
++          MPLBACKEND: Agg
++        run: pytest -q
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+new file mode 100644
+index 0000000..ba9d085
+--- /dev/null
++++ b/CHANGELOG.md
+@@ -0,0 +1,113 @@
++# Changelog
++
++All notable changes to this project are documented in this file.
++The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
++and this project adheres to [Semantic Versioning](https://semver.org/).
++
++## [0.6.0] — Unreleased
++
++First release prepared for public distribution.
++
++### Fixed
++
++- **Coordinate convention unified to pixel centers.** `compute_extent` now
++  returns edges half a voxel outside the first/last pixel centers, so
++  `imshow(extent=...)`, `TransformIndexToPhysicalPoint`, contour paths
++  (`mask_slice_to_paths`), the isodose grid, and the brush tool's
++  physical-to-pixel mapping all agree on a single physical grid. Previously
++  the displayed image, contours, and crosshair could disagree by up to one
++  voxel across the field of view. Pinned by regression tests.
++- **Negative directional margins shaved the wrong face.** `apply_margin`
++  with a negative value (e.g. `MarginConfig(superior=-2)`) contracted the
++  *opposite* face of the structure. Erosion now removes the outermost layer
++  of the named face; dilation behaviour is unchanged.
++- **`layout_mode` on an injected state was ignored.** Constructing
++  `DicomViewer` with `SliceViewerState(layout_mode="single")` built the
++  default `mpr_wide` layout with no way to switch. The viewer now builds
++  the layout named by the injected state.
++- **Brush strokes could corrupt masks when the pointer crossed into another
++  view mid-drag.** A stroke is now confined to the axis it started on.
++- **A destroyed viewer stayed subscribed to an injected state.**
++  `DicomViewer.destroy()` now unregisters every state listener it added
++  (including the event handler's), so a shared `SliceViewerState` no
++  longer keeps notifying dead Tk widgets or pinning the viewer in memory.
++- **A single malformed REG file aborted `load_all_series`.** Malformed
++  registration entries are now logged and skipped per file.
++- **Multi-valued Window Width/Center tags fell back to defaults.**
++  Backslash-separated DS values (common on GE consoles) now use the first
++  preset.
++- `LayoutManager.build` and `SliceViewerState.set_layout_mode` now raise
++  `ValueError` for unknown layout modes instead of silently falling back
++  to `"mpr"`.
++
++### Changed
++
++- **Distribution renamed to `dicom-rt-viewer`** (import package remains
++  `dicom_viewer`).
++- **`load_rt_struct` raises `RtStructLoadError`** when the file cannot be
++  parsed, instead of returning an empty dict indistinguishable from an
++  empty structure set. ROI mask decoding is now sequential by default;
++  parallel decoding is opt-in via the new `max_workers` parameter.
++- **`StructureSet` entries are typed.** `get_all()` returns
++  `dict[int, RoiEntry]` (a dataclass with `name` / `mask` / `color`)
++  instead of `dict[int, dict[str, Any]]`; `StructureSet.update` rejects
++  unknown property keys with `ValueError`.
++- **Event names are constants.** All `SliceViewerState` event names are
++  declared in the new `dicom_viewer.events` module; `_notify` validates
++  event names at dispatch time.
++- **Direct writes to observable state fields are redirected through their
++  setters** (e.g. `state.blend_alpha = 0.5` now notifies listeners), so
++  bypassing a setter can no longer silently desynchronise the display.
++- **`window_level` is now `tuple[float, float]`** (was `tuple[int, int]`)
++  to preserve precision for percentile-derived MR windows and dose
++  displays.
++- `DicomViewer.destroy()` closes the state's thread pool only when the
++  viewer created the state itself; injected states are owned by their
++  creator.
++- `DicomViewer.metadata` always returns the keys `spacing` / `origin` /
++  `size` (each `None` when no image is loaded).
++- PageUp / PageDown now step ±10 slices (Up / Down remain ±1).
++- mypy configuration changed from `strict = true` (which the codebase did
++  not satisfy) to an enforced realistic baseline (`check_untyped_defs`,
++  `warn_return_any`, etc.); the package now ships a `py.typed` marker.
++  Restoring full strict mode is future work.
++
++### Added
++
++- Test suite (`tests/`) covering the coordinate convention, margin
++  directions, boolean operations, LUT/RGBA rendering, the observer
++  pattern, the setter guard, and `StructureSet`.
++- GitHub Actions CI: Black, isort, mypy, and pytest on every push / PR.
++- `pyproject.toml` metadata: authors, URLs, classifiers, keywords, and
++  Black / isort / pytest tool configuration.
++- README: PyPI installation, medical-device disclaimer, threading-model
++  documentation, state-event documentation, and development instructions.
++
++### Removed
++
++- Unused backward-compatibility shims from the pre-release internal API:
++  `DicomViewer.axis_vars` (and the `_IndexVarProxy` / `_SingleVar`
++  adapters) and the `_axis_to_xyz_index` / `_axis_to_numpy_index` /
++  `_update_crosshair_by_index` aliases.
++
++## [0.5.1] — 2026
++
++- Fix partial-blit bounding-box mismatch under `constrained_layout=True`
++  (visual ghosting in embedded hosts).
++- Add the `add_overlay_artist` / `remove_overlay_artist` API so host
++  applications' custom Matplotlib artists survive blit restores.
++
++## [0.5.0] — 2026
++
++- Add the `"single"` layout mode (one full-figure Axes keyed as
++  `"axial"`).
++
++## [0.4.x] — 2025–2026
++
++- Split the package into `state/`, `rendering/`, and `event_controllers/`
++  sub-packages with dependency-injected collaborators.
++- Blit-based idle-driven rendering (`DrawingManager`), per-slice contour
++  path caching, and background contour builds.
++- RT-DOSE loading, isodose fill/line overlay, and the DVH panel.
++- RT-STRUCT read/write, ROI operations (interpolation, margins, smoothing,
++  boolean operations, slice thinning), brush tool, and bounding-box tool.
+diff --git a/README.md b/README.md
+index bf66d24..2d5168c 100644
+--- a/README.md
++++ b/README.md
+@@ -1,6 +1,22 @@
+-# dicom-viewer
++# dicom-rt-viewer
+ 
+-A SimpleITK-based DICOM MPR viewer widget for Tkinter.
++[![CI](https://github.com/oki1002/DICOM_RT_Viewer/actions/workflows/ci.yml/badge.svg)](https://github.com/oki1002/DICOM_RT_Viewer/actions/workflows/ci.yml)
++[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/)
++[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
++
++A SimpleITK-based DICOM-RT MPR viewer widget for Tkinter — CT display with
++RT-STRUCT contours, RT-DOSE isodose overlay, DVH panel, and mask-editing
++tools, embeddable in any Tkinter application.
++
++The distribution name on PyPI is `dicom-rt-viewer`; the import package is
++`dicom_viewer` (`from dicom_viewer import DicomViewer`).
++
++<!-- TODO: replace with an actual screenshot / GIF before release -->
++![Screenshot placeholder](docs/screenshot.png)
++
++> **Disclaimer** — This software is **not a medical device**. It is
++> intended for research, education, and QA-support use only, and must not
++> be used for primary clinical decision-making, diagnosis, or treatment.
+ 
+ ## Features
+ 
+@@ -30,20 +46,32 @@ A SimpleITK-based DICOM MPR viewer widget for Tkinter.
+ 
+ ## Installation
+ 
+-Install directly from source (editable mode — changes take effect immediately):
++From PyPI:
++
++```bash
++pip install dicom-rt-viewer
++```
++
++Or directly from source (editable mode — changes take effect immediately):
+ 
+ ```bash
+-git clone https://github.com/yourname/dicom-viewer.git
+-cd dicom-viewer
++git clone https://github.com/oki1002/DICOM_RT_Viewer.git
++cd DICOM_RT_Viewer
+ pip install -e .
+ ```
+ 
++> **Note** — Tkinter is part of the CPython standard library but is *not*
++> pip-installable; on some Linux distributions it ships as a separate OS
++> package (e.g. `sudo apt install python3-tk` on Debian/Ubuntu).
++
+ ## Package structure
+ 
+ ```
+ dicom_viewer/
+ ├── __init__.py
+-├── viewer.py                  # DicomViewer widget (wires up the collaborators below)
++├── py.typed                    # PEP 561 marker: the package ships inline types
++├── events.py                   # Event-name constants for SliceViewerState listeners
++├── viewer.py                   # DicomViewer widget (wires up the collaborators below)
+ ├── geometry.py                 # Pure geometric helpers (slicing, extent, contour paths)
+ ├── io.py                       # DICOM series loading utilities (CT, RT-DOSE, REG)
+ ├── rtstruct_io.py               # RT-STRUCT read / write utilities
+@@ -56,7 +84,7 @@ dicom_viewer/
+ │   ├── render.py                  # RGBA colormap LUT helpers
+ │   ├── isodose.py                 # IsoDoseOverlay (fill bands + contour lines)
+ │   ├── dvh.py                     # DvhPanel (cumulative DVH panel)
+-│   └── layout.py                  # LayoutManager (mpr / mpr_wide GridSpec layouts)
++│   └── layout.py                  # LayoutManager (single / mpr / mpr_wide layouts)
+ └── event_controllers/
+     ├── viewer_events.py      # ViewerEventHandler (top-level dispatcher)
+     ├── crosshair_handler.py
+@@ -139,9 +167,16 @@ the CT's geometry before being added:
+ 
+ ```python
+ import SimpleITK as sitk
+-from dicom_viewer.rtstruct_io import load_rt_struct
++from dicom_viewer.rtstruct_io import RtStructLoadError, load_rt_struct
+ 
+-structures = load_rt_struct(ct_dir, rtstruct_path)
++try:
++    # max_workers defaults to 1 (sequential). rt-utils does not document
++    # thread safety, so parallel decoding is opt-in: pass a higher value
++    # only after verifying it with the rt-utils version you ship.
++    structures = load_rt_struct(ct_dir, rtstruct_path)
++except RtStructLoadError as exc:
++    ...  # the file itself could not be parsed (an empty structure set
++    # returns {} instead, so the two cases are distinguishable)
+ 
+ def to_sitk_mask(mask_arr):
+     mask_image = sitk.GetImageFromArray(mask_arr.astype("uint8"))
+@@ -314,7 +349,7 @@ DicomViewer (ttk.Frame, viewer.py)
+     ├─ DrawingManager (rendering/)     # idle-driven blit-redraw coalescing
+     ├─ IsoDoseOverlay (rendering/)     # isodose fill bands + contour lines
+     ├─ DvhPanel (rendering/)           # cumulative DVH panel
+-    ├─ LayoutManager (rendering/)      # mpr / mpr_wide GridSpec layouts
++    ├─ LayoutManager (rendering/)      # single / mpr / mpr_wide GridSpec layouts
+     └─ ViewerEventHandler              # routes canvas events to sub-handlers
+         ├─ CrosshairEventHandler
+         ├─ BrushEventHandler
+@@ -325,6 +360,62 @@ Every collaborator under `rendering/` is constructed by `DicomViewer` with
+ the state, figure, or callback it needs rather than importing the viewer
+ itself, so each one can be exercised independently of Tkinter in tests.
+ 
++## Listening to state changes
++
++`SliceViewerState` broadcasts every change through an observer API. Event
++names are declared as constants in `dicom_viewer.events` — prefer them over
++string literals so a typo becomes an import-time error instead of a
++listener that silently never fires (`_notify` also validates event names at
++dispatch time):
++
++```python
++from dicom_viewer import events
++
++def on_index_changed(axis: str, index: int) -> None:
++    print(f"{axis} -> {index}")
++
++state.add_listener(events.INDEX_CHANGED, on_index_changed)
++```
++
++Observable fields should be changed through their `set_*` methods
++(`set_blend_alpha`, `set_window_level`, ...). As a safety net, direct
++attribute assignment from outside the state module (e.g.
++`state.blend_alpha = 0.5`) is transparently redirected through the matching
++setter so listeners are still notified.
++
++## Threading model
++
++Contour paths for ROI overlays are built on a background thread pool owned
++by `SliceViewerState`; completion is marshalled back onto the Tk main loop
++with `Tk.after`. Calling `after` from a non-main thread is safe only on a
++Tcl interpreter built with thread support — which is the default for
++CPython's bundled Tk on all mainstream platforms, but is stated here as an
++explicit assumption. Everything else (rendering, event handling, mask
++editing) runs on the main thread.
++
++`load_rt_struct` decodes ROI masks sequentially by default; parallel
++decoding is opt-in via `max_workers` because rt-utils does not document
++thread safety.
++
++Ownership note: `DicomViewer.destroy()` shuts the state's thread pool down
++only when the viewer created the state itself. If you inject a shared
++`SliceViewerState`, you own its lifecycle — call `state.close()` yourself
++when the last user of it is gone.
++
++## Development
++
++```bash
++pip install -e ".[dev]"
++
++pytest            # run the test suite (headless: MPLBACKEND=Agg)
++mypy src/dicom_viewer
++black src tests
++isort src tests
++```
++
++CI (GitHub Actions) runs Black, isort, mypy, and pytest on every push and
++pull request. See `CHANGELOG.md` for release history.
++
+ ## License
+ 
+ MIT
+\ No newline at end of file
+diff --git a/docs/README.md b/docs/README.md
+new file mode 100644
+index 0000000..266e577
+--- /dev/null
++++ b/docs/README.md
+@@ -0,0 +1,2 @@
++Place a real screenshot or GIF of the viewer here as screenshot.png
++before the first public release (referenced from README.md).
+diff --git a/pyproject.toml b/pyproject.toml
+index 11ef2a5..993ab75 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -3,12 +3,42 @@ requires = ["hatchling"]
+ build-backend = "hatchling.build"
+ 
+ [project]
+-name = "dicom-viewer"
++# Distribution name: "dicom-rt-viewer" (RT support is the differentiator and
++# plain "dicom-viewer" is too generic to be discoverable on PyPI). The import
++# package remains "dicom_viewer" — distribution and import names differing is
++# a standard pattern (e.g. scikit-image / skimage).
++name = "dicom-rt-viewer"
+ dynamic = ["version"]
+-description = "SimpleITK-based DICOM MPR viewer widget for Tkinter"
++description = "SimpleITK-based DICOM-RT MPR viewer widget for Tkinter (CT, RT-DOSE, RT-STRUCT, DVH)"
+ readme = "README.md"
+ requires-python = ">=3.12"
+ license = { text = "MIT" }
++authors = [{ name = "oki1002" }]
++keywords = [
++    "dicom",
++    "dicom-rt",
++    "radiotherapy",
++    "medical-imaging",
++    "mpr",
++    "viewer",
++    "rt-struct",
++    "rt-dose",
++    "dvh",
++    "simpleitk",
++    "tkinter",
++]
++classifiers = [
++    "Development Status :: 4 - Beta",
++    "Intended Audience :: Healthcare Industry",
++    "Intended Audience :: Science/Research",
++    "License :: OSI Approved :: MIT License",
++    "Operating System :: OS Independent",
++    "Programming Language :: Python :: 3",
++    "Programming Language :: Python :: 3.12",
++    "Topic :: Scientific/Engineering :: Medical Science Apps.",
++    "Topic :: Scientific/Engineering :: Visualization",
++    "Typing :: Typed",
++]
+ 
+ dependencies = [
+     "SimpleITK>=2.3",
+@@ -21,11 +51,19 @@ dependencies = [
+     "scipy>=1.11",
+ ]
+ 
++[project.urls]
++Homepage = "https://github.com/oki1002/DICOM_RT_Viewer"
++Repository = "https://github.com/oki1002/DICOM_RT_Viewer"
++Issues = "https://github.com/oki1002/DICOM_RT_Viewer/issues"
++Changelog = "https://github.com/oki1002/DICOM_RT_Viewer/blob/main/CHANGELOG.md"
++
+ [project.optional-dependencies]
+-# Install with: pip install dicom-viewer[dev]
++# Install with: pip install dicom-rt-viewer[dev]
+ dev = [
+     "pytest>=7",
+     "mypy>=1.0",
++    "black>=24",
++    "isort>=5.13",
+ ]
+ 
+ [tool.hatch.version]
+@@ -35,8 +73,28 @@ path = "src/dicom_viewer/__init__.py"
+ 
+ [tool.hatch.build.targets.wheel]
+ # src layout: only the package under src/ is included in the wheel.
++# py.typed is picked up automatically because it lives inside the package.
+ packages = ["src/dicom_viewer"]
+ 
+ [tool.mypy]
+ python_version = "3.12"
+-strict = true
+\ No newline at end of file
++# Realistic baseline: full --strict requires annotating every Tk/Matplotlib
++# event-handler signature, which adds noise without catching real bugs in
++# this codebase. The flags below keep the valuable checks (untyped-def
++# bodies are still checked, Any-returns flagged) while allowing untyped
++# callback parameters. Tightening back to strict is tracked in CHANGELOG.
++check_untyped_defs = true
++warn_redundant_casts = true
++warn_unused_ignores = true
++warn_return_any = true
++no_implicit_optional = true
++ignore_missing_imports = true
++
++[tool.black]
++target-version = ["py312"]
++
++[tool.isort]
++profile = "black"
++
++[tool.pytest.ini_options]
++testpaths = ["tests"]
+diff --git a/src/dicom_viewer/__init__.py b/src/dicom_viewer/__init__.py
+index a3f1b85..db89ec9 100644
+--- a/src/dicom_viewer/__init__.py
++++ b/src/dicom_viewer/__init__.py
+@@ -1,49 +1,57 @@
+ """dicom_viewer — SimpleITK-based DICOM MPR viewer widget for Tkinter.
+ 
+-Public API
+-----------
++Public API (re-exported here)
++-----------------------------
+ DicomViewer
+-    A ``ttk.Frame`` subclass embedding a three-plane MPR viewer (axial large
+-    left, coronal/sagittal stacked right).  Supports secondary image blending
+-    and 4DCT phase overlay via a built-in blend slider.
++    A ``ttk.Frame`` subclass embedding an MPR viewer. Layout is selectable
++    via ``SliceViewerState.layout_mode``: ``"mpr_wide"`` (default; axial
++    large left, coronal/sagittal stacked right), ``"mpr"`` (2x2 grid with a
++    DVH panel), or ``"single"`` (axial only). Supports secondary image
++    blending and 4DCT phase overlay via a built-in blend slider.
+ 
+ SliceViewerState
+     Observable state container.  Holds all mutable state: images, indices,
+     window/level, ROI masks, brush settings, bounding boxes, crosshair
+-    positions, and 4DCT phase data.
++    positions, and 4DCT phase data. Change events are declared as constants
++    in :mod:`dicom_viewer.events`.
+ 
+-StructureSet
+-    ROI mask container keyed by integer ROI number.  Used internally by
+-    ``SliceViewerState``; exposed here for callers that build structure sets
+-    directly.
++StructureSet / RoiEntry
++    ROI mask container keyed by integer ROI number, and the typed entry it
++    stores. Used internally by ``SliceViewerState``; exposed here for
++    callers that build structure sets directly.
+ 
+-I/O helpers (``dicom_viewer.io``)
++Submodule API (import from the submodule)
++-----------------------------------------
++``dicom_viewer.io``
+     validate_dicom_files, find_reg_matrices,
+     load_all_series, load_dcm_series, normalize_phase_label
+ 
+-RT-STRUCT helpers (``dicom_viewer.rtstruct_io``)
++``dicom_viewer.rtstruct_io``
+     load_rt_struct, mask2rtstruct, resample_mask_to_original_space,
+-    random_hex_color
++    random_hex_color, RtStructLoadError
+ 
+-ROI operations (``dicom_viewer.roi_operations``)
++``dicom_viewer.roi_operations``
+     interpolate_contour, apply_margin, smooth_contour,
+     boolean_operation, thin_slices
+ 
++``dicom_viewer.events``
++    Event-name constants for ``SliceViewerState.add_listener``.
++
+ Quick start::
+ 
+     import tkinter as tk
+     from dicom_viewer import DicomViewer, SliceViewerState
+ 
+     root = tk.Tk()
+-    state  = SliceViewerState()
++    state = SliceViewerState()
+     viewer = DicomViewer(root, state=state)
+     viewer.pack(fill="both", expand=True)
+     viewer.load_ct("/path/to/dicom")
+     root.mainloop()
+ """
+ 
+-from .state.viewer_state import SliceViewerState, StructureSet
++from .state.viewer_state import RoiEntry, SliceViewerState, StructureSet
+ from .viewer import DicomViewer
+ 
+-__all__ = ["DicomViewer", "SliceViewerState", "StructureSet"]
+-__version__ = "0.5.1"
++__all__ = ["DicomViewer", "RoiEntry", "SliceViewerState", "StructureSet"]
++__version__ = "0.6.0"
+diff --git a/src/dicom_viewer/event_controllers/bbox_handler.py b/src/dicom_viewer/event_controllers/bbox_handler.py
+index 9dc7344..f7d9417 100644
+--- a/src/dicom_viewer/event_controllers/bbox_handler.py
++++ b/src/dicom_viewer/event_controllers/bbox_handler.py
+@@ -14,6 +14,8 @@ Supported interactions:
+ 
+ from typing import TYPE_CHECKING
+ 
++import numpy as np
++
+ if TYPE_CHECKING:
+     from ..state.viewer_state import SliceViewerState
+     from ..viewer import DicomViewer
+@@ -64,13 +66,15 @@ class BboxEventHandler:
+         bbox = self.state.bounding_boxes.get(axis)
+         handle = self._detect_handle(event, axis)
+ 
+-        if handle:
+-            # Resize an existing box.
++        if handle and bbox is not None:
++            # Resize an existing box. _detect_handle only returns a handle
++            # when a box exists, so the bbox check is for the type checker
++            # and against future refactors breaking that invariant.
+             self._begin_drag(axis, "resize", (px, py), list(bbox))
+             self._resize_handle = handle
+             return True
+ 
+-        if bbox and (
++        if bbox is not None and (
+             bbox[0] <= px <= bbox[0] + bbox[2] and bbox[1] <= py <= bbox[1] + bbox[3]
+         ):
+             # Move the existing box.
+@@ -119,8 +123,15 @@ class BboxEventHandler:
+         self._original_pos = None
+ 
+     def _apply_drag(self, px: float, py: float) -> None:
+-        """Update the box currently being created/moved/resized to (px, py)."""
++        """Update the box currently being created/moved/resized to (px, py).
++
++        Callers guarantee a drag is in progress; the guard below encodes
++        that invariant explicitly (and narrows the Optionals for type
++        checking) rather than assuming it.
++        """
+         axis = self._active_axis
++        if axis is None or self._drag_start_pos_data is None:
++            return
+         x0, y0 = self._drag_start_pos_data
+         mode = self._interaction_mode
+ 
+@@ -131,6 +142,8 @@ class BboxEventHandler:
+                 axis, (x_start, y_start, x_end - x_start, y_end - y_start)
+             )
+         elif mode == "move":
++            if self._original_pos is None:
++                return
+             x, y, w, h = self._original_pos
+             self.state.set_bounding_box(axis, (x + px - x0, y + py - y0, w, h))
+         elif mode == "resize":
+@@ -180,14 +193,17 @@ class BboxEventHandler:
+         x_min, x_max = x, x + w
+         y_min, y_max = y, y + h
+ 
+-        # Convert the pixel tolerance to data units via the inverse display transform.
++        # Convert the pixel tolerance to data units via the inverse display
++        # transform. Before the axes has been drawn its transform can be
++        # singular, so a non-invertible / degenerate transform falls back to
++        # a 1-data-unit tolerance rather than swallowing unrelated errors.
+         try:
+             inv = ax.transData.inverted()
+             p0 = inv.transform((0, 0))
+             p1 = inv.transform((self.TOLERANCE_PIXELS, self.TOLERANCE_PIXELS))
+             tol_x = abs(p1[0] - p0[0])
+             tol_y = abs(p1[1] - p0[1])
+-        except Exception:
++        except (np.linalg.LinAlgError, ValueError):
+             tol_x = tol_y = 1.0
+ 
+         ex, ey = event.xdata, event.ydata
+@@ -226,6 +242,9 @@ class BboxEventHandler:
+             dragging "b" down (dy < 0) -> decrease y_min -> y += dy; h -= dy
+         """
+         handle = self._resize_handle
++        axis = self._active_axis
++        if handle is None or axis is None or self._original_pos is None:
++            return
+         x, y, w, h = self._original_pos
+         min_size = self._MIN_SIZE
+ 
+@@ -248,4 +267,4 @@ class BboxEventHandler:
+                 y += dy
+                 h = new_h
+ 
+-        self.state.set_bounding_box(self._active_axis, (x, y, w, h))
++        self.state.set_bounding_box(axis, (x, y, w, h))
+diff --git a/src/dicom_viewer/event_controllers/brush_handler.py b/src/dicom_viewer/event_controllers/brush_handler.py
+index bdb7625..cdafce1 100644
+--- a/src/dicom_viewer/event_controllers/brush_handler.py
++++ b/src/dicom_viewer/event_controllers/brush_handler.py
+@@ -34,6 +34,7 @@ class BrushEventHandler:
+         self._active_axis: str | None = None  # axis on which the stroke was started
+         self._last_pos_px: tuple[int, int] | None = None
+         self._stroke_mask: np.ndarray | None = None
++        self._stroke_radii_px: tuple[float, float] | None = None
+ 
+         self._cached_mask_volume: np.ndarray | None = None
+         self._cached_roi_number: int | None = None
+@@ -74,11 +75,22 @@ class BrushEventHandler:
+         self._active_axis = self.state.current_axis
+ 
+         mask_image = self.state.structure_set.get_mask(roi_number)
++        if mask_image is None:
++            # __contains__ was checked above, but the entry could in theory
++            # be removed between the check and here; guard rather than crash.
++            self._is_dragging = False
++            return
+         mask_slice = self.state.get_slice_data(mask_image, self._active_axis)
+         self._stroke_mask = np.zeros_like(mask_slice, dtype=bool)
+ 
+         self._cached_mask_volume = sitk.GetArrayFromImage(mask_image)
+         self._cached_roi_number = roi_number
++        # The physical extent and in-plane shape only depend on the image
++        # geometry and axis, both fixed for the duration of a stroke, so
++        # the radius-in-pixels conversion is computed once here instead of
++        # on every motion event (previously re-sliced state.primary_image
++        # on every mouse-move during a drag).
++        self._stroke_radii_px = self._compute_brush_radii_px(self._active_axis)
+ 
+         self._last_pos_px = None
+         self._paint_at(event)
+@@ -103,6 +115,13 @@ class BrushEventHandler:
+             self._update_brush_cursor(event)
+ 
+         if self._is_dragging:
++            # A stroke never crosses view boundaries: _stroke_mask and
++            # _cached_mask_volume were built for self._active_axis, so
++            # painting with a different axis' pixel coordinates would
++            # corrupt the mask if the pointer drifts into another view
++            # mid-drag.
++            if current != self._active_axis:
++                return
+             pos_px = self._physical_to_slice_pixel(current, (event.xdata, event.ydata))
+             if pos_px == self._last_pos_px:
+                 return
+@@ -128,6 +147,11 @@ class BrushEventHandler:
+ 
+         # Apply hole-filling on the final 2-D slice if requested, then commit.
+         mask_volume = self._cached_mask_volume
++        if mask_volume is None:
++            # A press that failed its guards never populated the cache, so
++            # there is nothing to commit.
++            self._discard_cache()
++            return
+         slobj = self._make_slobj(axis)
+ 
+         if self._button == 1 and self.state.brush_fill_inside:
+@@ -139,6 +163,7 @@ class BrushEventHandler:
+ 
+         self._last_pos_px = None
+         self._stroke_mask = None
++        self._stroke_radii_px = None
+         self._discard_cache()
+ 
+     def handle_scroll(self, event) -> None:
+@@ -331,10 +356,22 @@ class BrushEventHandler:
+     # Coordinate helpers
+     # ------------------------------------------------------------------
+     def _get_brush_radii_px(self, axis: str) -> tuple[float, float]:
++        """Return the current stroke's cached brush radius in pixel units ``(ry, rx)``.
++
++        Falls back to computing fresh if called outside an active stroke
++        (e.g. for cursor-preview rendering before the first press).
++        """
++        if self._stroke_radii_px is not None:
++            return self._stroke_radii_px
++        return self._compute_brush_radii_px(axis)
++
++    def _compute_brush_radii_px(self, axis: str) -> tuple[float, float]:
+         """Convert the brush radius from mm to pixel units ``(ry, rx)``.
+ 
+         The conversion accounts for the physical extent of the current slice
+-        so the brush appears isotropic in physical space.
++        so the brush appears isotropic in physical space. With the
++        pixel-center extent convention, pixels-per-mm along each axis is
++        ``shape / (extent span)`` (i.e. ``1 / spacing``).
+         """
+         slice_shape = self.state.get_slice_data(self.state.primary_image, axis).shape
+         extent = self.state.get_extent(axis)
+@@ -343,8 +380,8 @@ class BrushEventHandler:
+         phys_h = extent[3] - extent[2]
+         phys_w = extent[1] - extent[0]
+         return (
+-            self.state.brush_size_mm * (slice_shape[0] - 1) / phys_h,
+-            self.state.brush_size_mm * (slice_shape[1] - 1) / phys_w,
++            self.state.brush_size_mm * slice_shape[0] / phys_h,
++            self.state.brush_size_mm * slice_shape[1] / phys_w,
+         )
+ 
+     def _physical_to_slice_pixel(
+@@ -365,6 +402,13 @@ class BrushEventHandler:
+         if slice_shape[0] < 2 or slice_shape[1] < 2:
+             return None
+         x_min, x_max, y_min, y_max = self.state.get_extent(axis)
+-        col = (phys_pos[0] - x_min) / (x_max - x_min) * (slice_shape[1] - 1)
+-        row = (phys_pos[1] - y_min) / (y_max - y_min) * (slice_shape[0] - 1)
++        # Pixel-center convention (see geometry.compute_extent): pixel i's
++        # center sits at x_min + (i + 0.5) * sx, so the inverse mapping is
++        # (phys - x_min) / sx - 0.5. Using (shape - 1) here previously
++        # compressed the mapping by up to one pixel at the far edge,
++        # painting strokes slightly off from the cursor position.
++        sx = (x_max - x_min) / slice_shape[1]
++        sy = (y_max - y_min) / slice_shape[0]
++        col = (phys_pos[0] - x_min) / sx - 0.5
++        row = (phys_pos[1] - y_min) / sy - 0.5
+         return int(round(row)), int(round(col))
+diff --git a/src/dicom_viewer/event_controllers/crosshair_handler.py b/src/dicom_viewer/event_controllers/crosshair_handler.py
+index bf1c292..60c3938 100644
+--- a/src/dicom_viewer/event_controllers/crosshair_handler.py
++++ b/src/dicom_viewer/event_controllers/crosshair_handler.py
+@@ -65,6 +65,10 @@ class CrosshairEventHandler:
+             return False
+ 
+         ax = self.viewer.axs.get(axis)
++        if ax is None:
++            # current_axis can name a view that the active layout does not
++            # build (e.g. "coronal" after switching to "single").
++            return False
+         # Convert data coordinates to display pixels for hit-testing.
+         px, py = ax.transData.transform((event.xdata, event.ydata))
+         cx, cy = ax.transData.transform(pos)
+diff --git a/src/dicom_viewer/event_controllers/viewer_events.py b/src/dicom_viewer/event_controllers/viewer_events.py
+index 54e86c6..1c6e51d 100644
+--- a/src/dicom_viewer/event_controllers/viewer_events.py
++++ b/src/dicom_viewer/event_controllers/viewer_events.py
+@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
+ 
+ import numpy as np
+ 
++from .. import events
+ from .bbox_handler import BboxEventHandler
+ from .brush_handler import BrushEventHandler
+ from .crosshair_handler import CrosshairEventHandler
+@@ -40,6 +41,10 @@ if TYPE_CHECKING:
+ # this window.
+ SCROLL_DEBOUNCE_MS: int = 30
+ 
++# Slice step for the PageUp / PageDown keys (Up / Down move by 1). Larger
++# than one so paging is meaningfully faster than single stepping.
++_PAGE_STEP: int = 10
++
+ 
+ class ViewerEventHandler:
+     """Dispatch matplotlib canvas events to specialised sub-handlers."""
+@@ -55,7 +60,7 @@ class ViewerEventHandler:
+         # Window / level drag state
+         self._dragging_wl: bool = False
+         self._wl_start_pos: tuple[int, int] | None = None
+-        self._wl_initial: tuple[int, int] | None = None
++        self._wl_initial: tuple[float, float] | None = None
+ 
+         # Scroll debounce state. All fields are touched only from the Tk
+         # main thread, so no lock is required. ``_scroll_after_id`` holds
+@@ -66,7 +71,7 @@ class ViewerEventHandler:
+         self._scroll_axis: str | None = None
+ 
+         self.state.add_listener(
+-            "brush_tool_active_changed", self._on_brush_tool_active_changed
++            events.BRUSH_TOOL_ACTIVE_CHANGED, self._on_brush_tool_active_changed
+         )
+ 
+     # ------------------------------------------------------------------
+@@ -181,14 +186,19 @@ class ViewerEventHandler:
+         self.viewer.drawing_manager.flush()
+ 
+     def cancel_pending(self) -> None:
+-        """Cancel any pending debounced scroll flush without applying it.
++        """Cancel any pending debounced scroll flush without applying it,
++        and unregister this handler's state listener.
+ 
+         Call this when the owning viewer is being destroyed so that a
+         ``widget.after`` callback never fires against a widget that no
+-        longer exists.
++        longer exists, and so a shared (injected) state does not keep a
++        reference to — and keep notifying — a dead handler.
+         """
+         self._cancel_scroll_timer()
+         self._scroll_accum = 0
++        self.state.remove_listener(
++            events.BRUSH_TOOL_ACTIVE_CHANGED, self._on_brush_tool_active_changed
++        )
+         self._scroll_axis = None
+ 
+     def _tk_widget(self):
+@@ -244,12 +254,18 @@ class ViewerEventHandler:
+ 
+         # Priority 3: window / level.
+         # Horizontal drag -> window width; vertical drag -> window level.
+-        if self._dragging_wl and event.x is not None and event.y is not None:
++        if (
++            self._dragging_wl
++            and self._wl_start_pos is not None
++            and self._wl_initial is not None
++            and event.x is not None
++            and event.y is not None
++        ):
+             dx = event.x - self._wl_start_pos[0]
+             dy = event.y - self._wl_start_pos[1]
+             init_w, init_l = self._wl_initial
+-            new_w = max(1, int(init_w + dx * 1.0))
+-            new_l = int(init_l - dy * 0.2)
++            new_w = max(1.0, init_w + dx)
++            new_l = init_l - dy * 0.2
+             self.state.set_window_level(new_w, new_l)
+             return
+ 
+@@ -278,14 +294,18 @@ class ViewerEventHandler:
+     # Keyboard
+     # ------------------------------------------------------------------
+     def on_key_press(self, event) -> None:
+-        """Navigate slices with Up / Down / PageUp / PageDown keys."""
++        """Navigate slices with Up / Down (±1) and PageUp / PageDown (±10) keys."""
+         axis = self.state.current_axis
+         if not axis or self.state.primary_image is None:
+             return
+-        if event.key in ("up", "pageup"):
++        if event.key == "up":
+             delta = 1
+-        elif event.key in ("down", "pagedown"):
++        elif event.key == "down":
+             delta = -1
++        elif event.key == "pageup":
++            delta = _PAGE_STEP
++        elif event.key == "pagedown":
++            delta = -_PAGE_STEP
+         else:
+             return
+         current = self.state.indices[axis]
+diff --git a/src/dicom_viewer/events.py b/src/dicom_viewer/events.py
+new file mode 100644
+index 0000000..2edbf1f
+--- /dev/null
++++ b/src/dicom_viewer/events.py
+@@ -0,0 +1,67 @@
++"""events.py — Canonical event-name constants for SliceViewerState's Observer pattern.
++
++``SliceViewerState.add_listener`` / ``_notify`` accept plain strings, so a
++typo'd event name (``"windw_level_changed"``) previously failed silently —
++the listener would simply never fire. Importing these constants instead of
++writing string literals turns that typo into an ``AttributeError`` /
++``NameError`` at import or lint time.
++
++This module is the single source of truth for every event name and is also
++used by :meth:`SliceViewerState._notify` to validate that only known event
++types are ever broadcast (see ``_KNOWN_EVENTS`` there).
++"""
++
++from typing import Final
++
++PRIMARY_IMAGE_DATA_CHANGED: Final = "primary_image_data_changed"
++SECONDARY_IMAGE_DATA_CHANGED: Final = "secondary_image_data_changed"
++BLEND_ALPHA_CHANGED: Final = "blend_alpha_changed"
++SECONDARY_IMAGE_CMAP_CHANGED: Final = "secondary_image_cmap_changed"
++SECONDARY_CLIM_CHANGED: Final = "secondary_clim_changed"
++PHASES_DATA_LOADED: Final = "phases_data_loaded"
++PHASE_CHANGED: Final = "phase_changed"
++RT_DOSE_CHANGED: Final = "rt_dose_changed"
++LAYOUT_MODE_CHANGED: Final = "layout_mode_changed"
++INDEX_CHANGED: Final = "index_changed"
++WINDOW_LEVEL_CHANGED: Final = "window_level_changed"
++CROSSHAIR_CHANGED: Final = "crosshair_changed"
++CROSSHAIR_VISIBLE_CHANGED: Final = "crosshair_visible_changed"
++BOUNDING_BOXES_CHANGED: Final = "bounding_boxes_changed"
++ALL_CONTOURS_CHANGED: Final = "all_contours_changed"
++ACTIVE_CONTOURS_CHANGED: Final = "active_contours_changed"
++OVERLAY_CONTOURS_CHANGED: Final = "overlay_contours_changed"
++BRUSH_TOOL_ACTIVE_CHANGED: Final = "brush_tool_active_changed"
++BRUSH_SIZE_MM_CHANGED: Final = "brush_size_mm_changed"
++BRUSH_FILL_INSIDE_CHANGED: Final = "brush_fill_inside_changed"
++SELECTED_ROI_CHANGED: Final = "selected_roi_changed"
++CONTOUR_CACHE_BUILT: Final = "contour_cache_built"
++
++#: Every event type SliceViewerState may broadcast. Used by ``_notify`` to
++#: catch a typo'd event name (a string not in this set) at the point it is
++#: fired, instead of silently reaching zero listeners.
++ALL_EVENTS: Final[frozenset[str]] = frozenset(
++    {
++        PRIMARY_IMAGE_DATA_CHANGED,
++        SECONDARY_IMAGE_DATA_CHANGED,
++        BLEND_ALPHA_CHANGED,
++        SECONDARY_IMAGE_CMAP_CHANGED,
++        SECONDARY_CLIM_CHANGED,
++        PHASES_DATA_LOADED,
++        PHASE_CHANGED,
++        RT_DOSE_CHANGED,
++        LAYOUT_MODE_CHANGED,
++        INDEX_CHANGED,
++        WINDOW_LEVEL_CHANGED,
++        CROSSHAIR_CHANGED,
++        CROSSHAIR_VISIBLE_CHANGED,
++        BOUNDING_BOXES_CHANGED,
++        ALL_CONTOURS_CHANGED,
++        ACTIVE_CONTOURS_CHANGED,
++        OVERLAY_CONTOURS_CHANGED,
++        BRUSH_TOOL_ACTIVE_CHANGED,
++        BRUSH_SIZE_MM_CHANGED,
++        BRUSH_FILL_INSIDE_CHANGED,
++        SELECTED_ROI_CHANGED,
++        CONTOUR_CACHE_BUILT,
++    }
++)
+diff --git a/src/dicom_viewer/geometry.py b/src/dicom_viewer/geometry.py
+index dc18686..5212fc7 100644
+--- a/src/dicom_viewer/geometry.py
++++ b/src/dicom_viewer/geometry.py
+@@ -14,6 +14,24 @@ from skimage.measure import find_contours
+ 
+ AXES = ("axial", "coronal", "sagittal")
+ 
++#: For a given view axis, which physical axis backs each pixel axis of
++#: that view's 2-D slice: ``VIEW_TO_PIXEL_AXES[view] == (x_axis, y_axis)``.
++#: Shared by ``SliceViewerState.get_bbox_pixel_coords`` and
++#: ``set_bbox_from_pixel_coords`` so the mapping is defined once instead
++#: of duplicated (and liable to drift) across both directions of the
++#: conversion.
++VIEW_TO_PIXEL_AXES: dict[str, tuple[str, str]] = {
++    "axial": ("sagittal", "coronal"),
++    "coronal": ("sagittal", "axial"),
++    "sagittal": ("coronal", "axial"),
++}
++
++#: Valid ``DicomViewer`` / ``LayoutManager`` layout mode names. Centralised
++#: here so ``SliceViewerState.set_layout_mode`` and ``LayoutManager.build``
++#: validate against a single source of truth instead of two copies that
++#: could silently drift apart.
++LAYOUT_MODES = ("single", "mpr_wide", "mpr")
++
+ # Axis-name to NumPy / (x, y, z) dimension lookup. Defined once here (rather
+ # than duplicated in viewer_state.py / viewer_cache.py) so that runtime
+ # lookups never rebuild a dict (a measurable cost during scroll) and every
+@@ -37,8 +55,17 @@ def slice_along_axis(arr: np.ndarray, axis: str, index: int) -> np.ndarray:
+     return arr[:, :, index]
+ 
+ 
+-def compute_extent(image: sitk.Image, axis: str) -> list[float]:
+-    """Return ``[left, right, bottom, top]`` for *image* along *axis* in physical coordinates.
++def compute_extent(image: sitk.Image, axis: str) -> tuple[float, float, float, float]:
++    """Return ``(left, right, bottom, top)`` for *image* along *axis* in physical coordinates.
++
++    Pixel-center convention: the returned edges sit half a voxel outside
++    the first / last pixel centers, i.e. ``[origin - 0.5 * spacing,
++    origin + (size - 0.5) * spacing]`` per displayed dimension. This makes
++    the extent agree with ``sitk.Image.TransformIndexToPhysicalPoint``
++    (which is itself pixel-center based) so that ``imshow(extent=...)``,
++    crosshair placement, and ``mask_slice_to_paths`` all land on the same
++    physical grid instead of drifting by up to one voxel relative to each
++    other.
+ 
+     Shared by ``SliceViewerState.get_extent`` / ``get_dose_extent`` and by
+     the background contour-path build.
+@@ -47,26 +74,19 @@ def compute_extent(image: sitk.Image, axis: str) -> list[float]:
+     spacing = image.GetSpacing()
+     origin = image.GetOrigin()
+     if axis == "axial":
+-        return [
+-            origin[0],
+-            origin[0] + spacing[0] * size[0],
+-            origin[1],
+-            origin[1] + spacing[1] * size[1],
+-        ]
+-    if axis == "coronal":
+-        return [
+-            origin[0],
+-            origin[0] + spacing[0] * size[0],
+-            origin[2],
+-            origin[2] + spacing[2] * size[2],
+-        ]
+-    # sagittal
+-    return [
+-        origin[1],
+-        origin[1] + spacing[1] * size[1],
+-        origin[2],
+-        origin[2] + spacing[2] * size[2],
+-    ]
++        dims = (0, 1)
++    elif axis == "coronal":
++        dims = (0, 2)
++    else:
++        # sagittal
++        dims = (1, 2)
++    d0, d1 = dims
++    return (
++        origin[d0] - 0.5 * spacing[d0],
++        origin[d0] + (size[d0] - 0.5) * spacing[d0],
++        origin[d1] - 0.5 * spacing[d1],
++        origin[d1] + (size[d1] - 0.5) * spacing[d1],
++    )
+ 
+ 
+ def mask_slice_to_paths(
+@@ -85,6 +105,14 @@ def mask_slice_to_paths(
+     sub-path is explicitly closed so the fill rule recognises it as a
+     properly bounded polygon.
+ 
++    ``x0, x1, y0, y1`` must be the pixel-center-convention extent produced
++    by :func:`compute_extent` (edges half a voxel outside the first / last
++    pixel centers). ``sx = (x1 - x0) / w`` then recovers the true pixel
++    spacing, and the ``+ 0.5`` term below places contour coordinate ``i``
++    at the physical *center* of pixel ``i`` (``origin + i * spacing``) —
++    the same point ``TransformIndexToPhysicalPoint`` and the crosshair
++    use, so contours, image, and crosshair share one physical grid.
++
+     Vertex and code arrays are built with vectorised NumPy operations
+     instead of a per-point Python list comprehension; this is roughly two
+     orders of magnitude faster for contours with many points (measured
+@@ -95,18 +123,20 @@ def mask_slice_to_paths(
+     padded = np.pad(mask_slice, pad_width=1, mode="constant")
+     raw_contours = find_contours(padded, level=0.5)
+     h, w = mask_slice.shape
+-    sx = (x1 - x0) / max(w - 1, 1)
+-    sy = (y1 - y0) / max(h - 1, 1)
++    sx = (x1 - x0) / max(w, 1)
++    sy = (y1 - y0) / max(h, 1)
+ 
+     paths: list[MplPath] = []
+     for contour in raw_contours:
+         n = len(contour)
+         if n < 3:
+             continue
+-        # contour columns are (row, col) = (y, x) in padded-array indices.
++        # contour columns are (row, col) = (y, x) in padded-array indices;
++        # "- 1" cancels the padding offset, "+ 0.5" converts the edge-based
++        # extent origin to the pixel-center convention (see docstring).
+         verts = np.empty((n + 1, 2), dtype=np.float64)
+-        verts[:n, 0] = x0 + (contour[:, 1] - 1) * sx
+-        verts[:n, 1] = y0 + (contour[:, 0] - 1) * sy
++        verts[:n, 0] = x0 + (contour[:, 1] - 1 + 0.5) * sx
++        verts[:n, 1] = y0 + (contour[:, 0] - 1 + 0.5) * sy
+         verts[n] = verts[0]  # explicitly close the polygon
+         codes = np.full(n + 1, MplPath.LINETO, dtype=MplPath.code_type)
+         codes[0] = MplPath.MOVETO
+diff --git a/src/dicom_viewer/io.py b/src/dicom_viewer/io.py
+index d737f2d..605da1a 100644
+--- a/src/dicom_viewer/io.py
++++ b/src/dicom_viewer/io.py
+@@ -185,13 +185,26 @@ def _scan_dicom_tree(
+         ):
+             continue
+ 
+-        for reg_item in ds[0x0070, 0x0308].value:
+-            matrix = np.array(
+-                reg_item.MatrixRegistrationSequence[0]
+-                .MatrixSequence[0]
+-                .FrameOfReferenceTransformationMatrix
+-            ).reshape(4, 4)
+-            inv_matrix = np.linalg.inv(matrix)
++        # A single malformed REG file (missing sequence, singular matrix,
++        # ...) must not abort loading of every other series in the tree,
++        # so failures here are logged and skipped rather than propagated.
++        try:
++            reg_sequence = ds[0x0070, 0x0308].value
++        except KeyError:
++            logger.warning(f"REG file '{file}' has no RegistrationSequence; skipped.")
++            continue
++
++        for reg_item in reg_sequence:
++            try:
++                matrix = np.array(
++                    reg_item.MatrixRegistrationSequence[0]
++                    .MatrixSequence[0]
++                    .FrameOfReferenceTransformationMatrix
++                ).reshape(4, 4)
++                inv_matrix = np.linalg.inv(matrix)
++            except (AttributeError, IndexError, KeyError, np.linalg.LinAlgError) as exc:
++                logger.warning(f"Failed to parse REG matrix in '{file}': {exc}")
++                continue
+             for ref_item in reg_item.ReferencedImageSequence:
+                 reg_matrices[ref_item.ReferencedSOPInstanceUID] = inv_matrix
+ 
+@@ -244,6 +257,16 @@ def _orient_to_lps(image: sitk.Image) -> tuple[sitk.Image, sitk.Image]:
+     return resample.Execute(image_lps), original_image
+ 
+ 
++def _first_float(value: str) -> float:
++    """Parse the first component of a DICOM DS (decimal string) value.
++
++    Multi-valued window width / centre tags (e.g. ``"40\\400"``, common on
++    GE consoles when multiple presets are stored) use ``\\`` as the value
++    separator. Only the first value is used for the initial display window.
++    """
++    return float(value.split("\\")[0])
++
++
+ def _get_window_level(
+     reader: sitk.ImageSeriesReader,
+     image: sitk.Image,
+@@ -260,8 +283,8 @@ def _get_window_level(
+                 0, "0028|1051"
+             ):
+                 return (
+-                    float(reader.GetMetaData(0, "0028|1051")),
+-                    float(reader.GetMetaData(0, "0028|1050")),
++                    _first_float(reader.GetMetaData(0, "0028|1051")),
++                    _first_float(reader.GetMetaData(0, "0028|1050")),
+                 )
+         except (ValueError, TypeError):
+             logger.warning("Failed to parse DICOM window tags; using defaults.")
+@@ -276,7 +299,7 @@ def _get_window_level(
+ def _get_modality(reader: sitk.ImageSeriesReader) -> str:
+     """Return the modality string from DICOM tag 0008|0060, or ``'UNKNOWN'``."""
+     if reader.HasMetaDataKey(0, "0008|0060"):
+-        return reader.GetMetaData(0, "0008|0060").strip()
++        return str(reader.GetMetaData(0, "0008|0060")).strip()
+     logger.warning("Modality metadata not found; defaulting to 'UNKNOWN'.")
+     return "UNKNOWN"
+ 
+diff --git a/src/dicom_viewer/py.typed b/src/dicom_viewer/py.typed
+new file mode 100644
+index 0000000..e69de29
+diff --git a/src/dicom_viewer/rendering/contour_overlay.py b/src/dicom_viewer/rendering/contour_overlay.py
+index 2dfea60..05341d5 100644
+--- a/src/dicom_viewer/rendering/contour_overlay.py
++++ b/src/dicom_viewer/rendering/contour_overlay.py
+@@ -110,14 +110,16 @@ class ContourOverlay:
+                 else:
+                     # Retrieve the slice from mask_slice_cache to avoid a
+                     # sitk round-trip; fall back to the sitk mask when absent.
+-                    mask_slice = state.mask_slice_cache.get_slice(
++                    cached_slice = state.mask_slice_cache.get_slice(
+                         roi_number, axis, current_index
+                     )
+-                    if mask_slice is None:
++                    if cached_slice is None:
+                         mask_sitk = state.structure_set.get_mask(roi_number)
+                         if mask_sitk is None:
+                             continue
+                         mask_slice = state.get_slice_data(mask_sitk, axis)
++                    else:
++                        mask_slice = cached_slice
+ 
+                 if mask_slice.shape[0] < 2 or mask_slice.shape[1] < 2:
+                     continue
+diff --git a/src/dicom_viewer/rendering/isodose.py b/src/dicom_viewer/rendering/isodose.py
+index b25d11b..b46841c 100644
+--- a/src/dicom_viewer/rendering/isodose.py
++++ b/src/dicom_viewer/rendering/isodose.py
+@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Callable
+ 
+ import numpy as np
+ from contourpy import LineType, contour_generator
++from matplotlib.artist import Artist
+ from matplotlib.axes import Axes
+ from matplotlib.collections import LineCollection
+ from matplotlib.colors import BoundaryNorm, ListedColormap, to_rgba
+@@ -277,13 +278,18 @@ class IsoDoseOverlay:
+         # slicing keeps samples at indices 0, step, 2*step, ..., so the
+         # grid must not be stretched to the full extent — that would shift
+         # the overlay by up to (step - 1) voxels at the high-index side.
++        # get_extent() uses the pixel-center convention (see geometry.py):
++        # x0/y0 are the *edge* of pixel 0, half a native pixel outside its
++        # center. dx/dy below are native (pre-downsample) pixel spacing;
++        # the +0.5 term recovers the physical center of raw pixel 0 before
++        # striding by `step` native pixels per downsampled sample.
+         x0, x1, y0, y1 = self._state.get_extent(axis)
+         full_h, full_w = full.shape
+         h, w = raw.shape
+-        dx = (x1 - x0) / max(full_w - 1, 1)
+-        dy = (y1 - y0) / max(full_h - 1, 1)
+-        xs = x0 + np.arange(w) * step * dx
+-        ys = y0 + np.arange(h) * step * dy
++        dx = (x1 - x0) / max(full_w, 1)
++        dy = (y1 - y0) / max(full_h, 1)
++        xs = x0 + (np.arange(w) * step + 0.5) * dx
++        ys = y0 + (np.arange(h) * step + 0.5) * dy
+ 
+         self._update_fill(axis, ax, raw, xs, ys, step * dx, step * dy, pairs)
+         self._update_lines(axis, ax, raw, xs, ys, pairs)
+@@ -319,7 +325,11 @@ class IsoDoseOverlay:
+                 extent=extent,
+                 zorder=2,
+             )
+-            fill.format_cursor_data = _format_fill_cursor_data
++            # Per-instance override of AxesImage.format_cursor_data is a
++            # documented matplotlib pattern for customising the toolbar
++            # readout; mypy flags any assignment to a method, hence the
++            # targeted ignore.
++            fill.format_cursor_data = _format_fill_cursor_data  # type: ignore[method-assign,assignment]
+             self._fill[axis] = fill
+             self._on_artists_changed(axis)
+             return
+@@ -345,7 +355,10 @@ class IsoDoseOverlay:
+         segments: list[np.ndarray] = []
+         colors: list[str] = []
+         for level_gy, color in pairs:
+-            level_lines = generator.lines(level_gy)
++            # With LineType.Separate, lines() returns a flat list of (N, 2)
++            # vertex arrays; the stub's return type is a union over every
++            # LineType, so narrow it explicitly for the type checker.
++            level_lines = [np.asarray(line) for line in generator.lines(level_gy)]
+             segments.extend(level_lines)
+             colors.extend([color] * len(level_lines))
+ 
+@@ -366,9 +379,9 @@ class IsoDoseOverlay:
+     # ------------------------------------------------------------------
+     # Artist access for the blit layer / background caching
+     # ------------------------------------------------------------------
+-    def blit_artists(self, axis: str) -> list:
++    def blit_artists(self, axis: str) -> list[Artist]:
+         """Return the visible artists for *axis* in draw order (fill, lines)."""
+-        artists = []
++        artists: list[Artist] = []
+         fill = self._fill[axis]
+         if fill is not None and fill.get_visible():
+             artists.append(fill)
+@@ -377,7 +390,7 @@ class IsoDoseOverlay:
+             artists.append(lines)
+         return artists
+ 
+-    def all_artists(self, axis: str) -> list:
++    def all_artists(self, axis: str) -> list[Artist]:
+         """Return every existing artist for *axis*, visible or not.
+ 
+         Used by the background cache to hide blit-layer artists before the
+diff --git a/src/dicom_viewer/rendering/layout.py b/src/dicom_viewer/rendering/layout.py
+index 51faca4..4997cef 100644
+--- a/src/dicom_viewer/rendering/layout.py
++++ b/src/dicom_viewer/rendering/layout.py
+@@ -12,6 +12,8 @@ import matplotlib.gridspec as gridspec
+ from matplotlib.axes import Axes
+ from matplotlib.figure import Figure
+ 
++from ..geometry import LAYOUT_MODES
++
+ 
+ class LayoutManager:
+     """Builds the Axes layout for a given mode inside a shared Figure.
+@@ -64,8 +66,8 @@ class LayoutManager:
+                 "sagittal": self._fig.add_subplot(gs[1, 1]),
+             }
+             dvh_ax = None
+-        else:
+-            # "mpr": 2x2 grid — top row (Axial + DVH), bottom row (Coronal + Sagittal)
++        elif mode == "mpr":
++            # 2x2 grid — top row (Axial + DVH), bottom row (Coronal + Sagittal)
+             gs = gridspec.GridSpec(2, 2, figure=self._fig)
+             axs = {
+                 "axial": self._fig.add_subplot(gs[0, 0]),
+@@ -74,6 +76,13 @@ class LayoutManager:
+             }
+             dvh_ax = self._fig.add_subplot(gs[0, 1])
+             self._style_dvh_axes(dvh_ax)
++        else:
++            # A silent fallback to "mpr" would mask a typo'd mode name as a
++            # different-looking-but-valid layout, which is far harder to
++            # notice than an immediate error.
++            raise ValueError(
++                f"Unknown layout mode: {mode!r}. Expected one of: {LAYOUT_MODES}."
++            )
+ 
+         for ax in axs.values():
+             ax.set_facecolor("black")
+diff --git a/src/dicom_viewer/roi_operations.py b/src/dicom_viewer/roi_operations.py
+index dd46ad3..bef3293 100644
+--- a/src/dicom_viewer/roi_operations.py
++++ b/src/dicom_viewer/roi_operations.py
+@@ -202,18 +202,26 @@ def _shift_accumulate(
+       (1) so the image edge does not erode the interior.
+ 
+     ``origin`` is adjusted so the window is one-sided, covering the current
+-    position plus *n_voxels* steps in the *positive* direction
+-    (``n_voxels // 2`` when ``positive=True``,
+-    ``-((n_voxels + 1) // 2)`` when ``positive=False``).
+-    Verified to be numerically identical to the original ``np.roll``-based
+-    implementation across a range of multi-dimensional / multi-parameter
+-    combinations.
++    position plus *n_voxels* steps toward the face being modified.
++
++    Direction semantics: *positive* names the face being grown or shaved
++    (e.g. ``axis=0, positive=True`` is the superior face). For dilation
++    the window therefore extends in the *negative* direction (each new
++    voxel beyond the positive face copies its neighbour below), while for
++    erosion it extends in the *positive* direction (a voxel survives only
++    if its neighbours toward that face are also inside, which removes
++    that face's outermost layer). The previous implementation used the
++    dilation window for both, so a negative margin shaved the *opposite*
++    face from the one requested — e.g. ``superior=-2`` removed the two
++    inferior-most slices. Numerical equivalence with the historical
++    ``np.roll`` implementation is therefore intentionally preserved only
++    for dilation.
+ 
+     Args:
+         arr:      Input binary mask (bool, z y x).
+         n_voxels: Number of one-voxel shifts to perform. No-op when 0.
+         axis:     NumPy axis to shift (0=z, 1=y, 2=x).
+-        positive: True to shift toward increasing index, False otherwise.
++        positive: True when the modified face lies toward increasing index.
+         expand:   True for dilation, False for erosion.
+ 
+     Returns:
+@@ -222,8 +230,12 @@ def _shift_accumulate(
+     if n_voxels == 0:
+         return arr.copy()
+ 
++    # Erosion of the `positive` face needs the window on the opposite side
++    # of the one dilation uses (see docstring), so flip here.
++    window_positive = positive if expand else not positive
++
+     size = n_voxels + 1
+-    origin = (n_voxels // 2) if positive else -((n_voxels + 1) // 2)
++    origin = (n_voxels // 2) if window_positive else -((n_voxels + 1) // 2)
+     arr_uint8 = arr.astype(np.uint8, copy=False)
+     if expand:
+         result = maximum_filter1d(
+@@ -233,7 +245,8 @@ def _shift_accumulate(
+         result = minimum_filter1d(
+             arr_uint8, size=size, axis=axis, mode="constant", cval=1, origin=origin
+         )
+-    return result.astype(bool)
++    filtered: "np.ndarray" = result.astype(bool)
++    return filtered
+ 
+ 
+ # ---------------------------------------------------------------------------
+diff --git a/src/dicom_viewer/rtstruct_io.py b/src/dicom_viewer/rtstruct_io.py
+index dd12b44..7744232 100644
+--- a/src/dicom_viewer/rtstruct_io.py
++++ b/src/dicom_viewer/rtstruct_io.py
+@@ -2,9 +2,10 @@
+ 
+ Public API
+ ----------
+-load_rt_struct(ct_dir, rtstruct_path, progress_callback=None) -> dict[int, RoiInfo]
++load_rt_struct(ct_dir, rtstruct_path, progress_callback=None, max_workers=1) -> dict[int, RoiInfo]
+     Parse an RT-STRUCT file and return a mapping of ROI number to mask
+-    and display metadata.
++    and display metadata. Raises RtStructLoadError if the file itself
++    cannot be parsed.
+ 
+ mask2rtstruct(ct_dir, rtss_path, structures) -> None
+     Convert NumPy mask arrays to an RT-STRUCT DICOM file, creating or
+@@ -30,12 +31,27 @@ from rt_utils import RTStructBuilder
+ 
+ logger = logging.getLogger(__name__)
+ 
+-# Maximum number of worker threads for parallel ROI mask retrieval.
++
++class RtStructLoadError(Exception):
++    """Raised when an RT-STRUCT file cannot be parsed at all.
++
++    Distinguishes "the file could not be read" from "the file was read
++    and legitimately contains zero ROIs" — both of which previously
++    returned the same empty ``{}`` from :func:`load_rt_struct`, leaving
++    callers unable to tell a load failure from an empty structure set.
++    """
++
++
++# Default number of worker threads for parallel ROI mask retrieval.
+ # Each ROI can be decoded independently via RTStructBuilder.
+ # NOTE: rt-utils does not document thread safety; this parallelism relies on
+-# each call constructing independent intermediate NumPy arrays. If any
+-# thread-related issues surface, reduce this constant to 1.
+-_ROI_LOAD_MAX_WORKERS: int = 8
++# each call constructing independent intermediate NumPy arrays. The default
++# is kept at 1 (sequential) because that lack of a documented guarantee
++# makes concurrent execution an opt-in choice for callers who have verified
++# it's safe with their rt-utils version, not something safe to default to
++# for a public library. Pass a higher ``max_workers`` to load_rt_struct
++# to opt in.
++_DEFAULT_ROI_LOAD_MAX_WORKERS: int = 1
+ 
+ # Module-level RNG reused for random fallback colours. Allocating a fresh
+ # RNG per ROI (as the previous implementation did) has noticeable overhead
+@@ -86,7 +102,8 @@ def resample_mask_to_original_space(
+     resampler.SetInterpolator(sitk.sitkNearestNeighbor)
+     resampler.SetDefaultPixelValue(0)
+     resampler.SetTransform(sitk.Transform(3, sitk.sitkIdentity))
+-    return resampler.Execute(lps_mask)
++    resampled: sitk.Image = resampler.Execute(lps_mask)
++    return resampled
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -96,11 +113,12 @@ def load_rt_struct(
+     ct_dir: str | pathlib.Path,
+     rtstruct_path: str | pathlib.Path,
+     progress_callback: Callable[[int, int], None] | None = None,
++    max_workers: int = _DEFAULT_ROI_LOAD_MAX_WORKERS,
+ ) -> dict[int, RoiInfo]:
+     """Parse an RT-STRUCT file and return ROI masks indexed by ROI number.
+ 
+-    Uses a ``ThreadPoolExecutor`` to fetch each ROI mask in parallel,
+-    reducing load time when many ROIs are present.
++    Uses a ``ThreadPoolExecutor`` to fetch ROI masks, optionally in
++    parallel (see *max_workers*).
+ 
+     Each ROI mask is transposed from the rt-utils ``(H, W, D)`` convention
+     to ``(D, H, W)`` before being returned.
+@@ -113,10 +131,22 @@ def load_rt_struct(
+             finished ROIs regardless of completion order, so it can be used
+             to drive a determinate progress indicator. Safe to call from a
+             background thread; this function does not touch any UI itself.
++        max_workers: Number of worker threads used to fetch ROI masks.
++            Defaults to 1 (sequential) because rt-utils does not document
++            thread safety for concurrent ``get_roi_mask_by_name`` calls;
++            pass a higher value only after verifying it's safe for the
++            rt-utils version in use.
+ 
+     Returns:
+-        ``{roi_number: RoiInfo}`` mapping. Returns an empty dict when the
+-        file cannot be read or no ROI can be decoded.
++        ``{roi_number: RoiInfo}`` mapping. An RT-STRUCT that was read
++        successfully but legitimately contains zero ROI entries returns
++        an empty dict; a file that could not be parsed at all raises
++        :class:`RtStructLoadError` instead, so callers can tell the two
++        cases apart.
++
++    Raises:
++        RtStructLoadError: If *rtstruct_path* cannot be parsed (missing
++            file, corrupt DICOM, mismatched *ct_dir*, etc.).
+     """
+     ct_dir = pathlib.Path(ct_dir)
+     rtstruct_path = pathlib.Path(rtstruct_path)
+@@ -131,8 +161,9 @@ def load_rt_struct(
+         )
+         ds = pydicom.dcmread(str(rtstruct_path))
+     except Exception as exc:
+-        logger.error(f"Failed to create RTStructBuilder from '{rtstruct_path}': {exc}")
+-        return structures
++        raise RtStructLoadError(
++            f"Failed to create RTStructBuilder from '{rtstruct_path}': {exc}"
++        ) from exc
+ 
+     roi_name_map: dict[int, str] = {
+         roi.ROINumber: roi.ROIName for roi in ds.StructureSetROISequence
+@@ -165,7 +196,7 @@ def load_rt_struct(
+         return roi_number, RoiInfo(name=roi_name, mask=mask, color=color_hex)
+ 
+     total_rois = len(roi_tasks)
+-    n_workers = min(_ROI_LOAD_MAX_WORKERS, total_rois)
++    n_workers = min(max_workers, total_rois)
+     completed = 0
+     with ThreadPoolExecutor(max_workers=n_workers) as executor:
+         futures = [executor.submit(_load_single_roi, *task) for task in roi_tasks]
+diff --git a/src/dicom_viewer/state/viewer_state.py b/src/dicom_viewer/state/viewer_state.py
+index a7659dd..4938ca1 100644
+--- a/src/dicom_viewer/state/viewer_state.py
++++ b/src/dicom_viewer/state/viewer_state.py
+@@ -29,26 +29,61 @@ Performance:
+     class so that the state stays focused on observable logical state.
+     ``SliceViewerState`` exposes thin ``get_*_slice_cached`` accessors and
+     delegates cache lifecycle (build / invalidate / clear) to the manager.
+-    For backward compatibility the ``contour_path_cache`` and
+-    ``mask_slice_cache`` attributes remain accessible as read-only
+-    properties that proxy to the manager. The pre-cast dose volume is
+-    exposed via :meth:`get_dose_volume_cached`, and the fallback reference
+-    dose (Dmax) via :meth:`get_dose_fallback_ref_gy`.
++    The ``contour_path_cache`` and ``mask_slice_cache`` attributes are
++    exposed as read-only properties that proxy to the manager, so the
++    rendering layer can read cached paths / mask volumes without reaching
++    into the manager directly. The pre-cast dose volume is exposed via
++    :meth:`get_dose_volume_cached`, and the fallback reference dose (Dmax)
++    via :meth:`get_dose_fallback_ref_gy`.
+ """
+ 
++import dataclasses
++import inspect
+ import logging
+ import pathlib
+ from collections import defaultdict
+ from dataclasses import dataclass, field
+-from typing import Any, Callable
++from typing import Any, Callable, ClassVar
+ 
+ import numpy as np
+ import SimpleITK as sitk
+ 
+-from ..geometry import AXES
++from ..events import (
++    ACTIVE_CONTOURS_CHANGED,
++    ALL_CONTOURS_CHANGED,
++    ALL_EVENTS,
++    BLEND_ALPHA_CHANGED,
++    BOUNDING_BOXES_CHANGED,
++    BRUSH_FILL_INSIDE_CHANGED,
++    BRUSH_SIZE_MM_CHANGED,
++    BRUSH_TOOL_ACTIVE_CHANGED,
++    CONTOUR_CACHE_BUILT,
++    CROSSHAIR_CHANGED,
++    CROSSHAIR_VISIBLE_CHANGED,
++    INDEX_CHANGED,
++    LAYOUT_MODE_CHANGED,
++    OVERLAY_CONTOURS_CHANGED,
++    PHASE_CHANGED,
++    PHASES_DATA_LOADED,
++    PRIMARY_IMAGE_DATA_CHANGED,
++    RT_DOSE_CHANGED,
++    SECONDARY_CLIM_CHANGED,
++    SECONDARY_IMAGE_CMAP_CHANGED,
++    SECONDARY_IMAGE_DATA_CHANGED,
++    SELECTED_ROI_CHANGED,
++    WINDOW_LEVEL_CHANGED,
++)
++from ..geometry import (
++    AXES,
++)
+ from ..geometry import AXIS_TO_NUMPY_DIM as _AXIS_TO_NUMPY_DIM
+ from ..geometry import AXIS_TO_XYZ_DIM as _AXIS_TO_XYZ_DIM
+-from ..geometry import compute_extent, slice_along_axis
++from ..geometry import (
++    LAYOUT_MODES,
++    VIEW_TO_PIXEL_AXES,
++    compute_extent,
++    slice_along_axis,
++)
+ from .viewer_cache import ContourPathCache, MaskSliceCache, ViewerCacheManager
+ 
+ logger = logging.getLogger(__name__)
+@@ -57,6 +92,21 @@ logger = logging.getLogger(__name__)
+ # ---------------------------------------------------------------------------
+ # StructureSet
+ # ---------------------------------------------------------------------------
++@dataclass
++class RoiEntry:
++    """A single ROI's stored properties inside :class:`StructureSet`.
++
++    Replaces the previous ``dict[str, Any]`` entry shape so that field
++    names and types (``name: str``, ``mask: sitk.Image``, ``color: str``)
++    are checked statically instead of relying on string keys that a typo
++    could silently miss.
++    """
++
++    name: str
++    mask: sitk.Image
++    color: str
++
++
+ class StructureSet:
+     """Container for RT-STRUCT ROI masks, keyed by integer ROI number.
+ 
+@@ -75,8 +125,7 @@ class StructureSet:
+     """
+ 
+     def __init__(self) -> None:
+-        # { roi_number: {"name": str, "mask": sitk.Image, "color": "#RRGGBB"} }
+-        self._data: dict[int, dict[str, Any]] = {}
++        self._data: dict[int, RoiEntry] = {}
+         self._next_number: int = 1
+ 
+     def add(self, name: str, mask: sitk.Image, color: str) -> int:
+@@ -92,7 +141,7 @@ class StructureSet:
+         """
+         roi_number = self._next_number
+         self._next_number += 1
+-        self._data[roi_number] = {"name": name, "mask": mask, "color": color}
++        self._data[roi_number] = RoiEntry(name=name, mask=mask, color=color)
+         return roi_number
+ 
+     def remove(self, roi_number: int) -> None:
+@@ -100,14 +149,30 @@ class StructureSet:
+         self._data.pop(roi_number, None)
+ 
+     def update(self, roi_number: int, props: dict[str, Any]) -> None:
+-        """Update properties (``name``, ``mask``, ``color``) for *roi_number*."""
+-        if roi_number in self._data:
+-            self._data[roi_number].update(props)
++        """Update properties (``name``, ``mask``, ``color``) for *roi_number*.
++
++        Raises:
++            ValueError: If *props* contains a key that is not a field of
++                :class:`RoiEntry` — this used to update a plain dict with
++                no feedback, so a typo'd key (e.g. ``"colour"``) would be
++                silently stored and never actually applied.
++        """
++        entry = self._data.get(roi_number)
++        if entry is None:
++            return
++        valid_fields = {f.name for f in dataclasses.fields(RoiEntry)}
++        unknown = props.keys() - valid_fields
++        if unknown:
++            raise ValueError(
++                f"Unknown RoiEntry field(s) {sorted(unknown)}; expected one of {sorted(valid_fields)}."
++            )
++        for key, value in props.items():
++            setattr(entry, key, value)
+ 
+     def get_name(self, roi_number: int) -> str | None:
+         """Return the structure name for *roi_number*, or ``None``."""
+         entry = self._data.get(roi_number)
+-        return entry["name"] if entry else None
++        return entry.name if entry else None
+ 
+     def generate_unique_name(self, base_name: str) -> str:
+         """Return a name that does not collide with any existing ROI name.
+@@ -124,7 +189,7 @@ class StructureSet:
+         Returns:
+             A name guaranteed not to collide with any existing ROI name.
+         """
+-        existing_names = {entry["name"] for entry in self._data.values()}
++        existing_names = {entry.name for entry in self._data.values()}
+         if base_name not in existing_names:
+             return base_name
+ 
+@@ -138,19 +203,25 @@ class StructureSet:
+     def get_mask(self, roi_number: int) -> sitk.Image | None:
+         """Return the binary mask for *roi_number*, or ``None``."""
+         entry = self._data.get(roi_number)
+-        return entry["mask"] if entry else None
++        return entry.mask if entry else None
+ 
+     def get_color(self, roi_number: int) -> str | None:
+         """Return the hex colour string for *roi_number*, or ``None``."""
+         entry = self._data.get(roi_number)
+-        return entry["color"] if entry else None
++        return entry.color if entry else None
+ 
+     def get_roi_numbers(self) -> list[int]:
+         """Return a list of all ROI numbers in insertion order."""
+         return list(self._data.keys())
+ 
+-    def get_all(self) -> dict[int, dict[str, Any]]:
+-        """Return a shallow copy of the internal data dict."""
++    def get_all(self) -> dict[int, RoiEntry]:
++        """Return a shallow copy of the internal ``{roi_number: RoiEntry}`` mapping.
++
++        The copy is of the outer dict only; ``RoiEntry`` instances (and the
++        ``sitk.Image`` masks they hold) are shared with the internal
++        storage, consistent with the rest of this class's shallow-copy
++        semantics elsewhere.
++        """
+         return dict(self._data)
+ 
+     def __len__(self) -> int:
+@@ -196,6 +267,13 @@ class SliceViewerState:
+         ``"overlay_contours_changed"``     — ``(enable: bool)``
+         ``"brush_tool_active_changed"``    — ``(is_active: bool)``
+         ``"brush_size_mm_changed"``        — ``(size_mm: float)``
++        ``"brush_fill_inside_changed"``    — ``(fill: bool)``
++        ``"selected_roi_changed"``         — ``(roi_number: int | None)``
++        ``"contour_cache_built"``          — ``(roi_number: int)``
++
++    Every event name above has a matching constant in
++    :mod:`dicom_viewer.events` (e.g. ``events.INDEX_CHANGED``); prefer those
++    over string literals when calling :meth:`add_listener`.
+     """
+ 
+     # --- Primary image ---
+@@ -236,7 +314,7 @@ class SliceViewerState:
+ 
+     # --- Slice state ---
+     current_axis: str = ""
+-    window_level: tuple[int, int] = (300, 25)  # (window_width, window_level)
++    window_level: tuple[float, float] = (300.0, 25.0)  # (window_width, window_level)
+     indices: dict[str, int] = field(default_factory=lambda: {axis: 0 for axis in AXES})
+ 
+     # --- ROI ---
+@@ -272,7 +350,7 @@ class SliceViewerState:
+     )
+ 
+     # Cache for get_extent() results, keyed by axis name.
+-    _extent_cache: dict[str, list[float]] = field(
++    _extent_cache: dict[str, tuple[float, float, float, float]] = field(
+         default_factory=dict,
+         compare=False,
+         repr=False,
+@@ -287,12 +365,62 @@ class SliceViewerState:
+         """
+         self._cache = ViewerCacheManager(
+             on_contour_built=lambda roi_number: self._notify(
+-                "contour_cache_built", roi_number
++                CONTOUR_CACHE_BUILT, roi_number
+             )
+         )
+ 
++    # Every field that has a dedicated ``set_*`` method (and therefore a
++    # notification listeners rely on) is listed here, mapped to that
++    # method's name. See __setattr__ below.
++    _OBSERVABLE_SETTERS: ClassVar[dict[str, str]] = {
++        "blend_alpha": "set_blend_alpha",
++        "secondary_image_cmap": "set_secondary_image_cmap",
++        "secondary_clim": "set_secondary_clim",
++        "prescription_dose": "set_prescription_dose",
++        "layout_mode": "set_layout_mode",
++        "window_level": "set_window_level",
++        "crosshair_visible": "set_crosshair_visible",
++        "bbox_visible": "set_bbox_visible",
++        "active_contours": "set_active_contours",
++        "selected_roi_number": "set_selected_roi",
++        "overlay_contours": "set_overlay_contours",
++        "brush_tool_active": "set_brush_tool_active",
++        "brush_size_mm": "set_brush_size_mm",
++        "brush_fill_inside": "set_brush_fill_inside",
++    }
++
++    def __setattr__(self, name: str, value: Any) -> None:
++        """Redirect external direct writes to observable fields through their setter.
++
++        Assigning e.g. ``state.blend_alpha = 0.5`` directly (instead of
++        calling ``state.set_blend_alpha(0.5)``) would silently skip the
++        ``"blend_alpha_changed"`` notification, leaving listeners — and
++        therefore the on-screen rendering — out of sync with the new
++        value. This class's own methods still need to write these fields
++        directly without re-entering a setter (the dataclass-generated
++        ``__init__``, and the coordinated multi-field reset performed by
++        :meth:`set_primary_image_data`, both rely on that), so only
++        writes originating from *outside* this module are redirected:
++        the immediate caller's module is inspected, and only a mismatch
++        triggers the redirect.
++        """
++        setter_name = type(self)._OBSERVABLE_SETTERS.get(name)
++        if setter_name is not None:
++            frame = inspect.currentframe()
++            caller_frame = frame.f_back if frame is not None else None
++            caller_module = (
++                caller_frame.f_globals.get("__name__") if caller_frame else None
++            )
++            if caller_module != __name__:
++                if name == "window_level":
++                    getattr(self, setter_name)(value[0], value[1])
++                else:
++                    getattr(self, setter_name)(value)
++                return
++        object.__setattr__(self, name, value)
++
+     # =========================================================
+-    # Performance-cache accessors (backward-compatible proxies)
++    # Performance-cache accessors
+     # =========================================================
+     @property
+     def contour_path_cache(self) -> ContourPathCache:
+@@ -329,7 +457,19 @@ class SliceViewerState:
+ 
+         The listener set is snapshotted so a listener that mutates the
+         registry during iteration does not raise RuntimeError.
++
++        Raises:
++            ValueError: If *event_type* is not one of the names declared in
++                :mod:`dicom_viewer.events`. Every call site in this class
++                uses those constants rather than string literals, so this
++                only fires for a genuinely unknown event — e.g. a typo in
++                third-party code driving the state directly.
+         """
++        if event_type not in ALL_EVENTS:
++            raise ValueError(
++                f"Unknown event type: {event_type!r}. "
++                f"See dicom_viewer.events for the full list."
++            )
+         for listener in list(self._listeners[event_type]):
+             try:
+                 listener(*args, **kwargs)
+@@ -354,10 +494,6 @@ class SliceViewerState:
+         """
+         return _AXIS_TO_NUMPY_DIM[axis]
+ 
+-    # Backward-compatible aliases for internal callers.
+-    _axis_to_xyz_index = axis_to_xyz_index
+-    _axis_to_numpy_index = axis_to_numpy_index
+-
+     # =========================================================
+     # Physical <-> index conversion
+     # =========================================================
+@@ -374,7 +510,7 @@ class SliceViewerState:
+         # Reverse (z, y, x) to SimpleITK's (x, y, z) ordering.
+         sitk_indices = tuple(numpy_indices[::-1])
+         phys_point = self.primary_image.TransformIndexToPhysicalPoint(sitk_indices)
+-        return phys_point[_AXIS_TO_XYZ_DIM[axis]]
++        return float(phys_point[_AXIS_TO_XYZ_DIM[axis]])
+ 
+     def _current_physical_point(self) -> tuple[float, float, float]:
+         """Return the physical (x, y, z) point at the current 3-axis indices.
+@@ -392,7 +528,8 @@ class SliceViewerState:
+             self.indices.get("coronal", 0),
+             self.indices.get("axial", 0),
+         )
+-        return self.primary_image.TransformIndexToPhysicalPoint(sitk_indices)
++        px, py, pz = self.primary_image.TransformIndexToPhysicalPoint(sitk_indices)
++        return (float(px), float(py), float(pz))
+ 
+     def physical_to_index(self, axis: str, coord: float) -> int:
+         """Convert a physical LPS coordinate along *axis* to the nearest index."""
+@@ -410,7 +547,7 @@ class SliceViewerState:
+         if self.primary_image is None:
+             return 0
+         numpy_idx = _AXIS_TO_NUMPY_DIM[axis]
+-        return self.primary_image.GetSize()[::-1][numpy_idx] - 1
++        return int(self.primary_image.GetSize()[::-1][numpy_idx]) - 1
+ 
+     # =========================================================
+     # Slice data access
+@@ -424,8 +561,8 @@ class SliceViewerState:
+             return np.array([])
+         return slice_along_axis(arr, axis, self.indices[axis])
+ 
+-    def get_extent(self, axis: str) -> list[float]:
+-        """Return ``[left, right, bottom, top]`` in physical coordinates.
++    def get_extent(self, axis: str) -> tuple[float, float, float, float]:
++        """Return ``(left, right, bottom, top)`` in physical coordinates.
+ 
+         Results are cached in ``_extent_cache`` to avoid repeated
+         GetSize/GetSpacing/GetOrigin calls during scrolling. The cache is
+@@ -435,7 +572,7 @@ class SliceViewerState:
+         if cached is not None:
+             return cached
+         if self.primary_image is None:
+-            return [0.0, 1.0, 0.0, 1.0]
++            return (0.0, 1.0, 0.0, 1.0)
+         extent = compute_extent(self.primary_image, axis)
+         self._extent_cache[axis] = extent
+         return extent
+@@ -454,14 +591,13 @@ class SliceViewerState:
+         """Set the slice index for *axis* and notify listeners.
+ 
+         *value* is clamped to ``[0, get_max_index(axis)]`` here so that every
+-        caller (scroll, keyboard, crosshair drag, ``_SingleVar``) shares one
+-        range-checking rule instead of duplicating ``max(0, min(...))`` at
+-        each call site.
++        caller (scroll, keyboard, crosshair drag) shares one range-checking
++        rule instead of duplicating ``max(0, min(...))`` at each call site.
+         """
+         clamped = int(np.clip(value, 0, self.get_max_index(axis)))
+         if self.indices.get(axis) != clamped:
+             self.indices[axis] = clamped
+-            self._notify("index_changed", axis, clamped)
++            self._notify(INDEX_CHANGED, axis, clamped)
+             if update_crosshair:
+                 self.update_crosshair_by_index()
+ 
+@@ -497,7 +633,8 @@ class SliceViewerState:
+             transform if transform is not None else sitk.Transform(3, sitk.sitkIdentity)
+         )
+         resample.SetDefaultPixelValue(default_pixel_value)
+-        return resample.Execute(image)
++        result: sitk.Image = resample.Execute(image)
++        return result
+ 
+     # =========================================================
+     # Primary image
+@@ -570,8 +707,8 @@ class SliceViewerState:
+         else:
+             self.indices = {axis: 0 for axis in AXES}
+ 
+-        self._notify("secondary_image_data_changed", None)
+-        self._notify("rt_dose_changed", None)
++        self._notify(SECONDARY_IMAGE_DATA_CHANGED, None)
++        self._notify(RT_DOSE_CHANGED, None)
+ 
+         if image is not None:
+             x_dim, y_dim, z_dim = image.GetSize()
+@@ -579,7 +716,7 @@ class SliceViewerState:
+             self.set_index("coronal", y_dim // 2, update_crosshair=False)
+             self.set_index("sagittal", x_dim // 2, update_crosshair=False)
+ 
+-        self._notify("primary_image_data_changed", image)
++        self._notify(PRIMARY_IMAGE_DATA_CHANGED, image)
+ 
+     # =========================================================
+     # Secondary image & blend
+@@ -602,7 +739,7 @@ class SliceViewerState:
+             self.set_blend_alpha(0.5)
+         # Pre-cast once at load time to eliminate sitk round-trips during scroll.
+         self._cache.build_secondary_array(self.secondary_image)
+-        self._notify("secondary_image_data_changed", self.secondary_image)
++        self._notify(SECONDARY_IMAGE_DATA_CHANGED, self.secondary_image)
+ 
+     def set_blend_alpha(self, alpha: float) -> None:
+         """Set the primary-image opacity for the blend slider (0.0-1.0).
+@@ -612,13 +749,13 @@ class SliceViewerState:
+         """
+         if self.blend_alpha != alpha:
+             self.blend_alpha = alpha
+-            self._notify("blend_alpha_changed", alpha)
++            self._notify(BLEND_ALPHA_CHANGED, alpha)
+ 
+     def set_secondary_image_cmap(self, cmap_name: str) -> None:
+         """Change the colourmap used to display the secondary image."""
+         if self.secondary_image_cmap != cmap_name:
+             self.secondary_image_cmap = cmap_name
+-            self._notify("secondary_image_cmap_changed", cmap_name)
++            self._notify(SECONDARY_IMAGE_CMAP_CHANGED, cmap_name)
+ 
+     def set_secondary_clim(self, clim: tuple[float, float] | None) -> None:
+         """Override the colour limits for the secondary image display.
+@@ -627,7 +764,7 @@ class SliceViewerState:
+         """
+         if self.secondary_clim != clim:
+             self.secondary_clim = clim
+-            self._notify("secondary_clim_changed", clim)
++            self._notify(SECONDARY_CLIM_CHANGED, clim)
+ 
+     def set_rt_dose_image(self, image: sitk.Image | None) -> None:
+         """Set (or clear) the RT-DOSE volume.
+@@ -659,7 +796,7 @@ class SliceViewerState:
+ 
+         self._cache.build_dose_array(self.rt_dose_resampled)
+         self._dose_fallback_ref_gy = self._compute_dose_dmax(image)
+-        self._notify("rt_dose_changed", image)
++        self._notify(RT_DOSE_CHANGED, image)
+ 
+     @staticmethod
+     def _compute_dose_dmax(image: sitk.Image | None) -> float | None:
+@@ -697,7 +834,7 @@ class SliceViewerState:
+         """
+         if self.prescription_dose != dose_gy:
+             self.prescription_dose = dose_gy
+-            self._notify("rt_dose_changed", self.rt_dose_image)
++            self._notify(RT_DOSE_CHANGED, self.rt_dose_image)
+ 
+     # =========================================================
+     # Slice accessors backed by the performance caches
+@@ -752,13 +889,13 @@ class SliceViewerState:
+     # =========================================================
+     # RT-DOSE geometry helpers
+     # =========================================================
+-    def get_dose_extent(self, axis: str) -> list[float]:
+-        """Return ``[left, right, bottom, top]`` for the dose image.
++    def get_dose_extent(self, axis: str) -> tuple[float, float, float, float]:
++        """Return ``(left, right, bottom, top)`` for the dose image.
+ 
+         Uses the dose image's own geometry (not the primary CT geometry).
+         """
+         if self.rt_dose_image is None:
+-            return [0.0, 1.0, 0.0, 1.0]
++            return (0.0, 1.0, 0.0, 1.0)
+         return compute_extent(self.rt_dose_image, axis)
+ 
+     def get_dose_slice(self, axis: str) -> np.ndarray:
+@@ -795,12 +932,20 @@ class SliceViewerState:
+         """Switch the viewer layout mode.
+ 
+         Args:
+-            mode: ``"mpr"`` (top row: Axial + DVH, bottom row: Coronal + Sagittal)
+-                or ``"mpr_wide"`` (left column: large Axial, right column: Coronal / Sagittal).
++            mode: ``"mpr"`` (top row: Axial + DVH, bottom row: Coronal + Sagittal),
++                ``"mpr_wide"`` (left column: large Axial, right column: Coronal /
++                Sagittal), or ``"single"`` (one Axes, keyed as ``"axial"``).
++
++        Raises:
++            ValueError: If *mode* is not one of :data:`~dicom_viewer.geometry.LAYOUT_MODES`.
+         """
++        if mode not in LAYOUT_MODES:
++            raise ValueError(
++                f"Unknown layout mode: {mode!r}. Expected one of: {LAYOUT_MODES}."
++            )
+         if self.layout_mode != mode:
+             self.layout_mode = mode
+-            self._notify("layout_mode_changed", mode)
++            self._notify(LAYOUT_MODE_CHANGED, mode)
+ 
+     # =========================================================
+     # 4DCT phases
+@@ -816,7 +961,7 @@ class SliceViewerState:
+         After resampling the images are cached in :attr:`all_phases_data` and
+         listeners are notified with ``"phases_data_loaded"``.
+         """
+-        if not self.primary_image:
++        if self.primary_image is None:
+             logger.error("Cannot set phases: primary image not loaded.")
+             return
+ 
+@@ -831,7 +976,7 @@ class SliceViewerState:
+             for phase, series_dict in phases_data.items()
+         }
+         self.current_phase = None
+-        self._notify("phases_data_loaded", self.all_phases_data)
++        self._notify(PHASES_DATA_LOADED, self.all_phases_data)
+ 
+     def set_active_phase_as_secondary(self, phase_name: str) -> None:
+         """Activate a 4DCT phase as the secondary overlay image."""
+@@ -842,16 +987,21 @@ class SliceViewerState:
+         self.current_phase = phase_name
+         phase_image = self.all_phases_data[phase_name]["sitk_image"]
+         self.set_secondary_image_data(phase_image)
+-        self._notify("phase_changed", phase_name)
++        self._notify(PHASE_CHANGED, phase_name)
+ 
+     # =========================================================
+     # Window / level
+     # =========================================================
+-    def set_window_level(self, window: int, level: int) -> None:
+-        """Update the display window width and level (in HU)."""
++    def set_window_level(self, window: float, level: float) -> None:
++        """Update the display window width and level (in HU or dose units).
++
++        Values are kept as floats: MR percentile-derived windows and dose
++        images (Gy) legitimately need sub-integer precision, and CT integer
++        HU values are unaffected by float storage.
++        """
+         if self.window_level != (window, level):
+-            self.window_level = (window, level)
+-            self._notify("window_level_changed", window, level)
++            self.window_level = (float(window), float(level))
++            self._notify(WINDOW_LEVEL_CHANGED, window, level)
+ 
+     # =========================================================
+     # Crosshair
+@@ -878,23 +1028,20 @@ class SliceViewerState:
+         # compute all 3 axes in a single transform call instead of calling
+         # index_to_physical individually for each.
+         x, y, z = self._current_physical_point()
+-        new_pos = {
++        new_pos: dict[str, tuple[float, float] | None] = {
+             "axial": (x, y),
+             "coronal": (x, z),
+             "sagittal": (y, z),
+         }
+         if self.crosshair_pos != new_pos:
+             self.crosshair_pos = new_pos
+-            self._notify("crosshair_changed")
+-
+-    # Backward-compatible alias for internal callers.
+-    _update_crosshair_by_index = update_crosshair_by_index
++            self._notify(CROSSHAIR_CHANGED)
+ 
+     def set_crosshair_visible(self, visible: bool) -> None:
+         """Show or hide the crosshair lines in all views."""
+         if self.crosshair_visible != visible:
+             self.crosshair_visible = visible
+-            self._notify("crosshair_visible_changed", visible)
++            self._notify(CROSSHAIR_VISIBLE_CHANGED, visible)
+ 
+     # =========================================================
+     # Bounding box
+@@ -917,9 +1064,9 @@ class SliceViewerState:
+             for other in AXES:
+                 if other != axis and self.bounding_boxes.get(other) is not None:
+                     self.bounding_boxes[other] = None
+-                    self._notify("bounding_boxes_changed", other, None)
++                    self._notify(BOUNDING_BOXES_CHANGED, other, None)
+         self.bounding_boxes[axis] = bbox
+-        self._notify("bounding_boxes_changed", axis, bbox)
++        self._notify(BOUNDING_BOXES_CHANGED, axis, bbox)
+ 
+     def set_bbox_visible(self, visible: bool) -> None:
+         """Show or hide the bounding-box overlay."""
+@@ -944,13 +1091,7 @@ class SliceViewerState:
+             raise ValueError(f"No bounding box set for axis '{axis}'")
+         x0_p, y0_p, w_p, h_p = bbox
+         x1_p, y1_p = x0_p + w_p, y0_p + h_p
+-        # Map each physical axis to the corresponding index axis per view.
+-        axis_mapping = {
+-            "axial": ("sagittal", "coronal"),
+-            "coronal": ("sagittal", "axial"),
+-            "sagittal": ("coronal", "axial"),
+-        }
+-        x_axis, y_axis = axis_mapping[axis]
++        x_axis, y_axis = VIEW_TO_PIXEL_AXES[axis]
+         x0 = self.physical_to_index(x_axis, x0_p)
+         x1 = self.physical_to_index(x_axis, x1_p)
+         y0 = self.physical_to_index(y_axis, y0_p)
+@@ -974,12 +1115,7 @@ class SliceViewerState:
+             width:  Box width in pixel indices.
+             height: Box height in pixel indices.
+         """
+-        axis_mapping = {
+-            "axial": ("sagittal", "coronal"),
+-            "coronal": ("sagittal", "axial"),
+-            "sagittal": ("coronal", "axial"),
+-        }
+-        x_axis, y_axis = axis_mapping[axis]
++        x_axis, y_axis = VIEW_TO_PIXEL_AXES[axis]
+         x0_p = self.index_to_physical(x_axis, x_min)
+         x1_p = self.index_to_physical(x_axis, x_min + width)
+         y0_p = self.index_to_physical(y_axis, y_min)
+@@ -996,13 +1132,13 @@ class SliceViewerState:
+         """Set which ROIs are displayed."""
+         if self.active_contours != active_roi_numbers:
+             self.active_contours = active_roi_numbers
+-            self._notify("active_contours_changed", active_roi_numbers)
++            self._notify(ACTIVE_CONTOURS_CHANGED, active_roi_numbers)
+ 
+     def set_selected_roi(self, roi_number: int | None) -> None:
+         """Set the ROI that the brush tool will edit."""
+         if self.selected_roi_number != roi_number:
+             self.selected_roi_number = roi_number
+-            self._notify("selected_roi_changed", roi_number)
++            self._notify(SELECTED_ROI_CHANGED, roi_number)
+ 
+     def set_overlay_contours(self, enable: bool) -> None:
+         """Enable or disable filled (semi-transparent) contour overlay."""
+@@ -1010,7 +1146,7 @@ class SliceViewerState:
+             self.overlay_contours = enable
+             # Path objects remain valid; the facecolor is recomputed from
+             # to_rgba() inside ContourOverlay.draw() on every redraw.
+-            self._notify("overlay_contours_changed", enable)
++            self._notify(OVERLAY_CONTOURS_CHANGED, enable)
+ 
+     def add_contour(self, name: str, mask: sitk.Image, color: str) -> int:
+         """Add an ROI to the :class:`StructureSet` and return its ROI number."""
+@@ -1018,7 +1154,7 @@ class SliceViewerState:
+         # Cache the mask as a NumPy array to eliminate sitk round-trips during scrolling.
+         self._cache.register_mask_volume(roi_number, mask)
+         self._cache.schedule_contour_build(roi_number, self.primary_image)
+-        self._notify("all_contours_changed", self.structure_set)
++        self._notify(ALL_CONTOURS_CHANGED, self.structure_set)
+         return roi_number
+ 
+     def add_contours(self, rois: list[tuple[str, sitk.Image, str]]) -> list[int]:
+@@ -1046,7 +1182,7 @@ class SliceViewerState:
+             self._cache.schedule_contour_build(roi_number, self.primary_image)
+             roi_numbers.append(roi_number)
+         if roi_numbers:
+-            self._notify("all_contours_changed", self.structure_set)
++            self._notify(ALL_CONTOURS_CHANGED, self.structure_set)
+         return roi_numbers
+ 
+     def delete_contour(self, roi_number: int) -> None:
+@@ -1055,8 +1191,8 @@ class SliceViewerState:
+         self.active_contours.discard(roi_number)
+         self._cache.cancel_contour_build(roi_number)
+         self._cache.invalidate_roi(roi_number)
+-        self._notify("all_contours_changed", self.structure_set)
+-        self._notify("active_contours_changed", self.active_contours)
++        self._notify(ALL_CONTOURS_CHANGED, self.structure_set)
++        self._notify(ACTIVE_CONTOURS_CHANGED, self.active_contours)
+ 
+     def update_contour_properties(self, roi_number: int, props: dict[str, Any]) -> None:
+         """Update properties (``name``, ``mask``, ``color``) for *roi_number*."""
+@@ -1067,7 +1203,7 @@ class SliceViewerState:
+             self._cache.invalidate_contour_paths(roi_number)
+             self._cache.register_mask_volume(roi_number, props["mask"])
+             self._cache.schedule_contour_build(roi_number, self.primary_image)
+-        self._notify("all_contours_changed", self.structure_set)
++        self._notify(ALL_CONTOURS_CHANGED, self.structure_set)
+ 
+     def refresh_contours(self) -> None:
+         """Force a contour redraw and DVH update without modifying any mask.
+@@ -1075,7 +1211,7 @@ class SliceViewerState:
+         Call this when leaving the edit tab so that brush-painted changes are
+         reflected in the DVH even if no ``update_contour_properties`` was issued.
+         """
+-        self._notify("all_contours_changed", self.structure_set)
++        self._notify(ALL_CONTOURS_CHANGED, self.structure_set)
+ 
+     # =========================================================
+     # Brush tool
+@@ -1084,19 +1220,19 @@ class SliceViewerState:
+         """Activate or deactivate the brush editing tool."""
+         if self.brush_tool_active != is_active:
+             self.brush_tool_active = is_active
+-            self._notify("brush_tool_active_changed", is_active)
++            self._notify(BRUSH_TOOL_ACTIVE_CHANGED, is_active)
+ 
+     def set_brush_size_mm(self, size_mm: float) -> None:
+         """Set the brush radius in millimetres."""
+         if self.brush_size_mm != size_mm:
+             self.brush_size_mm = size_mm
+-            self._notify("brush_size_mm_changed", size_mm)
++            self._notify(BRUSH_SIZE_MM_CHANGED, size_mm)
+ 
+     def set_brush_fill_inside(self, fill: bool) -> None:
+         """Enable or disable hole-filling after each brush stroke."""
+         if self.brush_fill_inside != fill:
+             self.brush_fill_inside = fill
+-            self._notify("brush_fill_inside_changed", fill)
++            self._notify(BRUSH_FILL_INSIDE_CHANGED, fill)
+ 
+     # =========================================================
+     # Utilities
+diff --git a/src/dicom_viewer/viewer.py b/src/dicom_viewer/viewer.py
+index efa5ef4..a2d8629 100644
+--- a/src/dicom_viewer/viewer.py
++++ b/src/dicom_viewer/viewer.py
+@@ -91,7 +91,7 @@ Performance optimisations:
+ import logging
+ import tkinter as tk
+ from tkinter import ttk
+-from typing import Any
++from typing import Any, Callable
+ 
+ import numpy as np
+ import SimpleITK as sitk
+@@ -101,6 +101,25 @@ from matplotlib.figure import Figure
+ from matplotlib.patches import Rectangle
+ 
+ from .event_controllers.viewer_events import ViewerEventHandler
++from .events import (
++    ACTIVE_CONTOURS_CHANGED,
++    ALL_CONTOURS_CHANGED,
++    BLEND_ALPHA_CHANGED,
++    BOUNDING_BOXES_CHANGED,
++    CONTOUR_CACHE_BUILT,
++    CROSSHAIR_CHANGED,
++    CROSSHAIR_VISIBLE_CHANGED,
++    INDEX_CHANGED,
++    LAYOUT_MODE_CHANGED,
++    OVERLAY_CONTOURS_CHANGED,
++    PRIMARY_IMAGE_DATA_CHANGED,
++    RT_DOSE_CHANGED,
++    SECONDARY_CLIM_CHANGED,
++    SECONDARY_IMAGE_CMAP_CHANGED,
++    SECONDARY_IMAGE_DATA_CHANGED,
++    WINDOW_LEVEL_CHANGED,
++)
++from .io import load_dcm_series
+ from .rendering.contour_overlay import ContourOverlay
+ from .rendering.drawing_manager import DrawingManager
+ from .rendering.dvh import DvhPanel
+@@ -147,7 +166,19 @@ class DicomViewer(ttk.Frame):
+         self.rowconfigure(0, weight=1)
+         self.columnconfigure(0, weight=1)
+ 
+-        self.state = state if state is not None else SliceViewerState()
++        # Whether this instance created its own state (and therefore owns
++        # its lifecycle) or received one via dependency injection. Only an
++        # owned state is closed in destroy() — closing an injected state
++        # would stop its thread pool out from under whatever else holds a
++        # reference to it (see destroy() below).
++        self._owns_state = state is None
++        if state is None:
++            state = SliceViewerState()
++        # Note: this attribute intentionally shadows the inherited
++        # ``ttk.Frame.state()`` method; the explicit annotation tells type
++        # checkers the attribute type instead of the inherited callable,
++        # and the targeted ignore acknowledges the deliberate shadowing.
++        self.state: SliceViewerState = state  # type: ignore[assignment]
+ 
+         # --- Figure / Canvas / Toolbar ---
+         kw: dict = {
+@@ -191,7 +222,9 @@ class DicomViewer(ttk.Frame):
+         # DVH Axes for the "mpr" layout.
+         self.dvh_panel = DvhPanel(self.state)
+         self.layout = LayoutManager(self.fig, style_dvh_axes=self.dvh_panel.style_axes)
+-        self._layout_mode: str = "mpr_wide"
++        # Honour the layout mode already present on an injected state,
++        # rather than silently overriding it with a hardcoded default.
++        self._layout_mode: str = self.state.layout_mode
+         self.axs, self._dvh_ax = self.layout.build(self._layout_mode)
+ 
+         # Reentrancy guard for _on_draw: _cache_backgrounds() below fires a
+@@ -272,27 +305,31 @@ class DicomViewer(ttk.Frame):
+             "<Enter>", lambda _event: self.canvas.get_tk_widget().focus_set()
+         )
+ 
+-        s = self.state
+-        s.add_listener(
+-            "primary_image_data_changed", self._on_primary_image_data_changed
+-        )
+-        s.add_listener(
+-            "secondary_image_data_changed", self._on_secondary_image_data_changed
+-        )
+-        s.add_listener("blend_alpha_changed", self._on_blend_alpha_changed)
+-        s.add_listener("secondary_image_cmap_changed", self._on_secondary_cmap_changed)
+-        s.add_listener("secondary_clim_changed", self._on_secondary_clim_changed)
+-        s.add_listener("rt_dose_changed", self._on_rt_dose_changed)
+-        s.add_listener("layout_mode_changed", self._on_layout_mode_changed)
+-        s.add_listener("index_changed", self._on_index_changed)
+-        s.add_listener("window_level_changed", self._on_window_level_changed)
+-        s.add_listener("crosshair_changed", self._on_crosshair_changed)
+-        s.add_listener("crosshair_visible_changed", self._on_crosshair_visible_changed)
+-        s.add_listener("bounding_boxes_changed", self._on_bounding_boxes_changed)
+-        s.add_listener("all_contours_changed", self._on_all_contours_changed)
+-        s.add_listener("active_contours_changed", self._on_active_contours_changed)
+-        s.add_listener("overlay_contours_changed", self._on_overlay_contours_changed)
+-        s.add_listener("contour_cache_built", self._on_contour_cache_built)
++        # Every (event, callback) pair is recorded so destroy() can
++        # unregister them all. Without this, a destroyed viewer sharing an
++        # injected state would stay subscribed forever — the state would
++        # keep invoking callbacks on dead Tk widgets (TclError spam) and
++        # the viewer object could never be garbage collected.
++        self._state_listeners: list[tuple[str, Callable]] = [
++            (PRIMARY_IMAGE_DATA_CHANGED, self._on_primary_image_data_changed),
++            (SECONDARY_IMAGE_DATA_CHANGED, self._on_secondary_image_data_changed),
++            (BLEND_ALPHA_CHANGED, self._on_blend_alpha_changed),
++            (SECONDARY_IMAGE_CMAP_CHANGED, self._on_secondary_cmap_changed),
++            (SECONDARY_CLIM_CHANGED, self._on_secondary_clim_changed),
++            (RT_DOSE_CHANGED, self._on_rt_dose_changed),
++            (LAYOUT_MODE_CHANGED, self._on_layout_mode_changed),
++            (INDEX_CHANGED, self._on_index_changed),
++            (WINDOW_LEVEL_CHANGED, self._on_window_level_changed),
++            (CROSSHAIR_CHANGED, self._on_crosshair_changed),
++            (CROSSHAIR_VISIBLE_CHANGED, self._on_crosshair_visible_changed),
++            (BOUNDING_BOXES_CHANGED, self._on_bounding_boxes_changed),
++            (ALL_CONTOURS_CHANGED, self._on_all_contours_changed),
++            (ACTIVE_CONTOURS_CHANGED, self._on_active_contours_changed),
++            (OVERLAY_CONTOURS_CHANGED, self._on_overlay_contours_changed),
++            (CONTOUR_CACHE_BUILT, self._on_contour_cache_built),
++        ]
++        for event_name, callback in self._state_listeners:
++            self.state.add_listener(event_name, callback)
+ 
+     # ------------------------------------------------------------------
+     # Shared helpers
+@@ -592,7 +629,7 @@ class DicomViewer(ttk.Frame):
+         axis: str,
+         secondary_data: np.ndarray,
+         clim: tuple[float, float],
+-        extent: list[float],
++        extent: tuple[float, float, float, float],
+     ) -> None:
+         """Create or update the secondary image overlay artist for *axis*.
+ 
+@@ -673,7 +710,7 @@ class DicomViewer(ttk.Frame):
+         show = self.state.crosshair_visible and pos is not None
+         cache_invalidated = False
+ 
+-        if show:
++        if show and pos is not None:
+             c1, c2 = pos
+             h_line = self.crosshairs[axis]["h"]
+             if h_line is None:
+@@ -910,10 +947,24 @@ class DicomViewer(ttk.Frame):
+     def _on_contour_cache_built(self, roi_number: int) -> None:
+         """Redraw all axes when a background contour cache build completes.
+ 
+-        This callback is invoked from a background thread, so the actual
+-        redraw is dispatched to the main thread via Tkinter after().
++        This callback originates on a background worker thread (the
++        contour-build thread pool owned by the state), so it must not
++        touch Tk or Matplotlib directly. It instead marshals the redraw
++        onto the Tk main loop via ``after(0, ...)``.
++
++        Note: ``Tk.after`` is only documented as thread-safe on a Tcl
++        interpreter built with threads enabled (the default for CPython's
++        bundled Tk on all mainstream platforms). This viewer relies on
++        that assumption; see the "Threading model" note in the README.
+         """
+-        self.after(0, self._update_all_contours)
++        try:
++            self.after(0, self._update_all_contours)
++        except RuntimeError:
++            # "main thread is not in main loop": the mainloop has already
++            # exited (application shutdown) while a background contour
++            # build was still finishing. The redraw is moot at that point,
++            # so the race is benign and intentionally swallowed.
++            logger.debug("Contour cache built after mainloop exit; redraw skipped.")
+ 
+     def _on_secondary_clim_changed(self, clim: tuple | None) -> None:
+         """Apply or clear the secondary image colour-limit override.
+@@ -1032,18 +1083,33 @@ class DicomViewer(ttk.Frame):
+         Without this, a ``widget.after`` callback scheduled by the drawing
+         manager, the background-cache debounce, or the scroll debounce could
+         fire after the underlying Tk widget is gone and raise ``TclError``.
+-        The contour-build thread pool is also shut down here so it does not
+-        outlive the viewer.
++
++        The contour-build thread pool is shut down here too, but only when
++        this viewer created its own ``state`` (i.e. no ``state`` was passed
++        in). "Whoever creates a resource is responsible for releasing it":
++        an injected state may still be referenced by whatever constructed
++        it, so closing its thread pool here would break that owner even
++        though this viewer is done with it. ``SliceViewerState.close()``
++        itself documents that its thread pool is lazily recreated on next
++        use, which would otherwise leak a new pool if a caller reused a
++        state across viewer instances.
+         """
+         self.drawing_manager.cancel()
+         self.event_handler.cancel_pending()
++        # Unsubscribe from the state before anything else: after this point
++        # no state change can reach this (now dying) widget. Essential for
++        # injected states, which outlive the viewer.
++        for event_name, callback in self._state_listeners:
++            self.state.remove_listener(event_name, callback)
++        self._state_listeners.clear()
+         if self._cache_rebuild_after_id is not None:
+             try:
+                 self.after_cancel(self._cache_rebuild_after_id)
+             except tk.TclError:
+                 pass
+             self._cache_rebuild_after_id = None
+-        self.state.close()
++        if self._owns_state:
++            self.state.close()
+         super().destroy()
+ 
+     def load_ct(self, ct_dir: Any, window: tuple[int, int] | None = None) -> None:
+@@ -1056,16 +1122,14 @@ class DicomViewer(ttk.Frame):
+             ct_dir: Path to the DICOM folder.
+             window: Optional ``(window_width, window_level)`` override.
+         """
+-        from .io import load_dcm_series
+-
+         info = load_dcm_series(ct_dir)
+         self.state.set_primary_image_data(info["sitk_image"], image_dir=ct_dir)
+         ww, wl = window if window is not None else info["window_level"]
+-        self.state.set_window_level(int(ww), int(wl))
++        self.state.set_window_level(float(ww), float(wl))
+ 
+     def set_window(self, vmin: float, vmax: float) -> None:
+         """Set the display window using vmin / vmax HU values."""
+-        self.state.set_window_level(int(vmax - vmin), int((vmax + vmin) / 2))
++        self.state.set_window_level(vmax - vmin, (vmax + vmin) / 2)
+ 
+     def get_slice(self, view: str) -> np.ndarray:
+         """Return the current 2-D slice for *view* as a NumPy array."""
+@@ -1110,52 +1174,19 @@ class DicomViewer(ttk.Frame):
+             artists.remove(artist)
+         self._invalidate_blit_cache(axis)
+ 
+-    @property
+-    def axis_vars(self) -> dict[str, Any]:
+-        return _IndexVarProxy(self.state)
+-
+     @property
+     def metadata(self) -> dict[str, Any]:
++        """Return the primary image geometry as a fixed-key dict.
++
++        Always exposes the same keys (``spacing`` / ``origin`` / ``size``)
++        so callers can index them unconditionally; each is ``None`` when
++        no primary image is loaded, rather than the key being absent.
++        """
+         img = self.state.primary_image
+         if img is None:
+-            return {"spacing": None}
++            return {"spacing": None, "origin": None, "size": None}
+         return {
+             "spacing": img.GetSpacing(),
+             "origin": img.GetOrigin(),
+             "size": img.GetSize(),
+         }
+-
+-
+-# ---------------------------------------------------------------------------
+-# Backward-compatibility helpers
+-# ---------------------------------------------------------------------------
+-class _IndexVarProxy:
+-    """Tk-style IntVar dict proxy over SliceViewerState indices."""
+-
+-    _AXIS_CHAR_MAP = {"x": "sagittal", "y": "coronal", "z": "axial"}
+-
+-    def __init__(self, state: SliceViewerState) -> None:
+-        self._state = state
+-
+-    def __getitem__(self, axis_char: str) -> "_SingleVar":
+-        axis = self._AXIS_CHAR_MAP.get(axis_char)
+-        if axis is None:
+-            raise KeyError(
+-                f"Unknown axis character '{axis_char}'. "
+-                f"Expected one of: {list(self._AXIS_CHAR_MAP)}"
+-            )
+-        return _SingleVar(self._state, axis)
+-
+-
+-class _SingleVar:
+-    """IntVar-like adapter around a single ``SliceViewerState`` axis index."""
+-
+-    def __init__(self, state: SliceViewerState, axis: str) -> None:
+-        self._state = state
+-        self._axis = axis
+-
+-    def get(self) -> int:
+-        return self._state.indices[self._axis]
+-
+-    def set(self, value: int) -> None:
+-        self._state.set_index(self._axis, int(value), update_crosshair=True)
+diff --git a/tests/test_geometry.py b/tests/test_geometry.py
+new file mode 100644
+index 0000000..a0113d3
+--- /dev/null
++++ b/tests/test_geometry.py
+@@ -0,0 +1,125 @@
++"""Tests for geometry.py — the pixel-center extent convention.
++
++These tests pin the coordinate convention fixed in v0.6.0: extents are
++pixel-center based, so imshow(extent=...), TransformIndexToPhysicalPoint,
++and mask_slice_to_paths all agree on the same physical grid. A regression
++here reintroduces a sub-voxel misalignment between the image, contours,
++and crosshair — invisible at a glance but unacceptable for RT QA use.
++"""
++
++import numpy as np
++import pytest
++import SimpleITK as sitk
++
++from dicom_viewer.geometry import (
++    AXES,
++    compute_extent,
++    mask_slice_to_paths,
++    slice_along_axis,
++)
++
++
++def make_image(
++    size_xyz: tuple[int, int, int] = (32, 24, 10),
++    spacing_xyz: tuple[float, float, float] = (1.0, 2.0, 3.0),
++    origin_xyz: tuple[float, float, float] = (-16.0, -24.0, -15.0),
++) -> sitk.Image:
++    """Create a synthetic sitk image with distinct per-axis geometry."""
++    nx, ny, nz = size_xyz
++    img = sitk.GetImageFromArray(np.zeros((nz, ny, nx), dtype=np.uint8))
++    img.SetSpacing(spacing_xyz)
++    img.SetOrigin(origin_xyz)
++    return img
++
++
++class TestComputeExtent:
++    def test_axial_extent_is_pixel_center_convention(self) -> None:
++        img = make_image()
++        x0, x1, y0, y1 = compute_extent(img, "axial")
++        # Left edge is half a voxel outside the first pixel center.
++        assert x0 == pytest.approx(-16.0 - 0.5 * 1.0)
++        assert x1 == pytest.approx(-16.0 + (32 - 0.5) * 1.0)
++        assert y0 == pytest.approx(-24.0 - 0.5 * 2.0)
++        assert y1 == pytest.approx(-24.0 + (24 - 0.5) * 2.0)
++
++    @pytest.mark.parametrize("axis", AXES)
++    def test_extent_width_equals_size_times_spacing(self, axis: str) -> None:
++        img = make_image()
++        x0, x1, y0, y1 = compute_extent(img, axis)
++        size = img.GetSize()
++        spacing = img.GetSpacing()
++        dims = {"axial": (0, 1), "coronal": (0, 2), "sagittal": (1, 2)}[axis]
++        assert (x1 - x0) == pytest.approx(size[dims[0]] * spacing[dims[0]])
++        assert (y1 - y0) == pytest.approx(size[dims[1]] * spacing[dims[1]])
++
++    @pytest.mark.parametrize("axis", AXES)
++    def test_imshow_pixel_centers_match_sitk_physical_points(self, axis: str) -> None:
++        """The core alignment invariant.
++
++        With extent (x0, x1) over w pixels, imshow places the center of
++        pixel i at x0 + (i + 0.5) * (x1 - x0) / w. That must equal the
++        SimpleITK physical coordinate of index i (origin + i * spacing) —
++        otherwise the displayed image drifts relative to the crosshair
++        and contours, which are physical-coordinate based.
++        """
++        img = make_image()
++        x0, x1, y0, y1 = compute_extent(img, axis)
++        dims = {"axial": (0, 1), "coronal": (0, 2), "sagittal": (1, 2)}[axis]
++        size = img.GetSize()
++        spacing = img.GetSpacing()
++        origin = img.GetOrigin()
++        for d, (lo, hi) in zip(dims, ((x0, x1), (y0, y1))):
++            w = size[d]
++            for i in (0, w // 2, w - 1):
++                imshow_center = lo + (i + 0.5) * (hi - lo) / w
++                sitk_center = origin[d] + i * spacing[d]
++                assert imshow_center == pytest.approx(sitk_center)
++
++
++class TestMaskSliceToPaths:
++    def test_single_voxel_contour_surrounds_its_physical_center(self) -> None:
++        """A 1-voxel mask must produce a contour enclosing that voxel's
++        physical center — the same point the crosshair would land on."""
++        img = make_image(size_xyz=(16, 16, 4), spacing_xyz=(2.0, 2.0, 5.0))
++        arr = sitk.GetArrayFromImage(img)
++        row, col = 5, 8
++        z = 1
++        arr[z, row, col] = 1
++        x0, x1, y0, y1 = compute_extent(img, "axial")
++        mask_slice = arr[z]
++
++        paths = mask_slice_to_paths(mask_slice, x0, x1, y0, y1)
++        assert len(paths) == 1
++
++        origin = img.GetOrigin()
++        spacing = img.GetSpacing()
++        cx = origin[0] + col * spacing[0]
++        cy = origin[1] + row * spacing[1]
++        assert paths[0].contains_point((cx, cy))
++
++        # And the contour must be local: a neighbouring voxel's center
++        # (2 voxels away) must be outside.
++        assert not paths[0].contains_point((cx + 2 * spacing[0], cy))
++
++    def test_edge_touching_mask_yields_closed_path(self) -> None:
++        img = make_image(size_xyz=(8, 8, 2), spacing_xyz=(1.0, 1.0, 1.0))
++        arr = sitk.GetArrayFromImage(img)
++        arr[0, 0:3, 0:3] = 1  # touches the slice edge
++        x0, x1, y0, y1 = compute_extent(img, "axial")
++        paths = mask_slice_to_paths(arr[0], x0, x1, y0, y1)
++        assert len(paths) == 1
++        # Path is explicitly closed: last code is CLOSEPOLY.
++        from matplotlib.path import Path as MplPath
++
++        assert paths[0].codes is not None
++        assert paths[0].codes[-1] == MplPath.CLOSEPOLY
++
++
++class TestSliceAlongAxis:
++    def test_slicing_matches_numpy_indexing(self) -> None:
++        arr = np.arange(2 * 3 * 4).reshape(2, 3, 4)  # (z, y, x)
++        np.testing.assert_array_equal(slice_along_axis(arr, "axial", 1), arr[1])
++        np.testing.assert_array_equal(slice_along_axis(arr, "coronal", 2), arr[:, 2])
++        np.testing.assert_array_equal(
++            slice_along_axis(arr, "sagittal", 3), arr[:, :, 3]
++        )
+diff --git a/tests/test_io.py b/tests/test_io.py
+new file mode 100644
+index 0000000..4a068a8
+--- /dev/null
++++ b/tests/test_io.py
+@@ -0,0 +1,31 @@
++"""Tests for io.py — pure helpers (DS parsing, phase-label normalisation)."""
++
++import pytest
++
++from dicom_viewer.io import _first_float, normalize_phase_label
++
++
++class TestFirstFloat:
++    def test_single_value(self) -> None:
++        assert _first_float("400") == 400.0
++        assert _first_float("40.5") == 40.5
++
++    def test_multi_value_takes_first(self) -> None:
++        """Multi-valued WW/WC tags (backslash-separated, e.g. from GE
++        consoles storing several presets) must not fall back to defaults —
++        the first preset is the one to use."""
++        assert _first_float("40\\400") == 40.0
++        assert _first_float("-600\\40\\80") == -600.0
++
++    def test_invalid_raises_value_error(self) -> None:
++        with pytest.raises(ValueError):
++            _first_float("abc")
++
++
++class TestNormalizePhaseLabel:
++    def test_extracts_percent_label(self) -> None:
++        assert normalize_phase_label("4DCT 30% exhale") == "30%"
++        assert normalize_phase_label("0%") == "0%"
++
++    def test_no_match_returns_none(self) -> None:
++        assert normalize_phase_label("Helical CT") is None
+diff --git a/tests/test_render.py b/tests/test_render.py
+new file mode 100644
+index 0000000..fa930da
+--- /dev/null
++++ b/tests/test_render.py
+@@ -0,0 +1,62 @@
++"""Tests for rendering/render.py — LUT construction and windowed RGBA conversion.
++
++Pins the documented claim that slice_to_rgba is equivalent to
++``cmap(Normalize(vmin, vmax, clip=True)(data))``.
++"""
++
++import matplotlib
++
++matplotlib.use("Agg")
++
++import numpy as np
++from matplotlib import colormaps
++from matplotlib.colors import Normalize
++
++from dicom_viewer.rendering.render import GRAY_LUT, build_cmap_lut, slice_to_rgba
++
++
++class TestBuildCmapLut:
++    def test_shape_and_dtype(self) -> None:
++        lut = build_cmap_lut("gray")
++        assert lut.shape == (256, 4)
++        assert lut.dtype == np.uint8
++
++    def test_alpha_channel(self) -> None:
++        lut = build_cmap_lut("jet", alpha=0.5)
++        assert np.all(lut[:, 3] == round(0.5 * 255))
++
++    def test_gray_is_monotonic_identity(self) -> None:
++        lut = build_cmap_lut("gray")
++        # Grayscale: R == G == B, monotonically increasing.
++        assert np.all(lut[:, 0] == lut[:, 1])
++        assert np.all(lut[:, 1] == lut[:, 2])
++        assert np.all(np.diff(lut[:, 0].astype(int)) >= 0)
++
++
++class TestSliceToRgba:
++    def test_matches_matplotlib_normalize_pipeline(self) -> None:
++        rng = np.random.default_rng(0)
++        data = rng.uniform(-1000, 2000, size=(64, 64)).astype(np.float32)
++        vmin, vmax = -150.0, 250.0
++
++        got = slice_to_rgba(data, vmin, vmax, GRAY_LUT)
++
++        cmap = colormaps["gray"]
++        norm = Normalize(vmin=vmin, vmax=vmax, clip=True)
++        expected = (cmap(norm(data)) * 255).astype(np.uint8)
++
++        # Quantisation through a 256-entry LUT differs from the continuous
++        # pipeline by at most one LUT step per channel.
++        diff = np.abs(got[..., :3].astype(int) - expected[..., :3].astype(int))
++        assert diff.max() <= 2
++
++    def test_clipping_at_bounds(self) -> None:
++        data = np.array([[-1e6, 1e6]], dtype=np.float32)
++        rgba = slice_to_rgba(data, 0.0, 100.0, GRAY_LUT)
++        assert tuple(rgba[0, 0, :3]) == tuple(GRAY_LUT[0, :3])
++        assert tuple(rgba[0, 1, :3]) == tuple(GRAY_LUT[255, :3])
++
++    def test_degenerate_window_does_not_divide_by_zero(self) -> None:
++        data = np.zeros((4, 4), dtype=np.float32)
++        rgba = slice_to_rgba(data, 50.0, 50.0, GRAY_LUT)
++        assert rgba.shape == (4, 4, 4)
+diff --git a/tests/test_roi_operations.py b/tests/test_roi_operations.py
+new file mode 100644
+index 0000000..2a25db1
+--- /dev/null
++++ b/tests/test_roi_operations.py
+@@ -0,0 +1,216 @@
++"""Tests for roi_operations.py — interpolation, margins, booleans, thinning.
++
++Pins the docstring claim that _shift_accumulate's filter-based
++implementation is equivalent to iterated-roll OR/AND dilation/erosion.
++"""
++
++import numpy as np
++import pytest
++import SimpleITK as sitk
++
++from dicom_viewer.roi_operations import (
++    BooleanOp,
++    MarginConfig,
++    apply_margin,
++    boolean_operation,
++    interpolate_contour,
++    thin_slices,
++)
++
++
++def make_mask(
++    arr: np.ndarray, spacing: tuple[float, float, float] = (1.0, 1.0, 1.0)
++) -> sitk.Image:
++    img = sitk.GetImageFromArray(arr.astype(np.uint8))
++    img.SetSpacing(spacing)
++    return img
++
++
++def cube_mask(
++    shape_zyx: tuple[int, int, int] = (11, 11, 11),
++    lo: int = 4,
++    hi: int = 7,
++) -> np.ndarray:
++    arr = np.zeros(shape_zyx, dtype=np.uint8)
++    arr[lo:hi, lo:hi, lo:hi] = 1
++    return arr
++
++
++class TestInterpolateContour:
++    def test_fills_gap_between_slices(self) -> None:
++        arr = np.zeros((7, 8, 8), dtype=np.uint8)
++        arr[1, 2:6, 2:6] = 1
++        arr[5, 2:6, 2:6] = 1
++        out = sitk.GetArrayFromImage(interpolate_contour(make_mask(arr)))
++        for z in (2, 3, 4):
++            assert out[z].any(), f"slice {z} should be filled"
++        # Slices outside the non-empty range stay untouched.
++        assert not out[0].any()
++        assert not out[6].any()
++
++    def test_identical_slices_copied_verbatim(self) -> None:
++        arr = np.zeros((5, 8, 8), dtype=np.uint8)
++        square = np.zeros((8, 8), dtype=np.uint8)
++        square[2:6, 2:6] = 1
++        arr[0] = square
++        arr[4] = square
++        out = sitk.GetArrayFromImage(interpolate_contour(make_mask(arr)))
++        for z in range(5):
++            np.testing.assert_array_equal(out[z], square)
++
++    def test_fewer_than_two_slices_is_noop(self) -> None:
++        arr = np.zeros((5, 8, 8), dtype=np.uint8)
++        arr[2, 3:5, 3:5] = 1
++        src = make_mask(arr)
++        out = interpolate_contour(src)
++        np.testing.assert_array_equal(
++            sitk.GetArrayFromImage(out), sitk.GetArrayFromImage(src)
++        )
++
++    def test_preserves_metadata(self) -> None:
++        arr = np.zeros((5, 8, 8), dtype=np.uint8)
++        arr[1, 2:4, 2:4] = 1
++        arr[3, 2:4, 2:4] = 1
++        src = make_mask(arr, spacing=(0.5, 0.5, 2.5))
++        out = interpolate_contour(src)
++        assert out.GetSpacing() == src.GetSpacing()
++        assert out.GetOrigin() == src.GetOrigin()
++
++
++class TestApplyMargin:
++    def _naive_dilate(
++        self, arr: np.ndarray, n: int, axis: int, positive: bool
++    ) -> np.ndarray:
++        """Reference implementation: iterated roll + OR (the pre-optimisation
++        algorithm the filter version claims equivalence with)."""
++        result = arr.astype(bool).copy()
++        shift = 1 if positive else -1
++        rolled = arr.astype(bool)
++        for _ in range(n):
++            rolled = np.roll(rolled, shift, axis=axis)
++            # Zero the wrapped-around border.
++            sl: list[slice | int] = [slice(None)] * arr.ndim
++            sl[axis] = 0 if positive else -1
++            rolled[tuple(sl)] = False
++            result |= rolled
++        return result
++
++    @pytest.mark.parametrize(
++        "field,axis,positive",
++        [
++            ("superior", 0, True),
++            ("inferior", 0, False),
++            ("posterior", 1, True),
++            ("anterior", 1, False),
++            ("right", 2, True),
++            ("left", 2, False),
++        ],
++    )
++    def test_directional_expansion_matches_naive_roll(
++        self, field: str, axis: int, positive: bool
++    ) -> None:
++        arr = cube_mask()
++        config = MarginConfig(**{field: 2.0})
++        out = sitk.GetArrayFromImage(apply_margin(make_mask(arr), config)).astype(bool)
++        expected = self._naive_dilate(arr, 2, axis, positive)
++        np.testing.assert_array_equal(out, expected)
++
++    def _naive_erode(
++        self, arr: np.ndarray, n: int, axis: int, positive: bool
++    ) -> np.ndarray:
++        """Reference erosion: a voxel survives only if its n neighbours
++        toward the shaved face are also inside the mask."""
++        result = arr.astype(bool).copy()
++        shift = -1 if positive else 1  # opposite of the dilation direction
++        rolled = arr.astype(bool)
++        for _ in range(n):
++            rolled = np.roll(rolled, shift, axis=axis)
++            sl: list[slice | int] = [slice(None)] * arr.ndim
++            sl[axis] = -1 if positive else 0
++            rolled[tuple(sl)] = False
++            result &= rolled
++        return result
++
++    @pytest.mark.parametrize(
++        "field,axis,positive",
++        [
++            ("superior", 0, True),
++            ("inferior", 0, False),
++            ("posterior", 1, True),
++            ("anterior", 1, False),
++            ("right", 2, True),
++            ("left", 2, False),
++        ],
++    )
++    def test_negative_margin_shaves_the_named_face(
++        self, field: str, axis: int, positive: bool
++    ) -> None:
++        """Regression test for the inverted-erosion-direction bug: a
++        negative margin must remove the outermost layer of the *named*
++        face, not the opposite one (e.g. superior=-1 removes the top
++        slice of the structure, not the bottom)."""
++        arr = cube_mask()
++        config = MarginConfig(**{field: -1.0})
++        out = sitk.GetArrayFromImage(apply_margin(make_mask(arr), config)).astype(bool)
++        expected = self._naive_erode(arr, 1, axis, positive)
++        np.testing.assert_array_equal(out, expected)
++        # The named face's outermost occupied layer must now be empty.
++        face_index = 6 if positive else 4  # cube occupies 4..6
++        sl: list[slice | int] = [slice(None)] * 3
++        sl[axis] = face_index
++        assert not out[tuple(sl)].any()
++
++    def test_anisotropic_spacing_scales_voxel_count(self) -> None:
++        arr = cube_mask()
++        # spacing z = 2 mm: a 4 mm superior margin = 2 voxels.
++        mask = make_mask(arr, spacing=(1.0, 1.0, 2.0))
++        out = sitk.GetArrayFromImage(
++            apply_margin(mask, MarginConfig(superior=4.0))
++        ).astype(bool)
++        expected = self._naive_dilate(arr, 2, axis=0, positive=True)
++        np.testing.assert_array_equal(out, expected)
++
++    def test_zero_margin_is_noop(self) -> None:
++        arr = cube_mask()
++        out = sitk.GetArrayFromImage(apply_margin(make_mask(arr), MarginConfig()))
++        np.testing.assert_array_equal(out.astype(bool), arr.astype(bool))
++
++
++class TestBooleanOperation:
++    def _two_masks(self) -> tuple[sitk.Image, sitk.Image, np.ndarray, np.ndarray]:
++        a = np.zeros((6, 6, 6), dtype=np.uint8)
++        b = np.zeros((6, 6, 6), dtype=np.uint8)
++        a[1:4, 1:4, 1:4] = 1
++        b[2:5, 2:5, 2:5] = 1
++        return make_mask(a), make_mask(b), a.astype(bool), b.astype(bool)
++
++    def test_union(self) -> None:
++        ma, mb, a, b = self._two_masks()
++        out = sitk.GetArrayFromImage(boolean_operation(ma, mb, BooleanOp.UNION))
++        np.testing.assert_array_equal(out.astype(bool), a | b)
++
++    def test_intersection(self) -> None:
++        ma, mb, a, b = self._two_masks()
++        out = sitk.GetArrayFromImage(boolean_operation(ma, mb, BooleanOp.INTERSECTION))
++        np.testing.assert_array_equal(out.astype(bool), a & b)
++
++    def test_subtraction(self) -> None:
++        ma, mb, a, b = self._two_masks()
++        out = sitk.GetArrayFromImage(boolean_operation(ma, mb, BooleanOp.SUBTRACTION))
++        np.testing.assert_array_equal(out.astype(bool), a & ~b)
++
++
++class TestThinSlices:
++    def test_keeps_every_other_slice(self) -> None:
++        arr = np.ones((6, 4, 4), dtype=np.uint8)
++        out = sitk.GetArrayFromImage(thin_slices(make_mask(arr), interval=2))
++        for z in range(6):
++            if z % 2 == 0:
++                assert out[z].all()
++            else:
++                assert not out[z].any()
++
++    def test_interval_below_two_raises(self) -> None:
++        arr = np.ones((4, 4, 4), dtype=np.uint8)
++        with pytest.raises(ValueError):
++            thin_slices(make_mask(arr), interval=1)
+diff --git a/tests/test_viewer_state.py b/tests/test_viewer_state.py
+new file mode 100644
+index 0000000..6c07bb8
+--- /dev/null
++++ b/tests/test_viewer_state.py
+@@ -0,0 +1,166 @@
++"""Tests for state/viewer_state.py — observers, the setter guard, and StructureSet."""
++
++import matplotlib
++
++matplotlib.use("Agg")
++
++import numpy as np
++import pytest
++import SimpleITK as sitk
++
++from dicom_viewer import events
++from dicom_viewer.state.viewer_state import RoiEntry, SliceViewerState, StructureSet
++
++
++def make_state_with_image() -> SliceViewerState:
++    state = SliceViewerState()
++    arr = np.zeros((10, 20, 30), dtype=np.int16)
++    img = sitk.GetImageFromArray(arr)
++    img.SetSpacing((1.0, 2.0, 3.0))
++    img.SetOrigin((-15.0, -20.0, -15.0))
++    state.set_primary_image_data(img)
++    return state
++
++
++class TestObserverPattern:
++    def test_setter_notifies_listener(self) -> None:
++        state = SliceViewerState()
++        received: list[float] = []
++        state.add_listener(events.BLEND_ALPHA_CHANGED, received.append)
++        state.set_blend_alpha(0.25)
++        assert received == [0.25]
++
++    def test_setter_is_idempotent(self) -> None:
++        state = SliceViewerState()
++        received: list[float] = []
++        state.add_listener(events.BLEND_ALPHA_CHANGED, received.append)
++        state.set_blend_alpha(0.25)
++        state.set_blend_alpha(0.25)  # same value: no second notification
++        assert received == [0.25]
++
++    def test_unknown_event_type_raises(self) -> None:
++        state = SliceViewerState()
++        with pytest.raises(ValueError, match="Unknown event type"):
++            state._notify("windw_level_changed")  # deliberate typo
++
++    def test_all_declared_events_are_accepted(self) -> None:
++        state = SliceViewerState()
++        # Registering a listener for every declared event must not raise.
++        for name in events.ALL_EVENTS:
++            state.add_listener(name, lambda *a, **k: None)
++
++
++class TestSetattrGuard:
++    def test_external_direct_write_goes_through_setter(self) -> None:
++        state = SliceViewerState()
++        received: list[float] = []
++        state.add_listener(events.BLEND_ALPHA_CHANGED, received.append)
++        state.blend_alpha = 0.4  # direct write from outside the module
++        assert state.blend_alpha == 0.4
++        assert received == [0.4]
++
++    def test_window_level_direct_write_unpacks_tuple(self) -> None:
++        state = SliceViewerState()
++        received: list[tuple[float, float]] = []
++        state.add_listener(
++            events.WINDOW_LEVEL_CHANGED, lambda w, l: received.append((w, l))
++        )
++        state.window_level = (400.0, 40.0)
++        assert state.window_level == (400.0, 40.0)
++        assert received == [(400.0, 40.0)]
++
++    def test_layout_mode_direct_write_validates(self) -> None:
++        state = SliceViewerState()
++        with pytest.raises(ValueError, match="Unknown layout mode"):
++            state.layout_mode = "bogus"
++
++    def test_internal_reset_does_not_renotify(self) -> None:
++        """set_primary_image_data resets observable fields internally;
++        those writes must not re-enter the setters (which would fire a
++        storm of change events mid-reset)."""
++        state = make_state_with_image()
++        state.set_blend_alpha(0.5)
++        blend_events: list[float] = []
++        state.add_listener(events.BLEND_ALPHA_CHANGED, blend_events.append)
++        # Loading a new image resets blend_alpha to 1.0 internally. The
++        # coordinated reset notifies via its own dedicated events, not via
++        # a blend_alpha_changed re-entry.
++        arr = np.zeros((5, 5, 5), dtype=np.int16)
++        state.set_primary_image_data(sitk.GetImageFromArray(arr))
++        assert state.blend_alpha == 1.0
++        assert blend_events == []
++
++
++class TestLayoutModeValidation:
++    def test_set_layout_mode_rejects_unknown(self) -> None:
++        state = SliceViewerState()
++        with pytest.raises(ValueError):
++            state.set_layout_mode("quad")
++
++    def test_set_layout_mode_accepts_all_valid(self) -> None:
++        state = SliceViewerState()
++        for mode in ("single", "mpr", "mpr_wide"):
++            state.set_layout_mode(mode)
++            assert state.layout_mode == mode
++
++
++class TestPhysicalIndexRoundTrip:
++    def test_index_to_physical_matches_sitk(self) -> None:
++        state = make_state_with_image()
++        img = state.primary_image
++        assert img is not None
++        for axis, size_dim in (("sagittal", 0), ("coronal", 1), ("axial", 2)):
++            for idx in (0, img.GetSize()[size_dim] // 2, img.GetSize()[size_dim] - 1):
++                phys = state.index_to_physical(axis, idx)
++                assert state.physical_to_index(axis, phys) == idx
++
++
++class TestStructureSet:
++    def _mask(self) -> sitk.Image:
++        return sitk.GetImageFromArray(np.zeros((4, 4, 4), dtype=np.uint8))
++
++    def test_add_and_accessors(self) -> None:
++        ss = StructureSet()
++        num = ss.add("PTV", self._mask(), "#ff0000")
++        assert num == 1
++        assert ss.get_name(num) == "PTV"
++        assert ss.get_color(num) == "#ff0000"
++        assert ss.get_mask(num) is not None
++        assert num in ss
++        assert len(ss) == 1
++
++    def test_roi_numbers_never_reused(self) -> None:
++        ss = StructureSet()
++        n1 = ss.add("A", self._mask(), "#111111")
++        ss.remove(n1)
++        n2 = ss.add("B", self._mask(), "#222222")
++        assert n2 != n1
++
++    def test_get_all_returns_roi_entries(self) -> None:
++        ss = StructureSet()
++        num = ss.add("PTV", self._mask(), "#ff0000")
++        entries = ss.get_all()
++        assert isinstance(entries[num], RoiEntry)
++        # Outer dict is a copy: mutating it must not affect the set.
++        entries.clear()
++        assert num in ss
++
++    def test_update_valid_field(self) -> None:
++        ss = StructureSet()
++        num = ss.add("PTV", self._mask(), "#ff0000")
++        ss.update(num, {"color": "#00ff00"})
++        assert ss.get_color(num) == "#00ff00"
++
++    def test_update_unknown_field_raises(self) -> None:
++        ss = StructureSet()
++        num = ss.add("PTV", self._mask(), "#ff0000")
++        with pytest.raises(ValueError, match="Unknown RoiEntry field"):
++            ss.update(num, {"colour": "#00ff00"})
++
++    def test_generate_unique_name(self) -> None:
++        ss = StructureSet()
++        ss.add("PTV", self._mask(), "#ff0000")
++        assert ss.generate_unique_name("PTV") == "PTV(2)"
++        ss.add("PTV(2)", self._mask(), "#ff0000")
++        assert ss.generate_unique_name("PTV") == "PTV(3)"
++        assert ss.generate_unique_name("CTV") == "CTV"

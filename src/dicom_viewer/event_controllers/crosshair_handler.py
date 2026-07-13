@@ -65,6 +65,10 @@ class CrosshairEventHandler:
             return False
 
         ax = self.viewer.axs.get(axis)
+        if ax is None:
+            # current_axis can name a view that the active layout does not
+            # build (e.g. "coronal" after switching to "single").
+            return False
         # Convert data coordinates to display pixels for hit-testing.
         px, py = ax.transData.transform((event.xdata, event.ydata))
         cx, cy = ax.transData.transform(pos)

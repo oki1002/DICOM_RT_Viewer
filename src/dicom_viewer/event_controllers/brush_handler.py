@@ -34,6 +34,7 @@ class BrushEventHandler:
         self._active_axis: str | None = None  # axis on which the stroke was started
         self._last_pos_px: tuple[int, int] | None = None
         self._stroke_mask: np.ndarray | None = None
+        self._stroke_radii_px: tuple[float, float] | None = None
 
         self._cached_mask_volume: np.ndarray | None = None
         self._cached_roi_number: int | None = None
@@ -74,11 +75,22 @@ class BrushEventHandler:
         self._active_axis = self.state.current_axis
 
         mask_image = self.state.structure_set.get_mask(roi_number)
+        if mask_image is None:
+            # __contains__ was checked above, but the entry could in theory
+            # be removed between the check and here; guard rather than crash.
+            self._is_dragging = False
+            return
         mask_slice = self.state.get_slice_data(mask_image, self._active_axis)
         self._stroke_mask = np.zeros_like(mask_slice, dtype=bool)
 
         self._cached_mask_volume = sitk.GetArrayFromImage(mask_image)
         self._cached_roi_number = roi_number
+        # The physical extent and in-plane shape only depend on the image
+        # geometry and axis, both fixed for the duration of a stroke, so
+        # the radius-in-pixels conversion is computed once here instead of
+        # on every motion event (previously re-sliced state.primary_image
+        # on every mouse-move during a drag).
+        self._stroke_radii_px = self._compute_brush_radii_px(self._active_axis)
 
         self._last_pos_px = None
         self._paint_at(event)
@@ -103,6 +115,13 @@ class BrushEventHandler:
             self._update_brush_cursor(event)
 
         if self._is_dragging:
+            # A stroke never crosses view boundaries: _stroke_mask and
+            # _cached_mask_volume were built for self._active_axis, so
+            # painting with a different axis' pixel coordinates would
+            # corrupt the mask if the pointer drifts into another view
+            # mid-drag.
+            if current != self._active_axis:
+                return
             pos_px = self._physical_to_slice_pixel(current, (event.xdata, event.ydata))
             if pos_px == self._last_pos_px:
                 return
@@ -128,6 +147,11 @@ class BrushEventHandler:
 
         # Apply hole-filling on the final 2-D slice if requested, then commit.
         mask_volume = self._cached_mask_volume
+        if mask_volume is None:
+            # A press that failed its guards never populated the cache, so
+            # there is nothing to commit.
+            self._discard_cache()
+            return
         slobj = self._make_slobj(axis)
 
         if self._button == 1 and self.state.brush_fill_inside:
@@ -139,6 +163,7 @@ class BrushEventHandler:
 
         self._last_pos_px = None
         self._stroke_mask = None
+        self._stroke_radii_px = None
         self._discard_cache()
 
     def handle_scroll(self, event) -> None:
@@ -331,10 +356,22 @@ class BrushEventHandler:
     # Coordinate helpers
     # ------------------------------------------------------------------
     def _get_brush_radii_px(self, axis: str) -> tuple[float, float]:
+        """Return the current stroke's cached brush radius in pixel units ``(ry, rx)``.
+
+        Falls back to computing fresh if called outside an active stroke
+        (e.g. for cursor-preview rendering before the first press).
+        """
+        if self._stroke_radii_px is not None:
+            return self._stroke_radii_px
+        return self._compute_brush_radii_px(axis)
+
+    def _compute_brush_radii_px(self, axis: str) -> tuple[float, float]:
         """Convert the brush radius from mm to pixel units ``(ry, rx)``.
 
         The conversion accounts for the physical extent of the current slice
-        so the brush appears isotropic in physical space.
+        so the brush appears isotropic in physical space. With the
+        pixel-center extent convention, pixels-per-mm along each axis is
+        ``shape / (extent span)`` (i.e. ``1 / spacing``).
         """
         slice_shape = self.state.get_slice_data(self.state.primary_image, axis).shape
         extent = self.state.get_extent(axis)
@@ -343,8 +380,8 @@ class BrushEventHandler:
         phys_h = extent[3] - extent[2]
         phys_w = extent[1] - extent[0]
         return (
-            self.state.brush_size_mm * (slice_shape[0] - 1) / phys_h,
-            self.state.brush_size_mm * (slice_shape[1] - 1) / phys_w,
+            self.state.brush_size_mm * slice_shape[0] / phys_h,
+            self.state.brush_size_mm * slice_shape[1] / phys_w,
         )
 
     def _physical_to_slice_pixel(
@@ -365,6 +402,13 @@ class BrushEventHandler:
         if slice_shape[0] < 2 or slice_shape[1] < 2:
             return None
         x_min, x_max, y_min, y_max = self.state.get_extent(axis)
-        col = (phys_pos[0] - x_min) / (x_max - x_min) * (slice_shape[1] - 1)
-        row = (phys_pos[1] - y_min) / (y_max - y_min) * (slice_shape[0] - 1)
+        # Pixel-center convention (see geometry.compute_extent): pixel i's
+        # center sits at x_min + (i + 0.5) * sx, so the inverse mapping is
+        # (phys - x_min) / sx - 0.5. Using (shape - 1) here previously
+        # compressed the mapping by up to one pixel at the far edge,
+        # painting strokes slightly off from the cursor position.
+        sx = (x_max - x_min) / slice_shape[1]
+        sy = (y_max - y_min) / slice_shape[0]
+        col = (phys_pos[0] - x_min) / sx - 0.5
+        row = (phys_pos[1] - y_min) / sy - 0.5
         return int(round(row)), int(round(col))
