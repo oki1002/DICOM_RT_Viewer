@@ -102,6 +102,13 @@ First release prepared for public distribution.
   the per-frame RGBA conversion cost roughly 4x (measured 3.4 ms -> 0.8 ms
   for a 512x512 slice), which is paid on every scroll / window-level /
   crosshair-drag frame.
+- **Breaking: `all_phases_data["..."]["sitk_image"]` is no longer
+  pre-resampled to the primary grid.** `set_all_phases` now stores each
+  phase's raw image and defers resampling to first activation (see below),
+  so listeners of `"phases_data_loaded"` that read geometry directly from
+  `all_phases_data` must resample themselves via `get_resampled_image`, or
+  read the resampled volume through `set_active_phase_as_secondary` /
+  the secondary-image cache instead.
 - **Background contour build skips empty slices.** The mask is projected
   onto each axis once (a cheap `any()` reduction) so `find_contours` runs
   only on occupied slices, which are a small fraction of the volume for a

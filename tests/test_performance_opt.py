@@ -95,6 +95,24 @@ class TestCachesAreZeroCopyViews:
         mgr.mask_slice_cache.invalidate_roi(1)
         assert 1 not in mgr.mask_slice_cache._backers
 
+    def test_build_dose_array_casts_to_float32(self) -> None:
+        """build_dose_array owns the float32 cast (not the caller), and the
+
+        cached view must alias the casted image, not the original float64
+        one, so the backer keeps the right object alive.
+        """
+        mgr = ViewerCacheManager(on_contour_built=lambda _n: None)
+        dose_f64 = sitk.Cast(
+            sitk.GetImageFromArray(np.ones((2, 3, 3), dtype=np.float32)),
+            sitk.sitkFloat64,
+        )
+        mgr.build_dose_array(dose_f64)
+        assert mgr.dose_array is not None
+        assert mgr.dose_array.dtype == np.float32
+        assert not np.shares_memory(
+            mgr.dose_array, sitk.GetArrayViewFromImage(dose_f64)
+        )
+
 
 class TestContourBuildSkipEmpty:
     def test_skip_empty_matches_exhaustive_build(self) -> None:
@@ -171,3 +189,20 @@ class TestLazyPhaseCache:
         state.set_active_phase_as_secondary("0%")  # refresh "0%" as MRU
         state.set_active_phase_as_secondary("100%")  # should evict "50%"
         assert set(state._resampled_phase_cache) == {"0%", "100%"}
+
+    def test_all_phases_data_is_isolated_from_caller_dict(self) -> None:
+        """set_all_phases must copy each entry dict, not just the outer
+
+        dict, so the caller mutating its own phases_data afterwards cannot
+        silently change what the state holds.
+        """
+        state = self._state()
+        phases_data = {"0%": self._phase(1)}
+        state.set_all_phases(phases_data)
+        phases_data["0%"]["sitk_image"] = self._phase(9)["sitk_image"]
+        stored = sitk.GetArrayFromImage(state.all_phases_data["0%"]["sitk_image"])
+        assert (stored == 1).all()
+
+    def test_max_cached_phases_below_one_is_clamped(self) -> None:
+        state = SliceViewerState(max_cached_phases=0)
+        assert state.max_cached_phases == 1

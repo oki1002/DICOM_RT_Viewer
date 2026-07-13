@@ -83,8 +83,12 @@ def slice_to_rgba(
     if out is not None and out.shape == expected_shape and out.dtype == np.uint8:
         # np.take with out= writes directly into the reused buffer, avoiding
         # the (H, W, 4) allocation that ``lut[indices]`` fancy-indexing would
-        # produce every frame.
-        np.take(lut, indices, axis=0, out=out)
+        # produce every frame. mode="clip" is used because the default
+        # mode="raise" makes NumPy route the write through an internal
+        # temporary buffer even when out= is supplied; indices is already
+        # uint8-clamped above, so clipping is a no-op here, not a behaviour
+        # change.
+        np.take(lut, indices, axis=0, out=out, mode="clip")
         return out
     return lut[indices]
 

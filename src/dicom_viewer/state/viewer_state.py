@@ -386,6 +386,12 @@ class SliceViewerState:
                 CONTOUR_CACHE_BUILT, roi_number
             )
         )
+        if self.max_cached_phases < 1:
+            logger.warning(
+                f"max_cached_phases must be >= 1, got {self.max_cached_phases}; "
+                "clamping to 1."
+            )
+            self.max_cached_phases = 1
 
     # Every field that has a dedicated ``set_*`` method (and therefore a
     # notification listeners rely on) is listed here, mapped to that
@@ -806,14 +812,9 @@ class SliceViewerState:
         """
         self.rt_dose_image = image
         if image is not None and self.primary_image is not None:
-            resampled = self.get_resampled_image(image, default_pixel_value=0.0)
-            # Cast to float32 once here so the manager can cache a zero-copy
-            # view instead of a separate float32 copy. Dose is typically
-            # float64 after Gy scaling; float32 has ample precision for
-            # display and DVH and halves the resampled volume's footprint.
-            if resampled.GetPixelID() != sitk.sitkFloat32:
-                resampled = sitk.Cast(resampled, sitk.sitkFloat32)
-            self.rt_dose_resampled = resampled
+            self.rt_dose_resampled = self.get_resampled_image(
+                image, default_pixel_value=0.0
+            )
             self.set_blend_alpha(0.5)
         else:
             self.rt_dose_resampled = None
@@ -931,6 +932,12 @@ class SliceViewerState:
         Finds the dose slice whose physical coordinate along *axis* best
         matches the physical coordinate of the current CT slice index.
         Returns an empty array when the CT slice lies outside the dose volume.
+
+        The returned array is a zero-copy view into ``self.rt_dose_image``,
+        valid only as long as this state keeps that image alive (i.e. until
+        ``rt_dose_image``/``rt_dose_resampled`` is replaced or cleared).
+        Callers that need to retain the slice beyond the current call must
+        copy it.
         """
         if self.rt_dose_image is None:
             return np.array([])
@@ -993,14 +1000,28 @@ class SliceViewerState:
         the total phase count — a 10-phase 4DCT no longer builds ten
         primary-grid volumes at load time.
 
+        Breaking change vs. the eager version: listeners of
+        ``"phases_data_loaded"`` previously received ``sitk_image`` entries
+        already resampled to the primary grid; they now receive the raw,
+        un-resampled images as passed in. Code that reads geometry
+        (spacing/origin/size) from ``all_phases_data`` directly must call
+        :meth:`get_resampled_image` itself, or read the resampled volume via
+        :meth:`set_active_phase_as_secondary` / the secondary-image cache
+        instead.
+
         Listeners are notified with ``"phases_data_loaded"``.
         """
         if self.primary_image is None:
             logger.error("Cannot set phases: primary image not loaded.")
             return
 
-        # Store raw entries verbatim; resampling is deferred to activation.
-        self.all_phases_data = dict(phases_data)
+        # Store a shallow copy of each entry (not just of the outer dict) so
+        # a caller mutating its own phases_data afterwards (e.g. replacing
+        # "sitk_image") cannot silently change what this state holds.
+        # Resampling itself is deferred to activation.
+        self.all_phases_data = {
+            phase: dict(series_dict) for phase, series_dict in phases_data.items()
+        }
         self._resampled_phase_cache.clear()
         self.current_phase = None
         self._notify(PHASES_DATA_LOADED, self.all_phases_data)
@@ -1022,9 +1043,11 @@ class SliceViewerState:
             series_dict["sitk_image"],
             transform=series_dict.get("transform"),
         )
+        # OrderedDict inserts new keys at the end already, so no
+        # move_to_end is needed here (unlike the cache-hit path above,
+        # which must explicitly promote an existing entry).
         cache[phase_name] = resampled
-        cache.move_to_end(phase_name)
-        while len(cache) > max(1, self.max_cached_phases):
+        while len(cache) > self.max_cached_phases:
             evicted, _ = cache.popitem(last=False)
             logger.info(f"Evicted resampled phase '{evicted}' from LRU cache.")
         return resampled

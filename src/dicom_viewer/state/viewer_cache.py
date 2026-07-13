@@ -103,10 +103,19 @@ class MaskSliceCache:
         self._volumes: dict[int, np.ndarray] = {}
         # { roi_number: object }. Holds a strong reference to whatever owns
         # the buffer a zero-copy view points into (e.g. the sitk.Image), so
-        # the view can never outlive its backing storage even if no other
-        # reference to that owner survives. Without this, caching a view of
-        # a temporary sitk.Image would leave a dangling view once the
-        # temporary is garbage-collected (silent data corruption).
+        # the view's backing storage is never garbage-collected while the
+        # view is cached, even if no other reference to that owner
+        # survives. Without this, caching a view of a temporary sitk.Image
+        # would leave a dangling view once the temporary is
+        # garbage-collected (silent data corruption).
+        #
+        # This only protects against GC: it assumes the backing sitk.Image
+        # is never mutated in place after being registered here. An
+        # in-place edit that triggers a reallocation (e.g. via a
+        # copy-on-write path) would leave the cached view pointing at the
+        # old buffer without any error. Callers must treat a registered
+        # image as immutable and go through invalidate_roi/set_volume with
+        # a fresh image instead of mutating the one already cached.
         self._backers: dict[int, object] = {}
 
     def set_volume(
@@ -205,8 +214,10 @@ class ViewerCacheManager:
         # Pre-cast float32 view of the resampled dose volume (shared by all axes).
         self.dose_array: np.ndarray | None = None
         # Strong references to the sitk.Images the array views above point
-        # into, so a cached zero-copy view can never dangle even if the
-        # caller drops its own reference to the image.
+        # into, so the caller dropping its own reference to the image can
+        # never GC the buffer out from under a cached view. As with
+        # MaskSliceCache's backers, this assumes the registered image is
+        # not mutated in place afterwards.
         self._primary_backer: sitk.Image | None = None
         self._secondary_backer: sitk.Image | None = None
         self._dose_backer: sitk.Image | None = None
@@ -265,15 +276,21 @@ class ViewerCacheManager:
     def build_dose_array(self, dose_resampled: sitk.Image | None) -> None:
         """Cache a zero-copy float32 NumPy view of the resampled dose volume.
 
-        The caller resamples the dose onto the primary grid and casts it to
-        float32 before passing it here, so this only needs a zero-copy view
-        (``GetArrayViewFromImage`` returns (z, y, x) order). Clears the
-        cache when no resampled dose is available.
+        *dose_resampled* is the dose already resampled onto the primary
+        grid (``GetArrayViewFromImage`` returns (z, y, x) order); it is
+        typically float64 after Gy scaling. It is cast to float32 here if
+        needed (float32 has ample precision for display and DVH and halves
+        the resampled volume's footprint), and the resulting image — the
+        cast when one was needed, otherwise *dose_resampled* itself — is
+        kept as the view's backer. Clears the cache when no resampled dose
+        is available.
         """
         if dose_resampled is None:
             self.dose_array = None
             self._dose_backer = None
             return
+        if dose_resampled.GetPixelID() != sitk.sitkFloat32:
+            dose_resampled = sitk.Cast(dose_resampled, sitk.sitkFloat32)
         self._dose_backer = dose_resampled
         self.dose_array = sitk.GetArrayViewFromImage(dose_resampled)
         logger.info(
