@@ -41,7 +41,7 @@ import dataclasses
 import inspect
 import logging
 import pathlib
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Callable, ClassVar
 
@@ -287,8 +287,18 @@ class SliceViewerState:
     secondary_clim: tuple[float, float] | None = None
 
     # --- 4DCT phases ---
+    # Raw (un-resampled) phase entries keyed by phase name; each value is
+    # the original dict passed to set_all_phases (with "sitk_image" and
+    # "transform"). Phases are resampled to the primary grid lazily on
+    # activation and cached in _resampled_phase_cache, so loading a 10-phase
+    # 4DCT no longer materialises ten primary-grid volumes up front.
     all_phases_data: dict[str, Any] = field(default_factory=dict, repr=False)
     current_phase: str | None = None
+    #: Max number of resampled phase volumes kept in the LRU cache. Raising
+    #: it trades memory for faster repeat-activation of recently viewed
+    #: phases; the default keeps the current and a couple of neighbours
+    #: warm for quick back-and-forth cycling.
+    max_cached_phases: int = 3
 
     # --- RT-DOSE ---
     # Raw dose in LPS (original grid, used for display with correct extent).
@@ -352,6 +362,14 @@ class SliceViewerState:
     # Cache for get_extent() results, keyed by axis name.
     _extent_cache: dict[str, tuple[float, float, float, float]] = field(
         default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+
+    # LRU cache of resampled 4DCT phase volumes, keyed by phase name and
+    # ordered most-recently-used last. Bounded by ``max_cached_phases``.
+    _resampled_phase_cache: "OrderedDict[str, sitk.Image]" = field(
+        default_factory=OrderedDict,
         compare=False,
         repr=False,
     )
@@ -671,6 +689,7 @@ class SliceViewerState:
         self.secondary_clim = None
         self.all_phases_data = {}
         self.current_phase = None
+        self._resampled_phase_cache.clear()
         self.rt_dose_image = None
         self.rt_dose_resampled = None
         self.prescription_dose = None
@@ -787,9 +806,14 @@ class SliceViewerState:
         """
         self.rt_dose_image = image
         if image is not None and self.primary_image is not None:
-            self.rt_dose_resampled = self.get_resampled_image(
-                image, default_pixel_value=0.0
-            )
+            resampled = self.get_resampled_image(image, default_pixel_value=0.0)
+            # Cast to float32 once here so the manager can cache a zero-copy
+            # view instead of a separate float32 copy. Dose is typically
+            # float64 after Gy scaling; float32 has ample precision for
+            # display and DVH and halves the resampled volume's footprint.
+            if resampled.GetPixelID() != sitk.sitkFloat32:
+                resampled = sitk.Cast(resampled, sitk.sitkFloat32)
+            self.rt_dose_resampled = resampled
             self.set_blend_alpha(0.5)
         else:
             self.rt_dose_resampled = None
@@ -842,7 +866,9 @@ class SliceViewerState:
     def get_primary_slice_cached(self, axis: str) -> np.ndarray:
         """Return the current primary image slice from the array cache.
 
-        Falls back to ``get_slice_data`` when the cache has not been built.
+        The returned array is a read-only view in the image's native dtype
+        (float promotion happens later in ``slice_to_rgba``). Falls back to
+        ``get_slice_data`` when the cache has not been built.
         """
         cached = self._cache.get_primary_slice(axis, self.indices[axis])
         if cached is None:
@@ -852,6 +878,7 @@ class SliceViewerState:
     def get_secondary_slice_cached(self, axis: str) -> np.ndarray:
         """Return the current secondary image slice from the array cache.
 
+        The returned array is a read-only view in the image's native dtype.
         Falls back to ``get_slice_data`` when the cache has not been built.
         """
         if self.secondary_image is None:
@@ -951,41 +978,69 @@ class SliceViewerState:
     # 4DCT phases
     # =========================================================
     def set_all_phases(self, phases_data: dict[str, Any]) -> None:
-        """Store all 4DCT phase images, resampled to the primary image grid.
+        """Store all 4DCT phase images for lazy, on-demand resampling.
 
         Each entry in *phases_data* must be a dict containing at minimum:
 
         - ``"sitk_image"`` — the raw phase ``sitk.Image``
         - ``"transform"`` — a ``sitk.Transform | None`` for registration
 
-        After resampling the images are cached in :attr:`all_phases_data` and
-        listeners are notified with ``"phases_data_loaded"``.
+        Unlike an eager approach, the phases are **not** resampled to the
+        primary grid here. Each phase is resampled on first activation via
+        :meth:`set_active_phase_as_secondary` and the result is kept in a
+        small LRU cache (:attr:`max_cached_phases`). This keeps peak memory
+        proportional to the number of *recently viewed* phases rather than
+        the total phase count — a 10-phase 4DCT no longer builds ten
+        primary-grid volumes at load time.
+
+        Listeners are notified with ``"phases_data_loaded"``.
         """
         if self.primary_image is None:
             logger.error("Cannot set phases: primary image not loaded.")
             return
 
-        self.all_phases_data = {
-            phase: {
-                **series_dict,
-                "sitk_image": self.get_resampled_image(
-                    series_dict["sitk_image"],
-                    transform=series_dict.get("transform"),
-                ),
-            }
-            for phase, series_dict in phases_data.items()
-        }
+        # Store raw entries verbatim; resampling is deferred to activation.
+        self.all_phases_data = dict(phases_data)
+        self._resampled_phase_cache.clear()
         self.current_phase = None
         self._notify(PHASES_DATA_LOADED, self.all_phases_data)
 
+    def _get_resampled_phase(self, phase_name: str) -> sitk.Image:
+        """Return the phase volume resampled to the primary grid (LRU cached).
+
+        Resamples on a cache miss and evicts the least-recently-used entry
+        once the cache exceeds :attr:`max_cached_phases`.
+        """
+        cache = self._resampled_phase_cache
+        cached = cache.get(phase_name)
+        if cached is not None:
+            cache.move_to_end(phase_name)  # mark as most-recently-used
+            return cached
+
+        series_dict = self.all_phases_data[phase_name]
+        resampled = self.get_resampled_image(
+            series_dict["sitk_image"],
+            transform=series_dict.get("transform"),
+        )
+        cache[phase_name] = resampled
+        cache.move_to_end(phase_name)
+        while len(cache) > max(1, self.max_cached_phases):
+            evicted, _ = cache.popitem(last=False)
+            logger.info(f"Evicted resampled phase '{evicted}' from LRU cache.")
+        return resampled
+
     def set_active_phase_as_secondary(self, phase_name: str) -> None:
-        """Activate a 4DCT phase as the secondary overlay image."""
+        """Activate a 4DCT phase as the secondary overlay image.
+
+        The phase is resampled to the primary grid on demand (and cached);
+        see :meth:`set_all_phases` for the lazy-resampling rationale.
+        """
         if phase_name not in self.all_phases_data:
             logger.warning(f"Phase '{phase_name}' not found in loaded phases.")
             return
 
         self.current_phase = phase_name
-        phase_image = self.all_phases_data[phase_name]["sitk_image"]
+        phase_image = self._get_resampled_phase(phase_name)
         self.set_secondary_image_data(phase_image)
         self._notify(PHASE_CHANGED, phase_name)
 

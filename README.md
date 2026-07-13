@@ -397,6 +397,23 @@ editing) runs on the main thread.
 decoding is opt-in via `max_workers` because rt-utils does not document
 thread safety.
 
+## Memory model
+
+Image, mask, and dose slice caches are kept as zero-copy views over their
+`sitk.Image` buffers, so loading a CT or adding ROI masks does not duplicate
+the volume in memory. 4DCT phases are resampled to the primary grid **lazily
+on activation**, and only the most recent `max_cached_phases` (default 3)
+resampled volumes are retained:
+
+```python
+# Keep more phases warm for fast back-and-forth cycling, at higher memory:
+state = SliceViewerState(max_cached_phases=5)
+```
+
+Set `max_cached_phases=len(phases)` to eagerly retain every activated phase
+(closest to the old always-resident behaviour), or lower it to minimise peak
+memory when phases are viewed once in sequence.
+
 Ownership note: `DicomViewer.destroy()` shuts the state's thread pool down
 only when the viewer created the state itself. If you inject a shared
 `SliceViewerState`, you own its lifecycle — call `state.close()` yourself

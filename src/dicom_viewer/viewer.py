@@ -238,6 +238,16 @@ class DicomViewer(ttk.Frame):
         self._backgrounds: dict[str, Any] = {axis: None for axis in AXES}
         self.img_displays: dict[str, Any] = {axis: None for axis in AXES}
         self.secondary_img_displays: dict[str, Any] = {axis: None for axis in AXES}
+        # Reused (H, W, 4) uint8 RGBA buffers, one per axis per layer, so
+        # slice_to_rgba does not allocate a fresh buffer on every scroll /
+        # window-level / crosshair-drag frame. Cleared on image switch (the
+        # slice shape changes) so a stale-shaped buffer is never reused.
+        self._primary_rgba_buffers: dict[str, np.ndarray | None] = {
+            axis: None for axis in AXES
+        }
+        self._secondary_rgba_buffers: dict[str, np.ndarray | None] = {
+            axis: None for axis in AXES
+        }
         self.crosshairs: dict[str, dict[str, Any]] = {
             axis: {"h": None, "v": None} for axis in AXES
         }
@@ -593,7 +603,14 @@ class DicomViewer(ttk.Frame):
         window, level = self.state.window_level
         extent = self.state.get_extent(axis)
         clim = (level - window / 2, level + window / 2)
-        rgba = slice_to_rgba(primary_data, clim[0], clim[1], GRAY_LUT)
+        rgba = slice_to_rgba(
+            primary_data,
+            clim[0],
+            clim[1],
+            GRAY_LUT,
+            out=self._primary_rgba_buffers[axis],
+        )
+        self._primary_rgba_buffers[axis] = rgba
 
         # coronal/sagittal: increasing row index = increasing z (inferior -> superior).
         # With origin="lower", large-z (superior) naturally appears at the top.
@@ -649,8 +666,13 @@ class DicomViewer(ttk.Frame):
             self.state.secondary_clim if self.state.secondary_clim is not None else clim
         )
         rgba = slice_to_rgba(
-            secondary_data, effective_clim[0], effective_clim[1], self._secondary_lut
+            secondary_data,
+            effective_clim[0],
+            effective_clim[1],
+            self._secondary_lut,
+            out=self._secondary_rgba_buffers[axis],
         )
+        self._secondary_rgba_buffers[axis] = rgba
 
         disp = self.secondary_img_displays[axis]
         if disp is None:
@@ -775,6 +797,10 @@ class DicomViewer(ttk.Frame):
             ax.set_axis_off()
         self.img_displays = {axis: None for axis in AXES}
         self.secondary_img_displays = {axis: None for axis in AXES}
+        # The slice shape may change with the new image, so drop the reused
+        # RGBA buffers; they are lazily reallocated on the next draw.
+        self._primary_rgba_buffers = {axis: None for axis in AXES}
+        self._secondary_rgba_buffers = {axis: None for axis in AXES}
         # ax.clear() removes all artists from the Axes, so drop the overlay's
         # references here to avoid touching already-removed artists.
         self.isodose.reset()

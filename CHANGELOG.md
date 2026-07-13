@@ -76,7 +76,36 @@ First release prepared for public distribution.
 
 - Test suite (`tests/`) covering the coordinate convention, margin
   directions, boolean operations, LUT/RGBA rendering, the observer
-  pattern, the setter guard, and `StructureSet`.
+  pattern, the setter guard, `StructureSet`, and the memory /
+  performance optimisations below.
+
+### Performance & memory
+
+- **Image / mask / dose caches are now zero-copy views.** The primary and
+  secondary image caches, per-ROI mask volumes, and the resampled dose
+  volume are kept as `GetArrayViewFromImage` views instead of separate
+  copies. Per-slice float promotion happens in `slice_to_rgba` at render
+  time (<0.1 ms per 512x512 slice). This removes the standing float32 copy
+  of the CT (~200 MB for 512x512x200) and the duplicate uint8 copy of every
+  ROI mask (~50 MB each, ~1 GB across 20 ROIs). Each cache keeps a strong
+  reference to the backing `sitk.Image`, so a cached view can never dangle.
+- **Resampled dose stored as float32** (down from float64), halving the
+  resampled dose volume's footprint.
+- **4DCT phases are resampled lazily with an LRU cache.** `set_all_phases`
+  no longer resamples every phase up front; each phase is resampled to the
+  primary grid on first activation and the most-recent
+  `max_cached_phases` (default 3) results are cached. Peak memory now
+  scales with the number of *recently viewed* phases rather than the total
+  phase count.
+- **RGBA render buffers are reused across frames.** `slice_to_rgba` accepts
+  an optional `out` buffer; the viewer keeps one per axis per layer, cutting
+  the per-frame RGBA conversion cost roughly 4x (measured 3.4 ms -> 0.8 ms
+  for a 512x512 slice), which is paid on every scroll / window-level /
+  crosshair-drag frame.
+- **Background contour build skips empty slices.** The mask is projected
+  onto each axis once (a cheap `any()` reduction) so `find_contours` runs
+  only on occupied slices, which are a small fraction of the volume for a
+  typical ROI. Measured ~3x faster build with byte-identical output.
 - GitHub Actions CI: Black, isort, mypy, and pytest on every push / PR.
 - `pyproject.toml` metadata: authors, URLs, classifiers, keywords, and
   Black / isort / pytest tool configuration.
