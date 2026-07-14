@@ -598,6 +598,10 @@ class DicomViewer(ttk.Frame):
                 self.img_displays[axis].set_data(np.zeros((1, 1, 4), dtype=np.uint8))
             if self.secondary_img_displays[axis]:
                 self.secondary_img_displays[axis].set_visible(False)
+            # Without this, the cleared display would not reach the screen
+            # until some unrelated event happened to request a redraw of
+            # this axis.
+            self.drawing_manager.add_request(axis)
             return
 
         window, level = self.state.window_level
@@ -703,7 +707,12 @@ class DicomViewer(ttk.Frame):
     # IsoDose display (delegated to IsoDoseOverlay)
     # ------------------------------------------------------------------
     def _update_dose_display(self, axis: str) -> None:
-        """Public entry point kept for backward compatibility."""
+        """Render the isodose overlay for *axis*'s current slice.
+
+        Thin wrapper around ``self.isodose.update`` that adds the
+        layout-mode guard shared by every per-axis update method in this
+        class (e.g. :meth:`_update_slice_display`).
+        """
         if axis not in self.axs:
             # Not rendered in the current layout mode (e.g. "single").
             return
@@ -894,7 +903,7 @@ class DicomViewer(ttk.Frame):
         # limits changes) continue to invoke _schedule_cache_backgrounds from
         # their own listeners.
 
-    def _on_window_level_changed(self, window: int, level: int) -> None:
+    def _on_window_level_changed(self, window: float, level: float) -> None:
         """Re-window the displayed slices through the RGBA LUT.
 
         With pre-composed RGBA data there is no ``set_clim`` shortcut; the

@@ -66,13 +66,21 @@ class BrushEventHandler:
     # ------------------------------------------------------------------
     def handle_press(self, event) -> None:
         """Begin a paint or erase stroke on left / right button press."""
+        # Guard against a press landing outside any view (e.g. the figure
+        # margin): current_axis is "" there and event.xdata/ydata are None,
+        # so falling through would slice with an empty axis name and raise
+        # KeyError from state.indices[""] a few lines below.
+        axis = self.state.current_axis
+        if not axis or event.xdata is None or event.ydata is None:
+            return
+
         roi_number = self.state.selected_roi_number
         if roi_number is None or roi_number not in self.state.structure_set:
             return
 
         self._is_dragging = True
         self._button = event.button
-        self._active_axis = self.state.current_axis
+        self._active_axis = axis
 
         mask_image = self.state.structure_set.get_mask(roi_number)
         if mask_image is None:
@@ -140,7 +148,15 @@ class BrushEventHandler:
             self._discard_cache()
             return
 
-        roi_number = self.state.selected_roi_number
+        # Commit to the ROI the stroke was actually painted into
+        # (self._cached_roi_number, captured in handle_press), not
+        # state.selected_roi_number as it stands now. If the selected ROI
+        # changes mid-drag (e.g. the host application switches it from
+        # another widget while the mouse button is still held), reading
+        # selected_roi_number here would write this stroke's mask volume
+        # into the *new* ROI's entry, silently overwriting its mask with
+        # the one that was painted for the ROI active at press time.
+        roi_number = self._cached_roi_number
         if roi_number is None or roi_number not in self.state.structure_set:
             self._discard_cache()
             return
@@ -209,6 +225,15 @@ class BrushEventHandler:
             self.brush_circle.set_radius(self.state.brush_size_mm)
 
         self.viewer.drawing_manager.add_request(axis)
+
+    def remove_cursor(self) -> None:
+        """Remove the brush cursor circle from the canvas.
+
+        Public entry point for callers outside this class (e.g.
+        ``ViewerEventHandler.on_leave_axes``) that need to hide the cursor
+        without reaching into a private method.
+        """
+        self._remove_brush_cursor()
 
     def _remove_brush_cursor(self) -> None:
         """Remove the brush cursor circle from the canvas."""

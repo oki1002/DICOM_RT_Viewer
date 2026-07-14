@@ -104,7 +104,7 @@ class ViewerEventHandler:
         """Clear the active axis and hide the brush cursor on exit."""
         self.state.current_axis = ""
         if self.state.brush_tool_active:
-            self.brush_handler._remove_brush_cursor()
+            self.brush_handler.remove_cursor()
             self.viewer.canvas.draw_idle()
 
     # ------------------------------------------------------------------

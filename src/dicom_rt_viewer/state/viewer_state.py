@@ -38,7 +38,6 @@ Performance:
 """
 
 import dataclasses
-import inspect
 import logging
 import pathlib
 from collections import OrderedDict, defaultdict
@@ -258,7 +257,7 @@ class SliceViewerState:
         ``"rt_dose_changed"``              — ``(image: sitk.Image | None)``
         ``"layout_mode_changed"``          — ``(mode: str)``
         ``"index_changed"``                — ``(axis: str, new_idx: int)``
-        ``"window_level_changed"``         — ``(window: int, level: int)``
+        ``"window_level_changed"``         — ``(window: float, level: float)``
         ``"crosshair_changed"``            — ``()``
         ``"crosshair_visible_changed"``    — ``(visible: bool)``
         ``"bounding_boxes_changed"``       — ``(axis: str, bbox: tuple | None)``
@@ -414,33 +413,54 @@ class SliceViewerState:
     }
 
     def __setattr__(self, name: str, value: Any) -> None:
-        """Redirect external direct writes to observable fields through their setter.
+        """Redirect external writes to observable fields through their setter.
 
         Assigning e.g. ``state.blend_alpha = 0.5`` directly (instead of
         calling ``state.set_blend_alpha(0.5)``) would silently skip the
         ``"blend_alpha_changed"`` notification, leaving listeners — and
         therefore the on-screen rendering — out of sync with the new
-        value. This class's own methods still need to write these fields
-        directly without re-entering a setter (the dataclass-generated
-        ``__init__``, and the coordinated multi-field reset performed by
-        :meth:`set_primary_image_data`, both rely on that), so only
-        writes originating from *outside* this module are redirected:
-        the immediate caller's module is inspected, and only a mismatch
-        triggers the redirect.
+        value. Every field with a dedicated ``set_*`` method that guards a
+        notification is listed in ``_OBSERVABLE_SETTERS`` and redirected
+        here to that method.
+
+        The very first write to an observable field is always the
+        dataclass-generated ``__init__`` assigning its default (or a
+        caller-supplied constructor argument), which must be let through
+        unredirected: no listener could be registered yet at that point
+        (there is nothing to notify), and several setters below read the
+        field's current value before deciding whether to notify, which
+        would raise ``AttributeError`` if the field did not exist yet.
+        That first write is identified cheaply by checking whether *name*
+        is already present in ``self.__dict__`` — no per-call stack
+        inspection is needed, unlike a previous version of this method
+        that inspected the caller's frame on every single attribute write
+        (a cost that scaled with every hot path in this class) and broke
+        for any caller one indirection layer removed from this module.
+
+        This class's own ``set_*`` methods write their field with
+        ``object.__setattr__`` directly (bypassing this method entirely)
+        so they never re-enter themselves, and the coordinated multi-field
+        reset in :meth:`set_primary_image_data` does the same for the
+        handful of fields it resets without per-field notification — see
+        the comment there.
+
+        Fields that are *not* in ``_OBSERVABLE_SETTERS`` (e.g.
+        ``secondary_image``, ``rt_dose_image``, ``indices``,
+        ``structure_set``) never take a simple 1:1 ``set_<field>(value)``
+        shape — their setters resample images, rebuild caches, or update
+        more than one field at once — so guarding the bare field name
+        would not add real safety. Those must always be mutated through
+        their dedicated method (``set_secondary_image_data``,
+        ``set_rt_dose_image``, ``set_index``, ``add_contour``, ...), never
+        by direct assignment.
         """
         setter_name = type(self)._OBSERVABLE_SETTERS.get(name)
-        if setter_name is not None:
-            frame = inspect.currentframe()
-            caller_frame = frame.f_back if frame is not None else None
-            caller_module = (
-                caller_frame.f_globals.get("__name__") if caller_frame else None
-            )
-            if caller_module != __name__:
-                if name == "window_level":
-                    getattr(self, setter_name)(value[0], value[1])
-                else:
-                    getattr(self, setter_name)(value)
-                return
+        if setter_name is not None and name in self.__dict__:
+            if name == "window_level":
+                getattr(self, setter_name)(value[0], value[1])
+            else:
+                getattr(self, setter_name)(value)
+            return
         object.__setattr__(self, name, value)
 
     # =========================================================
@@ -685,20 +705,28 @@ class SliceViewerState:
         self.primary_image_dir = image_dir
 
         # Reset all derived state before firing any notifications so that
-        # listeners always see a consistent state.
+        # listeners always see a consistent state. active_contours,
+        # selected_roi_number, blend_alpha, secondary_clim and
+        # prescription_dose are observable fields (see
+        # _OBSERVABLE_SETTERS); this is a coordinated multi-field reset
+        # that must not fire a per-field notification storm mid-reset (the
+        # 3 notifications below already cover it), so those five are
+        # written via object.__setattr__ to bypass their individual
+        # set_* method. Every other field here has no dedicated notifying
+        # setter and is written with a plain assignment as before.
         self.structure_set = StructureSet()
-        self.active_contours = set()
-        self.selected_roi_number = None
+        object.__setattr__(self, "active_contours", set())
+        object.__setattr__(self, "selected_roi_number", None)
         self.bounding_boxes = {axis: None for axis in AXES}
         self.secondary_image = None
-        self.blend_alpha = 1.0
-        self.secondary_clim = None
+        object.__setattr__(self, "blend_alpha", 1.0)
+        object.__setattr__(self, "secondary_clim", None)
         self.all_phases_data = {}
         self.current_phase = None
         self._resampled_phase_cache.clear()
         self.rt_dose_image = None
         self.rt_dose_resampled = None
-        self.prescription_dose = None
+        object.__setattr__(self, "prescription_dose", None)
 
         # Discard every performance cache and cancel in-flight background builds.
         self._cache.clear_all()
@@ -770,16 +798,24 @@ class SliceViewerState:
         """Set the primary-image opacity for the blend slider (0.0-1.0).
 
         A value of ``1.0`` means only the primary image is visible; ``0.0``
-        shows only the secondary image.
+        shows only the secondary image. *alpha* is clamped to ``[0.0, 1.0]``
+        so an out-of-range caller value (e.g. a slightly overshooting drag
+        delta) can never leave ``blend_alpha`` outside the range every
+        consumer of it (the secondary LUT, the isodose fill alpha) assumes.
         """
+        alpha = min(1.0, max(0.0, alpha))
         if self.blend_alpha != alpha:
-            self.blend_alpha = alpha
+            # Bypasses __setattr__'s observable-field redirect: that
+            # redirect exists so *external* writes reach this method, and
+            # this method writing its own field must not re-enter itself.
+            object.__setattr__(self, "blend_alpha", alpha)
             self._notify(BLEND_ALPHA_CHANGED, alpha)
 
     def set_secondary_image_cmap(self, cmap_name: str) -> None:
         """Change the colourmap used to display the secondary image."""
         if self.secondary_image_cmap != cmap_name:
-            self.secondary_image_cmap = cmap_name
+            # See set_blend_alpha for why object.__setattr__ is used here.
+            object.__setattr__(self, "secondary_image_cmap", cmap_name)
             self._notify(SECONDARY_IMAGE_CMAP_CHANGED, cmap_name)
 
     def set_secondary_clim(self, clim: tuple[float, float] | None) -> None:
@@ -788,7 +824,7 @@ class SliceViewerState:
         Set to ``None`` to fall back to the primary window/level.
         """
         if self.secondary_clim != clim:
-            self.secondary_clim = clim
+            object.__setattr__(self, "secondary_clim", clim)
             self._notify(SECONDARY_CLIM_CHANGED, clim)
 
     def set_rt_dose_image(self, image: sitk.Image | None) -> None:
@@ -858,7 +894,7 @@ class SliceViewerState:
         reference for IsoDose rendering.
         """
         if self.prescription_dose != dose_gy:
-            self.prescription_dose = dose_gy
+            object.__setattr__(self, "prescription_dose", dose_gy)
             self._notify(RT_DOSE_CHANGED, self.rt_dose_image)
 
     # =========================================================
@@ -978,7 +1014,7 @@ class SliceViewerState:
                 f"Unknown layout mode: {mode!r}. Expected one of: {LAYOUT_MODES}."
             )
         if self.layout_mode != mode:
-            self.layout_mode = mode
+            object.__setattr__(self, "layout_mode", mode)
             self._notify(LAYOUT_MODE_CHANGED, mode)
 
     # =========================================================
@@ -1078,7 +1114,7 @@ class SliceViewerState:
         HU values are unaffected by float storage.
         """
         if self.window_level != (window, level):
-            self.window_level = (float(window), float(level))
+            object.__setattr__(self, "window_level", (float(window), float(level)))
             self._notify(WINDOW_LEVEL_CHANGED, window, level)
 
     # =========================================================
@@ -1118,7 +1154,7 @@ class SliceViewerState:
     def set_crosshair_visible(self, visible: bool) -> None:
         """Show or hide the crosshair lines in all views."""
         if self.crosshair_visible != visible:
-            self.crosshair_visible = visible
+            object.__setattr__(self, "crosshair_visible", visible)
             self._notify(CROSSHAIR_VISIBLE_CHANGED, visible)
 
     # =========================================================
@@ -1149,10 +1185,10 @@ class SliceViewerState:
     def set_bbox_visible(self, visible: bool) -> None:
         """Show or hide the bounding-box overlay."""
         if self.bbox_visible != visible:
-            self.bbox_visible = visible
+            object.__setattr__(self, "bbox_visible", visible)
             for axis in AXES:
                 self._notify(
-                    "bounding_boxes_changed", axis, self.bounding_boxes.get(axis)
+                    BOUNDING_BOXES_CHANGED, axis, self.bounding_boxes.get(axis)
                 )
 
     def get_bbox_pixel_coords(self, axis: str) -> tuple[int, int, int, int]:
@@ -1209,19 +1245,19 @@ class SliceViewerState:
     def set_active_contours(self, active_roi_numbers: set[int]) -> None:
         """Set which ROIs are displayed."""
         if self.active_contours != active_roi_numbers:
-            self.active_contours = active_roi_numbers
+            object.__setattr__(self, "active_contours", active_roi_numbers)
             self._notify(ACTIVE_CONTOURS_CHANGED, active_roi_numbers)
 
     def set_selected_roi(self, roi_number: int | None) -> None:
         """Set the ROI that the brush tool will edit."""
         if self.selected_roi_number != roi_number:
-            self.selected_roi_number = roi_number
+            object.__setattr__(self, "selected_roi_number", roi_number)
             self._notify(SELECTED_ROI_CHANGED, roi_number)
 
     def set_overlay_contours(self, enable: bool) -> None:
         """Enable or disable filled (semi-transparent) contour overlay."""
         if self.overlay_contours != enable:
-            self.overlay_contours = enable
+            object.__setattr__(self, "overlay_contours", enable)
             # Path objects remain valid; the facecolor is recomputed from
             # to_rgba() inside ContourOverlay.draw() on every redraw.
             self._notify(OVERLAY_CONTOURS_CHANGED, enable)
@@ -1297,19 +1333,19 @@ class SliceViewerState:
     def set_brush_tool_active(self, is_active: bool) -> None:
         """Activate or deactivate the brush editing tool."""
         if self.brush_tool_active != is_active:
-            self.brush_tool_active = is_active
+            object.__setattr__(self, "brush_tool_active", is_active)
             self._notify(BRUSH_TOOL_ACTIVE_CHANGED, is_active)
 
     def set_brush_size_mm(self, size_mm: float) -> None:
         """Set the brush radius in millimetres."""
         if self.brush_size_mm != size_mm:
-            self.brush_size_mm = size_mm
+            object.__setattr__(self, "brush_size_mm", size_mm)
             self._notify(BRUSH_SIZE_MM_CHANGED, size_mm)
 
     def set_brush_fill_inside(self, fill: bool) -> None:
         """Enable or disable hole-filling after each brush stroke."""
         if self.brush_fill_inside != fill:
-            self.brush_fill_inside = fill
+            object.__setattr__(self, "brush_fill_inside", fill)
             self._notify(BRUSH_FILL_INSIDE_CHANGED, fill)
 
     # =========================================================

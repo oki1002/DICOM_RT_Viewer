@@ -139,35 +139,43 @@ def find_reg_matrices(dcm_root_dir: str | pathlib.Path) -> dict[str, np.ndarray]
     Returns:
         ``{referenced_sop_instance_uid: 4x4 ndarray}``
     """
-    _, reg_matrices = _scan_dicom_tree(dcm_root_dir)
+    _, reg_matrices, _ = _scan_dicom_tree(dcm_root_dir)
     return reg_matrices
 
 
 def _scan_dicom_tree(
     dcm_root_dir: str | pathlib.Path,
-) -> tuple[set[pathlib.Path], dict[str, np.ndarray]]:
-    """Walk the directory tree once, collecting both the set of directories
-    containing DICOM files and the REG transformation matrices.
+) -> tuple[set[pathlib.Path], dict[str, np.ndarray], dict[str, str]]:
+    """Walk the directory tree once, collecting the set of directories
+    containing DICOM files, the REG transformation matrices, and each
+    file's SOPInstanceUID.
 
     Previously, "does this directory contain DICOM" (``_dir_has_dicom``) and
     "find REG files" (``find_reg_matrices``) each walked the whole tree
     independently with ``rglob``, ``dcmread``-ing the same file twice (a
     noticeable slowdown on large trees such as 4DCT). Here, a lightweight
     magic-number check via ``pydicom.misc.is_dicom`` is done first, and
-    ``dcmread`` is only called once per file that passes it, gathering both
-    pieces of information in a single pass.
+    ``dcmread`` is only called once per file that passes it, gathering all
+    three pieces of information in a single pass. The SOPInstanceUID map
+    lets :func:`_build_series_info` look up a series' first file's UID
+    (needed for REG-matrix matching) without a second ``dcmread`` of that
+    file.
 
     Args:
         dcm_root_dir: Root directory to search.
 
     Returns:
-        ``(dirs_with_dicom, reg_matrices)``. ``dirs_with_dicom`` is the set
-        of directories directly containing a DICOM file;
-        ``reg_matrices`` is ``{referenced_sop_instance_uid: 4x4 ndarray}``.
+        ``(dirs_with_dicom, reg_matrices, sop_uid_by_path)``.
+        ``dirs_with_dicom`` is the set of directories directly containing a
+        DICOM file; ``reg_matrices`` is
+        ``{referenced_sop_instance_uid: 4x4 ndarray}``; ``sop_uid_by_path``
+        is ``{str(file_path): sop_instance_uid}`` for every DICOM file
+        found.
     """
     root = pathlib.Path(dcm_root_dir)
     dirs_with_dicom: set[pathlib.Path] = set()
     reg_matrices: dict[str, np.ndarray] = {}
+    sop_uid_by_path: dict[str, str] = {}
 
     for file in root.rglob("*"):
         if not file.is_file() or not pydicom.misc.is_dicom(file):
@@ -178,6 +186,9 @@ def _scan_dicom_tree(
             continue
 
         dirs_with_dicom.add(file.parent)
+        sop_uid = ds.get("SOPInstanceUID")
+        if sop_uid is not None:
+            sop_uid_by_path[str(file)] = str(sop_uid)
 
         if (
             ds.get("Modality", "") != "REG"
@@ -208,7 +219,7 @@ def _scan_dicom_tree(
             for ref_item in reg_item.ReferencedImageSequence:
                 reg_matrices[ref_item.ReferencedSOPInstanceUID] = inv_matrix
 
-    return dirs_with_dicom, reg_matrices
+    return dirs_with_dicom, reg_matrices, sop_uid_by_path
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +344,7 @@ def _build_series_info(
     raw_image: sitk.Image,
     file_names: tuple[str, ...],
     reg_matrices: dict[str, np.ndarray],
+    sop_uid_by_path: dict[str, str],
     series_id: str,
 ) -> tuple[str, SeriesInfo]:
     """Build a ``(description, SeriesInfo)`` pair for one series.
@@ -344,7 +356,16 @@ def _build_series_info(
     modality = _get_modality(reader)
     window_level = _get_window_level(reader, image_lps, modality)
 
-    first_uid = pydicom.dcmread(file_names[0], stop_before_pixels=True).SOPInstanceUID
+    # sop_uid_by_path was already populated by the single _scan_dicom_tree
+    # pass over every DICOM file in the tree, so the series' first file's
+    # UID is looked up here instead of dcmread-ing that file a second time.
+    # A path missing from the map (e.g. a series loaded from a directory
+    # that was never scanned) falls back to a direct read.
+    first_uid = sop_uid_by_path.get(file_names[0])
+    if first_uid is None:
+        first_uid = pydicom.dcmread(
+            file_names[0], stop_before_pixels=True
+        ).SOPInstanceUID
     reg_matrix = reg_matrices.get(first_uid)
     if reg_matrix is not None:
         logger.info(f"Applying REG matrix to series '{series_id}'.")
@@ -390,17 +411,18 @@ def load_all_series(dcm_root_dir: str | pathlib.Path) -> dict[str, SeriesInfo]:
 
     logger.info(f"Searching for DICOM series in '{dcm_root_dir}'.")
     # Walk the directory tree once, gathering directories that contain
-    # DICOM files together with the REG matrices (previously
-    # find_reg_matrices and _dir_has_dicom each walked the whole tree
-    # independently, dcmread-ing the same file twice).
-    dirs_with_dicom, reg_matrices = _scan_dicom_tree(dcm_root_dir)
+    # DICOM files, the REG matrices, and each file's SOPInstanceUID
+    # (previously find_reg_matrices and _dir_has_dicom each walked the
+    # whole tree independently, dcmread-ing the same file twice, and
+    # _build_series_info dcmread-ing a series' first file a third time).
+    dirs_with_dicom, reg_matrices, sop_uid_by_path = _scan_dicom_tree(dcm_root_dir)
     candidate_dirs = sorted(dirs_with_dicom)
 
     for dcm_dir in candidate_dirs:
         for sid in reader.GetGDCMSeriesIDs(str(dcm_dir)):
             raw_image, file_names = _read_series(reader, dcm_dir, sid)
             description, info = _build_series_info(
-                reader, raw_image, file_names, reg_matrices, sid
+                reader, raw_image, file_names, reg_matrices, sop_uid_by_path, sid
             )
 
             if description in series_dict:
@@ -459,6 +481,14 @@ def load_rt_dose(dose_path: str | pathlib.Path) -> sitk.Image:
 
     Returns:
         ``sitk.Image`` with float32 voxel values in Gy, oriented to LPS.
+
+    Caution:
+        Z-spacing for a multi-frame RT-DOSE file is derived by SimpleITK's
+        DICOM reader from ``GridFrameOffsetVector`` (0x3004, 0x000C). That
+        derivation assumes uniform frame spacing; verify against a known
+        dose file when integrating a new treatment-planning system's
+        export, since a non-uniform offset vector is technically valid
+        DICOM but not something this loader detects or corrects for.
 
     Raises:
         ValueError: If the file is not an RT-DOSE DICOM.

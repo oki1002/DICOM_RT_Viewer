@@ -200,14 +200,28 @@ class ViewerCacheManager:
     See :meth:`build_contour_paths_for_roi` for thread-safety notes.
     """
 
-    def __init__(self, on_contour_built: Callable[[int], None]) -> None:
+    #: Default number of worker threads for the background contour-path
+    #: build pool. Overridable per instance via the ``max_workers``
+    #: constructor argument (e.g. to trade CPU headroom for faster
+    #: multi-ROI RT-STRUCT loads on a machine with more cores, or to
+    #: reduce it on a constrained deployment).
+    _DEFAULT_CONTOUR_WORKERS: int = 8
+
+    def __init__(
+        self,
+        on_contour_built: Callable[[int], None],
+        max_workers: int = _DEFAULT_CONTOUR_WORKERS,
+    ) -> None:
         """Initialise the manager.
 
         Args:
             on_contour_built: Callback receiving the roi_number whose contour
                 paths finished building. Invoked from a background thread.
+            max_workers: Number of worker threads for the background
+                contour-path build pool (see :meth:`_get_executor`).
         """
         self._on_contour_built = on_contour_built
+        self._max_workers = max_workers
 
         self.primary_array: np.ndarray | None = None
         self.secondary_array: np.ndarray | None = None
@@ -401,7 +415,7 @@ class ViewerCacheManager:
         """Return the thread pool used for contour path builds (created lazily)."""
         if self._contour_executor is None:
             self._contour_executor = ThreadPoolExecutor(
-                max_workers=8, thread_name_prefix="contour_cache"
+                max_workers=self._max_workers, thread_name_prefix="contour_cache"
             )
         return self._contour_executor
 
@@ -413,6 +427,9 @@ class ViewerCacheManager:
         Any existing in-flight task is cancelled before the new one is
         submitted. On completion the ``on_contour_built`` callback fires so
         the viewer can issue a redraw request.
+
+        See :meth:`build_contour_paths_for_roi` for the thread-safety
+        argument covering its unlocked writes into ``contour_path_cache``.
         """
         self.cancel_contour_build(roi_number)
         generation = self._generation

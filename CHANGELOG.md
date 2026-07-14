@@ -4,6 +4,109 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.7.1] — 2026
+
+### Fixed
+
+- **Brush tool could crash when a stroke started outside any view.**
+  `BrushEventHandler.handle_press` now guards against an empty
+  `current_axis` / missing `event.xdata`/`event.ydata` (e.g. a click that
+  lands on the figure margin between the MPR panels) instead of falling
+  through to `state.indices[""]`, which raised `KeyError`.
+- **Brush strokes could commit to the wrong ROI if the selected ROI
+  changed mid-drag.** `BrushEventHandler.handle_release` now commits the
+  stroke to the ROI that was selected when the stroke started
+  (`self._cached_roi_number`, captured in `handle_press`) instead of
+  re-reading `state.selected_roi_number` at release time. Previously, if
+  a host application switched the selected ROI from another widget while
+  the mouse button was still held down, the stroke's mask volume — built
+  for the *original* ROI — was written into the *new* ROI's entry,
+  silently overwriting its mask.
+- **`SliceViewerState._notify`'s docstring cross-reference was stale**
+  (`_KNOWN_EVENTS`, a name that no longer exists) in `events.py`; it now
+  points at `ALL_EVENTS`.
+- **`set_bbox_visible` bypassed the event-name constant**, notifying with
+  the string literal `"bounding_boxes_changed"` instead of
+  `events.BOUNDING_BOXES_CHANGED`, defeating the typo-detection this
+  project's event constants exist for. It now uses the constant like
+  every other `set_*` method.
+- **`window_level_changed`'s documented callback signature said
+  `(window: int, level: int)`** in both `SliceViewerState`'s event table
+  and `DicomViewer._on_window_level_changed`'s annotation, while the
+  values have been floats (for MR percentile windows and dose-in-Gy
+  windowing) since window/level was changed to float storage. Both are
+  now annotated `(window: float, level: float)`.
+- **`DicomViewer._update_slice_display`'s empty-primary-data branch never
+  requested a redraw.** Clearing the display when the primary slice is
+  empty (e.g. after the image is unloaded) now calls
+  `drawing_manager.add_request(axis)` like every other branch of this
+  method, so the cleared view reaches the screen immediately instead of
+  waiting for an unrelated redraw to happen to touch the same axis.
+
+### Changed
+
+- **`SliceViewerState.__setattr__` no longer inspects the caller's stack
+  frame.** The observable-field write guard (redirecting e.g.
+  `state.blend_alpha = 0.5` through `set_blend_alpha` so the change
+  notification isn't silently skipped) previously walked
+  `inspect.currentframe()` and compared the caller's `__name__` on
+  *every* attribute write, including hot paths such as
+  `crosshair_pos` updates during a drag. It now uses a cheap `name in
+  self.__dict__` check instead: the very first write to an observable
+  field is always the dataclass-generated `__init__` populating its
+  default, which is let through directly since no listener could be
+  registered yet; every later write is an update and is redirected. Each
+  `set_*` method writes its own field with `object.__setattr__` so it
+  never re-enters itself, and the coordinated multi-field reset in
+  `set_primary_image_data` does the same for the fields it intentionally
+  resets without a per-field notification. Behaviour is unchanged (see
+  `TestSetattrGuard` / `TestObserverPattern` in
+  `tests/test_viewer_state.py`, which still pass unmodified); this is a
+  cost and robustness fix, not an API change.
+- **`SliceViewerState.set_blend_alpha` now clamps its input to
+  `[0.0, 1.0]`** instead of accepting and storing an out-of-range value
+  verbatim, matching the range every consumer of `blend_alpha` (the
+  secondary-image LUT, the isodose fill alpha) already assumes.
+- **`ViewerCacheManager`'s background contour-build thread pool size is
+  now configurable** via a `max_workers` constructor argument (default
+  unchanged at 8, now named `ViewerCacheManager._DEFAULT_CONTOUR_WORKERS`)
+  instead of a value hard-coded at the `ThreadPoolExecutor` call site.
+- **`BrushEventHandler` exposes a public `remove_cursor()`** so callers
+  outside the class (`ViewerEventHandler.on_leave_axes`) no longer reach
+  into the private `_remove_brush_cursor()`.
+- **`io._scan_dicom_tree` now also collects each file's SOPInstanceUID**
+  in its single existing pass over the DICOM tree. `_build_series_info`
+  uses that map to resolve a series' first file's UID (needed for
+  REG-matrix matching) instead of a second `pydicom.dcmread` of that file
+  — one fewer file read per loaded series, on top of the read-sharing
+  `_scan_dicom_tree` already did for REG-file discovery.
+- **`roi_operations._shift_accumulate` no longer copies the input array**
+  when the requested shift is 0 voxels (a margin of `0.0` mm in a given
+  direction). `apply_margin` calls it once per anatomical direction (up
+  to 6 times), and a zero-margin direction previously still paid for a
+  full-volume copy that was immediately discarded.
+
+### Documentation
+
+- `DicomViewer._update_dose_display`'s docstring incorrectly called it a
+  "public entry point kept for backward compatibility"; it is a private
+  method and is now documented as the thin per-axis wrapper around
+  `IsoDoseOverlay.update` that it actually is.
+- `io.load_rt_dose` now notes that z-spacing for a multi-frame RT-DOSE
+  file is derived from `GridFrameOffsetVector` under an assumption of
+  uniform frame spacing, and recommends verifying against a known dose
+  file when integrating a new treatment-planning system's export.
+
+## [0.7.0] — 2026
+
+### Changed
+
+- Completed the package-rename migration to `dicom_rt_viewer` started in
+  0.6.0 (see the 0.6.0 entry below for the `dicom_viewer` →
+  `dicom_rt_viewer` import-name change and the `dicom-rt-viewer`
+  distribution rename): remaining internal references, packaging
+  metadata, and documentation were brought in line with the new name.
+
 ## [0.6.0] — 2026
 
 ### Fixed

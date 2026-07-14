@@ -54,4 +54,4 @@ from .state.viewer_state import RoiEntry, SliceViewerState, StructureSet
 from .viewer import DicomViewer
 
 __all__ = ["DicomViewer", "RoiEntry", "SliceViewerState", "StructureSet"]
-__version__ = "0.7.0"
+__version__ = "0.7.1"

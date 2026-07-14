@@ -8,7 +8,7 @@ writing string literals turns that typo into an ``AttributeError`` /
 
 This module is the single source of truth for every event name and is also
 used by :meth:`SliceViewerState._notify` to validate that only known event
-types are ever broadcast (see ``_KNOWN_EVENTS`` there).
+types are ever broadcast (see ``ALL_EVENTS`` below).
 """
 
 from typing import Final

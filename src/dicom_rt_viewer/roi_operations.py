@@ -228,7 +228,13 @@ def _shift_accumulate(
         Resulting mask (bool).
     """
     if n_voxels == 0:
-        return arr.copy()
+        # No shift to apply. apply_margin() only ever reads the returned
+        # array before reassigning its own `result` reference to it (never
+        # mutates in place), so it is safe to hand back the input array
+        # itself instead of paying for a full-volume copy that would just
+        # be discarded — up to 6 of these per apply_margin() call, one per
+        # anatomical direction with a zero margin.
+        return arr
 
     # Erosion of the `positive` face needs the window on the opposite side
     # of the one dilation uses (see docstring), so flip here.
