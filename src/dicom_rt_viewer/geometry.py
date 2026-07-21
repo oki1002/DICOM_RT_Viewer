@@ -40,6 +40,35 @@ AXIS_TO_NUMPY_DIM: dict[str, int] = {"axial": 0, "coronal": 1, "sagittal": 2}
 AXIS_TO_XYZ_DIM: dict[str, int] = {"axial": 2, "coronal": 1, "sagittal": 0}
 
 
+def resample_binary_mask(mask: sitk.Image, reference: sitk.Image) -> sitk.Image:
+    """Resample a binary mask onto *reference*'s geometry with an identity transform.
+
+    Uses nearest-neighbour interpolation to preserve binary (0/1) values,
+    with 0 filled outside *mask*'s original extent. This is the exact
+    resampler configuration needed by :func:`dicom_rt_viewer.rtstruct_io.\
+resample_mask_to_original_space` (LPS-space mask -> original DICOM
+    geometry) and :func:`dicom_rt_viewer.roi_operations.boolean_operation`
+    (aligning the second operand onto the first mask's grid); centralising
+    it here keeps both call sites from drifting apart if the
+    configuration ever needs to change.
+
+    Args:
+        mask: Binary mask to resample (sitk.Image).
+        reference: Image whose geometry (size, spacing, origin, direction)
+            the result is resampled onto.
+
+    Returns:
+        *mask* resampled onto *reference*'s grid.
+    """
+    resampler = sitk.ResampleImageFilter()
+    resampler.SetReferenceImage(reference)
+    resampler.SetInterpolator(sitk.sitkNearestNeighbor)
+    resampler.SetDefaultPixelValue(0)
+    resampler.SetTransform(sitk.Transform(3, sitk.sitkIdentity))
+    result: sitk.Image = resampler.Execute(mask)
+    return result
+
+
 def slice_along_axis(arr: np.ndarray, axis: str, index: int) -> np.ndarray:
     """Return the 2-D slice of *arr* at *index* along *axis*.
 

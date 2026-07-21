@@ -4,6 +4,66 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] — 2026
+
+### Changed
+
+- **BREAKING:** `DicomViewer.state` has been renamed to
+  `DicomViewer.viewer_state`. As an instance attribute, `state` shadowed
+  the inherited `ttk.Frame.state()` method (used to query/set Tk widget
+  states such as `"disabled"`); any host application code that called
+  `viewer.state()` expecting the Tk behaviour would instead hit the
+  `SliceViewerState` object and raise `TypeError`. Update call sites from
+  `viewer.state.xxx` to `viewer.viewer_state.xxx`; the `state=` constructor
+  keyword argument to `DicomViewer(...)` is unaffected.
+
+### Fixed
+
+- **`SliceViewerState.set_active_contours` could silently skip its change
+  notification.** The set passed in was stored by reference. If a caller
+  kept its own reference to that set and later mutated it in place (e.g.
+  via `add`/`discard`) instead of calling `set_active_contours` again, the
+  next real call would compare the stored set against that
+  already-mutated same object, find them equal, and skip the
+  notification — desynchronising listeners from the actual active-ROI
+  set. `set_active_contours` now stores a defensive copy
+  (`set(active_roi_numbers)`) instead of the caller's set.
+- **`BrushEventHandler.handle_release` could raise if the primary image
+  was cleared mid-stroke.** If a host application called
+  `state.set_primary_image_data(None)` (e.g. from an unrelated event)
+  while a brush stroke was still in progress, `handle_release` would call
+  `new_mask.CopyInformation(self.state.primary_image)` with a `None`
+  reference and raise `AttributeError` instead of finishing cleanly. It
+  now discards the in-progress stroke when the primary image has gone
+  missing, matching the existing empty-mask-volume guard just above it.
+- **Duplicated nearest-neighbour mask-resampling code in `rtstruct_io.py`
+  and `roi_operations.py` could drift apart.**
+  `resample_mask_to_original_space` and `boolean_operation` each built an
+  identical `sitk.ResampleImageFilter` (reference image, nearest-neighbour
+  interpolator, zero default pixel value, identity transform) inline.
+  Both now call a single shared `geometry.resample_binary_mask(mask,
+  reference)` helper.
+
+### Performance
+
+- **`BrushEventHandler` no longer converts the same cursor position from
+  physical to pixel coordinates twice per motion event.** `handle_motion`
+  already computes the pixel position to decide whether the cursor moved
+  enough to paint; previously `_paint_at` recomputed the identical
+  conversion instead of reusing that result. `_paint_at` now accepts an
+  optional pre-computed `center_px` and `handle_motion` passes its own
+  result through, halving the conversions per motion event during a
+  stroke.
+- **`BrushEventHandler._physical_to_slice_pixel` no longer re-slices the
+  mask volume on every motion event during an active stroke.** The
+  in-plane slice shape it needs is fixed for the duration of a stroke —
+  the same property `_stroke_radii_px` already relied on — so it is now
+  cached once in `handle_press` (`_stroke_slice_shape`) and reused for
+  every motion event of that stroke, instead of calling
+  `state.get_slice_data` again on each one. Lookups outside an active
+  stroke (e.g. cursor-preview positioning before the first press) still
+  read the shape fresh, since no stroke-scoped cache is valid then.
+
 ## [0.7.1] — 2026
 
 ### Fixed

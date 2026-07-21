@@ -35,6 +35,11 @@ class BrushEventHandler:
         self._last_pos_px: tuple[int, int] | None = None
         self._stroke_mask: np.ndarray | None = None
         self._stroke_radii_px: tuple[float, float] | None = None
+        # 2-D (rows, cols) shape of the slice being painted, cached once at
+        # press time (like _stroke_radii_px) so _physical_to_slice_pixel
+        # does not re-slice the mask volume on every motion event during
+        # a stroke.
+        self._stroke_slice_shape: tuple[int, int] | None = None
 
         self._cached_mask_volume: np.ndarray | None = None
         self._cached_roi_number: int | None = None
@@ -90,6 +95,10 @@ class BrushEventHandler:
             return
         mask_slice = self.state.get_slice_data(mask_image, self._active_axis)
         self._stroke_mask = np.zeros_like(mask_slice, dtype=bool)
+        # Cached alongside _stroke_radii_px below: the in-plane shape is
+        # fixed for the duration of the stroke, so _physical_to_slice_pixel
+        # can reuse it instead of re-slicing the mask on every motion event.
+        self._stroke_slice_shape = mask_slice.shape
 
         self._cached_mask_volume = sitk.GetArrayFromImage(mask_image)
         self._cached_roi_number = roi_number
@@ -131,9 +140,12 @@ class BrushEventHandler:
             if current != self._active_axis:
                 return
             pos_px = self._physical_to_slice_pixel(current, (event.xdata, event.ydata))
-            if pos_px == self._last_pos_px:
+            if pos_px is None or pos_px == self._last_pos_px:
                 return
-            self._paint_at(event, interpolate=True)
+            # Pass the pixel position already computed above into
+            # _paint_at instead of letting it recompute the same
+            # physical-to-pixel conversion a second time for this event.
+            self._paint_at(event, interpolate=True, center_px=pos_px)
 
     def handle_release(self, event) -> None:
         """Commit the completed stroke to the ROI mask volume."""
@@ -168,6 +180,22 @@ class BrushEventHandler:
             # there is nothing to commit.
             self._discard_cache()
             return
+
+        # The primary image can be cleared mid-stroke (e.g. a host
+        # application calls state.set_primary_image_data(None) from an
+        # unrelated event while the mouse button is still held). The
+        # cached mask volume was built for an image that no longer
+        # exists, so committing it here would call
+        # ``new_mask.CopyInformation(None)`` and raise. Discard the
+        # in-progress stroke instead of committing stale geometry.
+        if self.state.primary_image is None:
+            self._discard_cache()
+            self._stroke_mask = None
+            self._stroke_radii_px = None
+            self._stroke_slice_shape = None
+            self._last_pos_px = None
+            return
+
         slobj = self._make_slobj(axis)
 
         if self._button == 1 and self.state.brush_fill_inside:
@@ -180,6 +208,7 @@ class BrushEventHandler:
         self._last_pos_px = None
         self._stroke_mask = None
         self._stroke_radii_px = None
+        self._stroke_slice_shape = None
         self._discard_cache()
 
     def handle_scroll(self, event) -> None:
@@ -255,17 +284,33 @@ class BrushEventHandler:
     # ------------------------------------------------------------------
     # Painting logic
     # ------------------------------------------------------------------
-    def _paint_at(self, event, interpolate: bool = False) -> None:
+    def _paint_at(
+        self,
+        event,
+        interpolate: bool = False,
+        center_px: tuple[int, int] | None = None,
+    ) -> None:
         """Apply the brush at the current event position.
 
         When *interpolate* is True, intermediate positions between the
         previous and current pixel are also painted to avoid gaps in the stroke.
+
+        Args:
+            event: The originating matplotlib mouse event.
+            interpolate: See above.
+            center_px: Pixel position already converted from
+                ``(event.xdata, event.ydata)`` by the caller (e.g.
+                ``handle_motion``, which needs the same conversion to
+                decide whether to paint at all). When ``None``, this method
+                computes it itself — used by ``handle_press``, which has
+                no prior conversion to reuse.
         """
         axis = self.state.current_axis
         if not (axis and event.xdata is not None and event.ydata is not None):
             return
 
-        center_px = self._physical_to_slice_pixel(axis, (event.xdata, event.ydata))
+        if center_px is None:
+            center_px = self._physical_to_slice_pixel(axis, (event.xdata, event.ydata))
         if center_px is None:
             return
 
@@ -415,15 +460,31 @@ class BrushEventHandler:
         """Map a physical coordinate pair to the nearest pixel in the slice.
 
         Returns ``None`` if no ROI is selected or the slice is degenerate.
+
+        During an active stroke on *axis*, the in-plane shape cached at
+        press time (``_stroke_slice_shape``) is reused instead of
+        re-slicing the mask volume via ``get_slice_data`` on every call —
+        this is invoked on every motion event of a drag, so avoiding a
+        fresh ``sitk`` slice extraction there matters the same way it does
+        for ``_get_brush_radii_px``. Outside an active stroke (e.g. a
+        cursor-preview lookup before the first press) the shape is still
+        read fresh, since no stroke-scoped cache is guaranteed valid then.
         """
         roi_number = self.state.selected_roi_number
         if roi_number is None:
             return None
-        mask_image = self.state.structure_set.get_mask(roi_number)
-        if mask_image is None:
-            return None
-        mask_slice = self.state.get_slice_data(mask_image, axis)
-        slice_shape = mask_slice.shape
+
+        if (
+            self._is_dragging
+            and axis == self._active_axis
+            and (self._stroke_slice_shape is not None)
+        ):
+            slice_shape = self._stroke_slice_shape
+        else:
+            mask_image = self.state.structure_set.get_mask(roi_number)
+            if mask_image is None:
+                return None
+            slice_shape = self.state.get_slice_data(mask_image, axis).shape
         if slice_shape[0] < 2 or slice_shape[1] < 2:
             return None
         x_min, x_max, y_min, y_max = self.state.get_extent(axis)

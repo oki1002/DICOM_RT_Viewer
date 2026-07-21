@@ -1243,7 +1243,18 @@ class SliceViewerState:
     # ROI / contour management (delegates to StructureSet + notifies)
     # =========================================================
     def set_active_contours(self, active_roi_numbers: set[int]) -> None:
-        """Set which ROIs are displayed."""
+        """Set which ROIs are displayed.
+
+        *active_roi_numbers* is copied into a new ``set`` before being
+        stored. Without this, a caller that kept its own reference to the
+        set it passed in (and later mutated it in place, e.g. via
+        ``add``/``discard``, instead of calling this method again) would
+        silently desynchronise this state from its listeners: the next
+        call here would compare the stored set against that same,
+        already-mutated object and find them equal, so the change-detection
+        check above would skip the notification entirely.
+        """
+        active_roi_numbers = set(active_roi_numbers)
         if self.active_contours != active_roi_numbers:
             object.__setattr__(self, "active_contours", active_roi_numbers)
             self._notify(ACTIVE_CONTOURS_CHANGED, active_roi_numbers)

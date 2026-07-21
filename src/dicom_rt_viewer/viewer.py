@@ -147,6 +147,17 @@ class DicomViewer(ttk.Frame):
         viewer = DicomViewer(parent, state=state)
         viewer.pack(fill="both", expand=True)
         viewer.load_ct("/path/to/dicom")
+
+    Note:
+        The shared :class:`SliceViewerState` is exposed as
+        :attr:`viewer_state`, not ``state``. ``ttk.Frame`` already defines
+        a ``state()`` method (used to query/set Tk widget states such as
+        ``"disabled"``); an attribute literally named ``state`` would
+        shadow it, so any host application code that happened to call
+        ``viewer.state()`` for the inherited Tk behaviour would break with
+        a confusing ``TypeError`` instead. Code written against
+        ``dicom-rt-viewer`` < 0.8 that used ``viewer.state`` must be
+        updated to ``viewer.viewer_state``.
     """
 
     # Idle time (ms) before the background cache is rebuilt after scrolling stops.
@@ -174,11 +185,10 @@ class DicomViewer(ttk.Frame):
         self._owns_state = state is None
         if state is None:
             state = SliceViewerState()
-        # Note: this attribute intentionally shadows the inherited
-        # ``ttk.Frame.state()`` method; the explicit annotation tells type
-        # checkers the attribute type instead of the inherited callable,
-        # and the targeted ignore acknowledges the deliberate shadowing.
-        self.state: SliceViewerState = state  # type: ignore[assignment]
+        # Named "viewer_state" (not "state") so this attribute never
+        # shadows the inherited ``ttk.Frame.state()`` method; see the
+        # class docstring's Note for the rationale.
+        self.viewer_state: SliceViewerState = state
 
         # --- Figure / Canvas / Toolbar ---
         kw: dict = {
@@ -204,7 +214,7 @@ class DicomViewer(ttk.Frame):
             orient=tk.HORIZONTAL,
             command=self._on_blend_slider_change,
         )
-        self.blend_slider.set(self.state.blend_alpha)
+        self.blend_slider.set(self.viewer_state.blend_alpha)
         self.blend_slider.pack(side=tk.LEFT, padx=5)
         self._blend_frame.pack_forget()
 
@@ -220,11 +230,11 @@ class DicomViewer(ttk.Frame):
         # DvhPanel is created before LayoutManager because LayoutManager
         # needs a DVH-axes styling callback to apply when it creates the
         # DVH Axes for the "mpr" layout.
-        self.dvh_panel = DvhPanel(self.state)
+        self.dvh_panel = DvhPanel(self.viewer_state)
         self.layout = LayoutManager(self.fig, style_dvh_axes=self.dvh_panel.style_axes)
         # Honour the layout mode already present on an injected state,
         # rather than silently overriding it with a hardcoded default.
-        self._layout_mode: str = self.state.layout_mode
+        self._layout_mode: str = self.viewer_state.layout_mode
         self.axs, self._dvh_ax = self.layout.build(self._layout_mode)
 
         # Reentrancy guard for _on_draw: _cache_backgrounds() below fires a
@@ -262,17 +272,18 @@ class DicomViewer(ttk.Frame):
         # collaborator; the viewer only forwards lifecycle events and
         # wires the resulting artists into the blit layer.
         self.contours = ContourOverlay(
-            self.state, on_artists_changed=self._invalidate_blit_cache
+            self.viewer_state, on_artists_changed=self._invalidate_blit_cache
         )
         self.isodose = IsoDoseOverlay(
-            self.state, on_artists_changed=self._invalidate_blit_cache
+            self.viewer_state, on_artists_changed=self._invalidate_blit_cache
         )
 
         # RGBA lookup table for the secondary display. Rebuilt whenever the
         # secondary colormap or the blend alpha changes; the alpha is baked
         # into the table (see render.py).
         self._secondary_lut = build_cmap_lut(
-            self.state.secondary_image_cmap, alpha=1.0 - self.state.blend_alpha
+            self.viewer_state.secondary_image_cmap,
+            alpha=1.0 - self.viewer_state.blend_alpha,
         )
 
         # Same-slice early-exit: record the last rendered slice index per axis.
@@ -284,7 +295,7 @@ class DicomViewer(ttk.Frame):
         self._blit_artists_cache: dict[str, list | None] = {axis: None for axis in AXES}
 
         # --- Event handling ---
-        self.event_handler = ViewerEventHandler(self.state, self)
+        self.event_handler = ViewerEventHandler(self.viewer_state, self)
         self._bind_events()
 
         self.canvas.draw()
@@ -339,21 +350,21 @@ class DicomViewer(ttk.Frame):
             (CONTOUR_CACHE_BUILT, self._on_contour_cache_built),
         ]
         for event_name, callback in self._state_listeners:
-            self.state.add_listener(event_name, callback)
+            self.viewer_state.add_listener(event_name, callback)
 
     # ------------------------------------------------------------------
     # Shared helpers
     # ------------------------------------------------------------------
     def _has_valid_primary_image(self) -> bool:
         """Return ``True`` if a non-empty primary image is loaded."""
-        img = self.state.primary_image
+        img = self.viewer_state.primary_image
         return img is not None and img.GetNumberOfPixels() > 0
 
     def _should_show_blend_slider(self) -> bool:
         """Return ``True`` if either a secondary image or RT-DOSE is loaded."""
         return (
-            self.state.secondary_image is not None
-            or self.state.rt_dose_image is not None
+            self.viewer_state.secondary_image is not None
+            or self.viewer_state.rt_dose_image is not None
         )
 
     def _update_blend_slider_visibility(self) -> None:
@@ -590,8 +601,8 @@ class DicomViewer(ttk.Frame):
             # Not rendered in the current layout mode (e.g. "single").
             return
 
-        primary_data = self.state.get_primary_slice_cached(axis)
-        secondary_data = self.state.get_secondary_slice_cached(axis)
+        primary_data = self.viewer_state.get_primary_slice_cached(axis)
+        secondary_data = self.viewer_state.get_secondary_slice_cached(axis)
 
         if primary_data.size == 0:
             if self.img_displays[axis]:
@@ -604,8 +615,8 @@ class DicomViewer(ttk.Frame):
             self.drawing_manager.add_request(axis)
             return
 
-        window, level = self.state.window_level
-        extent = self.state.get_extent(axis)
+        window, level = self.viewer_state.window_level
+        extent = self.viewer_state.get_extent(axis)
         clim = (level - window / 2, level + window / 2)
         rgba = slice_to_rgba(
             primary_data,
@@ -667,7 +678,9 @@ class DicomViewer(ttk.Frame):
 
         # Use per-secondary clim override when set (e.g. RT-DOSE in Gy).
         effective_clim = (
-            self.state.secondary_clim if self.state.secondary_clim is not None else clim
+            self.viewer_state.secondary_clim
+            if self.viewer_state.secondary_clim is not None
+            else clim
         )
         rgba = slice_to_rgba(
             secondary_data,
@@ -700,7 +713,8 @@ class DicomViewer(ttk.Frame):
     def _rebuild_secondary_lut(self) -> None:
         """Recreate the secondary LUT from the current cmap and blend alpha."""
         self._secondary_lut = build_cmap_lut(
-            self.state.secondary_image_cmap, alpha=1.0 - self.state.blend_alpha
+            self.viewer_state.secondary_image_cmap,
+            alpha=1.0 - self.viewer_state.blend_alpha,
         )
 
     # ------------------------------------------------------------------
@@ -738,7 +752,7 @@ class DicomViewer(ttk.Frame):
             return
 
         ax = self.axs[axis]
-        show = self.state.crosshair_visible and pos is not None
+        show = self.viewer_state.crosshair_visible and pos is not None
         cache_invalidated = False
 
         if show and pos is not None:
@@ -834,7 +848,7 @@ class DicomViewer(ttk.Frame):
             for axis in AXES:
                 self._update_slice_display(axis)
             self._update_all_contours()
-            self.state.refresh_crosshair()
+            self.viewer_state.refresh_crosshair()
             self._cache_backgrounds()
             # _cache_backgrounds() ends by compositing through
             # _redraw_axis_blit(), which pushes only self.axs[axis].bbox to
@@ -891,7 +905,7 @@ class DicomViewer(ttk.Frame):
 
         self._update_slice_display(axis)
         self.contours.draw(axis, self.axs[axis])
-        if self.state.rt_dose_resampled is not None:
+        if self.viewer_state.rt_dose_resampled is not None:
             self.isodose.update(axis, self.axs[axis])
         # NOTE: _schedule_cache_backgrounds is intentionally NOT called here.
         # Slice scrolling only updates artists that already live in the blit
@@ -918,18 +932,22 @@ class DicomViewer(ttk.Frame):
 
     def _on_crosshair_changed(self) -> None:
         for axis in AXES:
-            self._update_crosshairs_display(axis, self.state.crosshair_pos.get(axis))
+            self._update_crosshairs_display(
+                axis, self.viewer_state.crosshair_pos.get(axis)
+            )
         # Crosshairs live in the blit layer so they always update immediately,
         # even while a background cache rebuild is pending.
         # Skip add_request when the crosshair is hidden to avoid unnecessary blits.
-        if not self.state.crosshair_visible:
+        if not self.viewer_state.crosshair_visible:
             return
         for axis in AXES:
             self.drawing_manager.add_request(axis)
 
     def _on_crosshair_visible_changed(self, visible: bool) -> None:
         for axis in AXES:
-            self._update_crosshairs_display(axis, self.state.crosshair_pos.get(axis))
+            self._update_crosshairs_display(
+                axis, self.viewer_state.crosshair_pos.get(axis)
+            )
         self._schedule_cache_backgrounds()
 
     def _on_bounding_boxes_changed(self, axis: str, bbox: tuple | None) -> None:
@@ -951,7 +969,7 @@ class DicomViewer(ttk.Frame):
             self.bbox_patches[axis] = patch
             self._invalidate_blit_cache(axis)
 
-        if bbox is None or not self.state.bbox_visible:
+        if bbox is None or not self.viewer_state.bbox_visible:
             if patch.get_visible():
                 patch.set_visible(False)
                 self._invalidate_blit_cache(axis)
@@ -1019,17 +1037,17 @@ class DicomViewer(ttk.Frame):
         # Dmax was already computed once in state.set_rt_dose_image(), so
         # only the cached value needs to be read here (avoids rescanning
         # every voxel on each prescription-dose change).
-        fallback_ref_dose = self.state.get_dose_fallback_ref_gy()
+        fallback_ref_dose = self.viewer_state.get_dose_fallback_ref_gy()
         self.isodose.set_fallback_ref_dose(fallback_ref_dose)
 
-        if self.state.rt_dose_resampled is None:
+        if self.viewer_state.rt_dose_resampled is None:
             for axis in AXES:
                 self.isodose.clear(axis)
 
-        if self.state.primary_image is not None:
+        if self.viewer_state.primary_image is not None:
             for axis in self.axs:
                 self.isodose.update(axis, self.axs[axis])
-            self.state.refresh_crosshair()
+            self.viewer_state.refresh_crosshair()
             # Deferred scheduling suppresses a full re-render on rapid
             # updates such as prescription-dose changes.
             self._schedule_cache_backgrounds()
@@ -1043,7 +1061,7 @@ class DicomViewer(ttk.Frame):
         self._rebuild_layout(mode)
 
     def _on_blend_slider_change(self, value: str) -> None:
-        self.state.set_blend_alpha(float(value))
+        self.viewer_state.set_blend_alpha(float(value))
 
     # ------------------------------------------------------------------
     # Layout management
@@ -1066,11 +1084,11 @@ class DicomViewer(ttk.Frame):
         if self._has_valid_primary_image():
             for axis in AXES:
                 self._update_slice_display(axis)
-            if self.state.rt_dose_resampled is not None:
+            if self.viewer_state.rt_dose_resampled is not None:
                 for axis in self.axs:
                     self.isodose.update(axis, self.axs[axis])
             self._update_all_contours()
-            self.state.refresh_crosshair()
+            self.viewer_state.refresh_crosshair()
             self._cache_backgrounds()
 
         # Restore blend slider visibility after rebuild.
@@ -1106,7 +1124,7 @@ class DicomViewer(ttk.Frame):
         """
         self.isodose.set_custom_levels(list(gy_pairs) if gy_pairs else [])
 
-        if self.state.rt_dose_resampled is not None:
+        if self.viewer_state.rt_dose_resampled is not None:
             for axis in self.axs:
                 self.isodose.update(axis, self.axs[axis])
                 self.drawing_manager.add_request(axis)
@@ -1135,7 +1153,7 @@ class DicomViewer(ttk.Frame):
         # no state change can reach this (now dying) widget. Essential for
         # injected states, which outlive the viewer.
         for event_name, callback in self._state_listeners:
-            self.state.remove_listener(event_name, callback)
+            self.viewer_state.remove_listener(event_name, callback)
         self._state_listeners.clear()
         if self._cache_rebuild_after_id is not None:
             try:
@@ -1144,7 +1162,7 @@ class DicomViewer(ttk.Frame):
                 pass
             self._cache_rebuild_after_id = None
         if self._owns_state:
-            self.state.close()
+            self.viewer_state.close()
         super().destroy()
 
     def load_ct(self, ct_dir: Any, window: tuple[int, int] | None = None) -> None:
@@ -1158,19 +1176,19 @@ class DicomViewer(ttk.Frame):
             window: Optional ``(window_width, window_level)`` override.
         """
         info = load_dcm_series(ct_dir)
-        self.state.set_primary_image_data(info["sitk_image"], image_dir=ct_dir)
+        self.viewer_state.set_primary_image_data(info["sitk_image"], image_dir=ct_dir)
         ww, wl = window if window is not None else info["window_level"]
-        self.state.set_window_level(float(ww), float(wl))
+        self.viewer_state.set_window_level(float(ww), float(wl))
 
     def set_window(self, vmin: float, vmax: float) -> None:
         """Set the display window using vmin / vmax HU values."""
-        self.state.set_window_level(vmax - vmin, (vmax + vmin) / 2)
+        self.viewer_state.set_window_level(vmax - vmin, (vmax + vmin) / 2)
 
     def get_slice(self, view: str) -> np.ndarray:
         """Return the current 2-D slice for *view* as a NumPy array."""
-        if self.state.primary_image is None:
+        if self.viewer_state.primary_image is None:
             raise RuntimeError("No image loaded.")
-        return self.state.get_slice_data(self.state.primary_image, view)
+        return self.viewer_state.get_slice_data(self.viewer_state.primary_image, view)
 
     def add_overlay_artist(self, axis: str, artist) -> None:
         """Register a host-application artist to survive the blit cycle.
@@ -1217,7 +1235,7 @@ class DicomViewer(ttk.Frame):
         so callers can index them unconditionally; each is ``None`` when
         no primary image is loaded, rather than the key being absent.
         """
-        img = self.state.primary_image
+        img = self.viewer_state.primary_image
         if img is None:
             return {"spacing": None, "origin": None, "size": None}
         return {

@@ -29,6 +29,8 @@ import pydicom
 import SimpleITK as sitk
 from rt_utils import RTStructBuilder
 
+from .geometry import resample_binary_mask
+
 logger = logging.getLogger(__name__)
 
 
@@ -97,13 +99,7 @@ def resample_mask_to_original_space(
         Mask resampled to the geometry of *original_image*, using
         nearest-neighbour interpolation to preserve binary values.
     """
-    resampler = sitk.ResampleImageFilter()
-    resampler.SetReferenceImage(original_image)
-    resampler.SetInterpolator(sitk.sitkNearestNeighbor)
-    resampler.SetDefaultPixelValue(0)
-    resampler.SetTransform(sitk.Transform(3, sitk.sitkIdentity))
-    resampled: sitk.Image = resampler.Execute(lps_mask)
-    return resampled
+    return resample_binary_mask(lps_mask, original_image)
 
 
 # ---------------------------------------------------------------------------

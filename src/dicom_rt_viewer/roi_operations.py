@@ -19,6 +19,8 @@ import numpy as np
 import SimpleITK as sitk
 from scipy.ndimage import gaussian_filter, maximum_filter1d, minimum_filter1d
 
+from .geometry import resample_binary_mask
+
 logger = logging.getLogger(__name__)
 
 
@@ -321,12 +323,7 @@ def boolean_operation(
     """
     # Resample mask_b onto mask_a's grid using nearest-neighbour to
     # preserve binary values.
-    resampler = sitk.ResampleImageFilter()
-    resampler.SetReferenceImage(mask_a)
-    resampler.SetInterpolator(sitk.sitkNearestNeighbor)
-    resampler.SetDefaultPixelValue(0)
-    resampler.SetTransform(sitk.Transform(3, sitk.sitkIdentity))
-    mask_b_aligned = resampler.Execute(mask_b)
+    mask_b_aligned = resample_binary_mask(mask_b, mask_a)
 
     arr_a = sitk.GetArrayFromImage(mask_a).astype(bool)
     arr_b = sitk.GetArrayFromImage(mask_b_aligned).astype(bool)
