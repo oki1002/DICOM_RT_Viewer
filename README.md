@@ -109,8 +109,21 @@ viewer.pack(fill="both", expand=True)
 
 viewer.load_ct("/path/to/dicom/folder")
 
+
+def on_close() -> None:
+    # The state was created here, so closing it is this application's job;
+    # see "Memory model" below.
+    state.close()
+    root.destroy()
+
+
+root.protocol("WM_DELETE_WINDOW", on_close)
 root.mainloop()
 ```
+
+If you let the viewer create its own state (`DicomViewer(root)` with no
+`state=` argument), `viewer.destroy()` closes it for you and no explicit
+`close()` is needed.
 
 ## Loading a DICOM series
 
@@ -227,7 +240,8 @@ combined = boolean_operation(mask_a, mask_b, BooleanOp.UNION)
 # Select the ROI to edit
 state.set_selected_roi(roi_number)
 
-# Activate the brush (left-click paints, right-click erases)
+# Activate the brush (left-click paints, right-click erases;
+# any other mouse button is ignored)
 state.set_brush_tool_active(True)
 
 # Adjust brush size (mm) — also controllable with the mouse wheel
@@ -413,7 +427,17 @@ memory when phases are viewed once in sequence.
 Ownership note: `DicomViewer.destroy()` shuts the state's thread pool down
 only when the viewer created the state itself. If you inject a shared
 `SliceViewerState`, you own its lifecycle — call `state.close()` yourself
-when the last user of it is gone.
+when the last user of it is gone, typically from your window-close handler
+as shown in Quick start. The pool's workers are non-daemon threads, so
+skipping this can keep the interpreter alive until any queued contour build
+finishes.
+
+Because the slice caches are zero-copy views, a `sitk.Image` handed to
+`add_contour` / `update_contour_properties` must be treated as immutable
+from that point on. Mutating it in place bypasses cache invalidation, and an
+edit that reallocates its buffer leaves the cached view pointing at freed
+memory. Build a new image and pass it through `update_contour_properties`
+instead.
 
 ## Development
 

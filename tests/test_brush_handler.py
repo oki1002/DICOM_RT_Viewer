@@ -111,3 +111,57 @@ class TestHandleReleaseCommitsToStrokeRoi:
         # started, not the one selected when the button was released.
         assert painted_a.any()
         assert not painted_b.any()
+
+
+class TestOnlyPaintAndEraseButtonsAct:
+    """Any button other than left (paint) / right (erase) must be ignored.
+
+    ``_apply_stroke_to_mask_cached`` used to treat "not the paint button" as
+    erase, so a middle-click while the brush was active silently subtracted
+    from the selected ROI.
+    """
+
+    @staticmethod
+    def _filled_state() -> tuple[SliceViewerState, int]:
+        state = SliceViewerState()
+        img = sitk.GetImageFromArray(np.zeros((4, 16, 16), dtype=np.int16))
+        img.SetSpacing((1.0, 1.0, 1.0))
+        state.set_primary_image_data(img)
+        filled = sitk.GetImageFromArray(np.ones((4, 16, 16), dtype=np.uint8))
+        filled.CopyInformation(img)
+        roi_number = state.add_contour("PTV", filled, "#ff0000")
+        state.set_selected_roi(roi_number)
+        state.set_brush_size_mm(3.0)
+        state.current_axis = "axial"
+        return state, roi_number
+
+    @staticmethod
+    def _voxel_count(state: SliceViewerState, roi_number: int) -> int:
+        mask = state.structure_set.get_mask(roi_number)
+        assert mask is not None
+        return int(sitk.GetArrayFromImage(mask).sum())
+
+    def _stroke(self, button: int) -> tuple[int, int]:
+        state, roi_number = self._filled_state()
+        before = self._voxel_count(state, roi_number)
+        handler = BrushEventHandler(state, _FakeViewer())
+        handler.activate()
+        event = _Event(xdata=8.0, ydata=8.0, button=button)
+        handler.handle_press(event)
+        handler.handle_release(event)
+        return before, self._voxel_count(state, roi_number)
+
+    def test_middle_click_leaves_the_mask_untouched(self) -> None:
+        before, after = self._stroke(button=2)
+        assert after == before
+
+    def test_middle_click_does_not_start_a_drag(self) -> None:
+        state, _ = self._filled_state()
+        handler = BrushEventHandler(state, _FakeViewer())
+        handler.activate()
+        handler.handle_press(_Event(xdata=8.0, ydata=8.0, button=2))
+        assert handler._is_dragging is False
+
+    def test_right_click_still_erases(self) -> None:
+        before, after = self._stroke(button=3)
+        assert after < before

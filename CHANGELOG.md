@@ -4,6 +4,84 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.8.1] — 2026
+
+### Fixed
+
+- **The brush tool erased the mask on any mouse button other than
+  left-click.** `_apply_stroke_to_mask_cached` selected between paint and
+  erase with `if button == 1: ... else: ...`, and neither
+  `ViewerEventHandler.on_press` nor `BrushEventHandler.handle_press`
+  filtered the button beforehand. A middle-click — easy to trigger
+  accidentally with a scroll-wheel press while the brush was active —
+  therefore took the erase branch and silently subtracted a brush-sized
+  region from the selected ROI, contrary to the documented "left-click
+  paints, right-click erases" behaviour. `handle_press` now ignores any
+  button other than those two, and both branches are matched explicitly so
+  an unexpected value leaves the mask untouched.
+- **`active_contours` handed its internal set to listeners, which then
+  changed underneath them.** `set_active_contours` copied the caller's set
+  before storing it (fixed in 0.8.0) but passed that same stored object to
+  `active_contours_changed` listeners, and `delete_contour` discarded from
+  it in place. A listener that retained the set it was given would see its
+  contents change with no further notification — the mirror image of the
+  aliasing bug 0.8.0 fixed. Listeners now receive a copy, and
+  `delete_contour` deactivates through `set_active_contours`.
+- **`delete_contour` fired `active_contours_changed` even when the deleted
+  ROI was not active.** Routing deactivation through `set_active_contours`
+  means the event is now emitted only when the active set actually changes.
+- **Assigning a malformed value to `state.window_level` raised `IndexError`
+  from inside `__setattr__`.** The observable-field redirect unpacked the
+  assigned value positionally, so `state.window_level = (300,)` failed with
+  a traceback pointing into the state machinery rather than at the
+  assignment. Such assignments now raise `ValueError` naming the field and
+  the expected shape.
+
+### Changed
+
+- **`DicomViewer` is now imported lazily.** `dicom_rt_viewer/__init__.py`
+  imported `viewer` — and therefore Tkinter and a Matplotlib GUI backend —
+  at package import time, so `from dicom_rt_viewer import events` or using
+  the pure-SimpleITK helpers in `io`, `rtstruct_io` and `roi_operations`
+  required a working Tkinter build. Those modules can now be imported and
+  used from a headless process. `dicom_rt_viewer.DicomViewer` continues to
+  work unchanged; it is resolved on first attribute access via a module
+  `__getattr__`.
+- **4DCT phase storage and lazy resampling moved into a `PhaseManager`
+  collaborator** (`dicom_rt_viewer.state.phase_manager`), following the same
+  split already applied to the performance caches in `ViewerCacheManager`.
+  `SliceViewerState` keeps its phase API (`set_all_phases`,
+  `set_active_phase_as_secondary`, `all_phases_data`, `current_phase`,
+  `max_cached_phases`) and remains the only thing that emits
+  `phases_data_loaded` / `phase_changed`; behaviour is unchanged.
+  `all_phases_data` and `current_phase` are now read-only properties rather
+  than dataclass fields, so they are no longer accepted as constructor
+  keyword arguments — passing them at construction never had any effect,
+  since `set_all_phases` is the only supported way to load phases.
+- **`load_rt_dose` scales the dose with SimpleITK instead of NumPy.** The
+  previous `GetArrayFromImage` → multiply → `GetImageFromArray` round-trip
+  allocated two extra full-size copies of the dose volume and then had to
+  restore the geometry with `CopyInformation`; it is now a `Cast` followed
+  by a `Multiply`.
+- **Minimum NumPy raised from 1.24 to 1.26.** 1.26 is the first release
+  supporting Python 3.12, which this package already requires, so the old
+  lower bound described a combination that could never be installed.
+
+### Documentation
+
+- The Quick start example injected a `SliceViewerState` without ever
+  closing it. Since `DicomViewer.destroy()` deliberately does not close an
+  injected state, the example leaked the contour-build thread pool — whose
+  workers are non-daemon and can delay interpreter shutdown. It now closes
+  the state from a window-close handler, and `DicomViewer.destroy()`
+  documents the host's responsibility (and logs a debug message when a
+  viewer is destroyed with an injected state).
+- Documented that a `sitk.Image` passed to `add_contour` /
+  `update_contour_properties` must be treated as immutable afterwards,
+  since the slice caches keep zero-copy views over its buffer.
+- Noted in the brush-tool section that buttons other than left and right
+  are ignored.
+
 ## [0.8.0] — 2026
 
 ### Changed

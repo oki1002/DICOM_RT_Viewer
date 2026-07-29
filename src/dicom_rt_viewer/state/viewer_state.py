@@ -40,7 +40,7 @@ Performance:
 import dataclasses
 import logging
 import pathlib
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Callable, ClassVar
 
@@ -83,6 +83,7 @@ from ..geometry import (
     compute_extent,
     slice_along_axis,
 )
+from .phase_manager import PhaseManager
 from .viewer_cache import ContourPathCache, MaskSliceCache, ViewerCacheManager
 
 logger = logging.getLogger(__name__)
@@ -286,18 +287,14 @@ class SliceViewerState:
     secondary_clim: tuple[float, float] | None = None
 
     # --- 4DCT phases ---
-    # Raw (un-resampled) phase entries keyed by phase name; each value is
-    # the original dict passed to set_all_phases (with "sitk_image" and
-    # "transform"). Phases are resampled to the primary grid lazily on
-    # activation and cached in _resampled_phase_cache, so loading a 10-phase
-    # 4DCT no longer materialises ten primary-grid volumes up front.
-    all_phases_data: dict[str, Any] = field(default_factory=dict, repr=False)
-    current_phase: str | None = None
     #: Max number of resampled phase volumes kept in the LRU cache. Raising
     #: it trades memory for faster repeat-activation of recently viewed
     #: phases; the default keeps the current and a couple of neighbours
     #: warm for quick back-and-forth cycling.
     max_cached_phases: int = 3
+    # Phase storage and lazy primary-grid resampling live in PhaseManager;
+    # this class only exposes the phase API and fires the events.
+    _phases: "PhaseManager" = field(init=False, repr=False, compare=False)
 
     # --- RT-DOSE ---
     # Raw dose in LPS (original grid, used for display with correct extent).
@@ -365,20 +362,13 @@ class SliceViewerState:
         repr=False,
     )
 
-    # LRU cache of resampled 4DCT phase volumes, keyed by phase name and
-    # ordered most-recently-used last. Bounded by ``max_cached_phases``.
-    _resampled_phase_cache: "OrderedDict[str, sitk.Image]" = field(
-        default_factory=OrderedDict,
-        compare=False,
-        repr=False,
-    )
-
     def __post_init__(self) -> None:
-        """Create the performance-cache collaborator.
+        """Create the collaborators this state delegates to.
 
-        Background contour-build completion is received from
-        ViewerCacheManager via callback and translated into the
-        "contour_cache_built" event.
+        ViewerCacheManager owns every performance cache; background
+        contour-build completion arrives from it via callback and is
+        translated into the "contour_cache_built" event. PhaseManager owns
+        4DCT phase storage and their lazy resampling onto the primary grid.
         """
         self._cache = ViewerCacheManager(
             on_contour_built=lambda roi_number: self._notify(
@@ -391,6 +381,12 @@ class SliceViewerState:
                 "clamping to 1."
             )
             self.max_cached_phases = 1
+        self._phases = PhaseManager(
+            resample=lambda image, transform: self.get_resampled_image(
+                image, transform=transform
+            ),
+            max_cached=lambda: self.max_cached_phases,
+        )
 
     # Every field that has a dedicated ``set_*`` method (and therefore a
     # notification listeners rely on) is listed here, mapped to that
@@ -411,6 +407,10 @@ class SliceViewerState:
         "brush_size_mm": "set_brush_size_mm",
         "brush_fill_inside": "set_brush_fill_inside",
     }
+
+    # Observable fields whose setter takes the assigned value as separate
+    # arguments rather than as a single object (see _call_unpacked_setter).
+    _UNPACKED_SETTER_FIELDS: ClassVar[frozenset[str]] = frozenset({"window_level"})
 
     def __setattr__(self, name: str, value: Any) -> None:
         """Redirect external writes to observable fields through their setter.
@@ -456,12 +456,44 @@ class SliceViewerState:
         """
         setter_name = type(self)._OBSERVABLE_SETTERS.get(name)
         if setter_name is not None and name in self.__dict__:
-            if name == "window_level":
-                getattr(self, setter_name)(value[0], value[1])
+            if name in type(self)._UNPACKED_SETTER_FIELDS:
+                self._call_unpacked_setter(name, setter_name, value)
             else:
                 getattr(self, setter_name)(value)
             return
         object.__setattr__(self, name, value)
+
+    def _call_unpacked_setter(self, name: str, setter_name: str, value: Any) -> None:
+        """Invoke a setter that takes the assigned value as separate arguments.
+
+        ``window_level`` is stored as a 2-tuple but its setter takes
+        ``(window, level)``, so the assigned value has to be unpacked.
+        Unpacking blindly turns a malformed assignment such as
+        ``state.window_level = (300,)`` into an ``IndexError`` raised from
+        inside ``__setattr__``, which points nowhere near the offending
+        line; validate the shape first and report it as a ``ValueError``
+        naming the field and what was expected.
+
+        Args:
+            name:        Name of the field being assigned.
+            setter_name: Name of the setter method to call.
+            value:       The assigned value, expected to be a 2-element sequence.
+
+        Raises:
+            ValueError: If *value* is not a sequence of exactly two items.
+        """
+        try:
+            unpacked = tuple(value)
+        except TypeError:
+            raise ValueError(
+                f"{name} must be assigned a sequence of 2 values, got {value!r}."
+            ) from None
+        if len(unpacked) != 2:
+            raise ValueError(
+                f"{name} must be assigned exactly 2 values, got {len(unpacked)}: "
+                f"{value!r}."
+            )
+        getattr(self, setter_name)(*unpacked)
 
     # =========================================================
     # Performance-cache accessors
@@ -579,12 +611,13 @@ class SliceViewerState:
         """Convert a physical LPS coordinate along *axis* to the nearest index."""
         if self.primary_image is None:
             return 0
+        xyz_dim = _AXIS_TO_XYZ_DIM[axis]
         phys = list(self._current_physical_point())
-        phys[_AXIS_TO_XYZ_DIM[axis]] = coord
+        phys[xyz_dim] = coord
+        # TransformPhysicalPointToIndex returns (x, y, z), matching the LPS
+        # dimension order, so the axis' own xyz dimension indexes it directly.
         idx_point = self.primary_image.TransformPhysicalPointToIndex(phys)
-        numpy_idx = _AXIS_TO_NUMPY_DIM[axis]
-        max_idx = self.primary_image.GetSize()[::-1][numpy_idx] - 1
-        return int(np.clip(idx_point[2 - numpy_idx], 0, max_idx))
+        return int(np.clip(idx_point[xyz_dim], 0, self.get_max_index(axis)))
 
     def get_max_index(self, axis: str) -> int:
         """Return the maximum valid slice index for *axis*."""
@@ -721,9 +754,7 @@ class SliceViewerState:
         self.secondary_image = None
         object.__setattr__(self, "blend_alpha", 1.0)
         object.__setattr__(self, "secondary_clim", None)
-        self.all_phases_data = {}
-        self.current_phase = None
-        self._resampled_phase_cache.clear()
+        self._phases.clear()
         self.rt_dose_image = None
         self.rt_dose_resampled = None
         object.__setattr__(self, "prescription_dose", None)
@@ -1020,6 +1051,22 @@ class SliceViewerState:
     # =========================================================
     # 4DCT phases
     # =========================================================
+    @property
+    def all_phases_data(self) -> dict[str, Any]:
+        """The loaded 4DCT phase entries, keyed by phase name.
+
+        Read-only view onto :class:`~dicom_rt_viewer.state.phase_manager.PhaseManager`.
+        The ``"sitk_image"`` in each entry is the raw image as passed to
+        :meth:`set_all_phases`, *not* resampled to the primary grid; see
+        that method for the rationale.
+        """
+        return self._phases.all_phases
+
+    @property
+    def current_phase(self) -> str | None:
+        """Name of the 4DCT phase currently shown as the secondary image."""
+        return self._phases.current_phase
+
     def set_all_phases(self, phases_data: dict[str, Any]) -> None:
         """Store all 4DCT phase images for lazy, on-demand resampling.
 
@@ -1028,22 +1075,20 @@ class SliceViewerState:
         - ``"sitk_image"`` — the raw phase ``sitk.Image``
         - ``"transform"`` — a ``sitk.Transform | None`` for registration
 
-        Unlike an eager approach, the phases are **not** resampled to the
-        primary grid here. Each phase is resampled on first activation via
+        The phases are **not** resampled to the primary grid here. Each
+        phase is resampled on first activation via
         :meth:`set_active_phase_as_secondary` and the result is kept in a
         small LRU cache (:attr:`max_cached_phases`). This keeps peak memory
         proportional to the number of *recently viewed* phases rather than
-        the total phase count — a 10-phase 4DCT no longer builds ten
+        the total phase count — a 10-phase 4DCT does not build ten
         primary-grid volumes at load time.
 
-        Breaking change vs. the eager version: listeners of
-        ``"phases_data_loaded"`` previously received ``sitk_image`` entries
-        already resampled to the primary grid; they now receive the raw,
+        Listeners of ``"phases_data_loaded"`` receive the raw,
         un-resampled images as passed in. Code that reads geometry
-        (spacing/origin/size) from ``all_phases_data`` directly must call
-        :meth:`get_resampled_image` itself, or read the resampled volume via
-        :meth:`set_active_phase_as_secondary` / the secondary-image cache
-        instead.
+        (spacing/origin/size) from :attr:`all_phases_data` directly must
+        call :meth:`get_resampled_image` itself, or read the resampled
+        volume via :meth:`set_active_phase_as_secondary` / the
+        secondary-image cache instead.
 
         Listeners are notified with ``"phases_data_loaded"``.
         """
@@ -1051,42 +1096,8 @@ class SliceViewerState:
             logger.error("Cannot set phases: primary image not loaded.")
             return
 
-        # Store a shallow copy of each entry (not just of the outer dict) so
-        # a caller mutating its own phases_data afterwards (e.g. replacing
-        # "sitk_image") cannot silently change what this state holds.
-        # Resampling itself is deferred to activation.
-        self.all_phases_data = {
-            phase: dict(series_dict) for phase, series_dict in phases_data.items()
-        }
-        self._resampled_phase_cache.clear()
-        self.current_phase = None
+        self._phases.set_all(phases_data)
         self._notify(PHASES_DATA_LOADED, self.all_phases_data)
-
-    def _get_resampled_phase(self, phase_name: str) -> sitk.Image:
-        """Return the phase volume resampled to the primary grid (LRU cached).
-
-        Resamples on a cache miss and evicts the least-recently-used entry
-        once the cache exceeds :attr:`max_cached_phases`.
-        """
-        cache = self._resampled_phase_cache
-        cached = cache.get(phase_name)
-        if cached is not None:
-            cache.move_to_end(phase_name)  # mark as most-recently-used
-            return cached
-
-        series_dict = self.all_phases_data[phase_name]
-        resampled = self.get_resampled_image(
-            series_dict["sitk_image"],
-            transform=series_dict.get("transform"),
-        )
-        # OrderedDict inserts new keys at the end already, so no
-        # move_to_end is needed here (unlike the cache-hit path above,
-        # which must explicitly promote an existing entry).
-        cache[phase_name] = resampled
-        while len(cache) > self.max_cached_phases:
-            evicted, _ = cache.popitem(last=False)
-            logger.info(f"Evicted resampled phase '{evicted}' from LRU cache.")
-        return resampled
 
     def set_active_phase_as_secondary(self, phase_name: str) -> None:
         """Activate a 4DCT phase as the secondary overlay image.
@@ -1094,12 +1105,11 @@ class SliceViewerState:
         The phase is resampled to the primary grid on demand (and cached);
         see :meth:`set_all_phases` for the lazy-resampling rationale.
         """
-        if phase_name not in self.all_phases_data:
+        if not self._phases.has_phase(phase_name):
             logger.warning(f"Phase '{phase_name}' not found in loaded phases.")
             return
 
-        self.current_phase = phase_name
-        phase_image = self._get_resampled_phase(phase_name)
+        phase_image = self._phases.activate(phase_name)
         self.set_secondary_image_data(phase_image)
         self._notify(PHASE_CHANGED, phase_name)
 
@@ -1253,11 +1263,16 @@ class SliceViewerState:
         call here would compare the stored set against that same,
         already-mutated object and find them equal, so the change-detection
         check above would skip the notification entirely.
+
+        Listeners receive their own copy for the mirror-image reason: the
+        stored set is mutated by later state changes, so handing out the
+        internal object would let a listener that retains it observe the
+        active-ROI set change underneath it with no notification.
         """
         active_roi_numbers = set(active_roi_numbers)
         if self.active_contours != active_roi_numbers:
             object.__setattr__(self, "active_contours", active_roi_numbers)
-            self._notify(ACTIVE_CONTOURS_CHANGED, active_roi_numbers)
+            self._notify(ACTIVE_CONTOURS_CHANGED, set(active_roi_numbers))
 
     def set_selected_roi(self, roi_number: int | None) -> None:
         """Set the ROI that the brush tool will edit."""
@@ -1311,13 +1326,19 @@ class SliceViewerState:
         return roi_numbers
 
     def delete_contour(self, roi_number: int) -> None:
-        """Remove the ROI identified by *roi_number* from the StructureSet."""
+        """Remove the ROI identified by *roi_number* from the StructureSet.
+
+        Deactivation goes through :meth:`set_active_contours` rather than
+        discarding from :attr:`active_contours` in place. An in-place
+        discard mutates the very set previously handed to listeners, and
+        fires ``active_contours_changed`` even when the deleted ROI was not
+        active; routing through the setter keeps both concerns correct.
+        """
         self.structure_set.remove(roi_number)
-        self.active_contours.discard(roi_number)
+        self.set_active_contours(self.active_contours - {roi_number})
         self._cache.cancel_contour_build(roi_number)
         self._cache.invalidate_roi(roi_number)
         self._notify(ALL_CONTOURS_CHANGED, self.structure_set)
-        self._notify(ACTIVE_CONTOURS_CHANGED, self.active_contours)
 
     def update_contour_properties(self, roi_number: int, props: dict[str, Any]) -> None:
         """Update properties (``name``, ``mask``, ``color``) for *roi_number*."""

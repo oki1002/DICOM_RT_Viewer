@@ -164,3 +164,66 @@ class TestStructureSet:
         ss.add("PTV(2)", self._mask(), "#ff0000")
         assert ss.generate_unique_name("PTV") == "PTV(3)"
         assert ss.generate_unique_name("CTV") == "CTV"
+
+
+class TestActiveContourNotificationIsolation:
+    """Listeners must not be handed the state's own active-contour set."""
+
+    def _state_with_two_rois(self) -> tuple[SliceViewerState, int, int]:
+        state = SliceViewerState()
+        ct = sitk.GetImageFromArray(np.zeros((4, 8, 8), dtype=np.int16))
+        state.set_primary_image_data(ct)
+        mask = sitk.GetImageFromArray(np.ones((4, 8, 8), dtype=np.uint8))
+        mask.CopyInformation(ct)
+        return (
+            state,
+            state.add_contour("A", mask, "#f00"),
+            state.add_contour("B", mask, "#0f0"),
+        )
+
+    def test_listener_receives_a_copy(self) -> None:
+        state, roi_a, roi_b = self._state_with_two_rois()
+        received: list[set[int]] = []
+        state.add_listener(events.ACTIVE_CONTOURS_CHANGED, received.append)
+
+        state.set_active_contours({roi_a, roi_b})
+
+        assert received[-1] == {roi_a, roi_b}
+        assert received[-1] is not state.active_contours
+
+    def test_delete_does_not_mutate_a_previously_notified_set(self) -> None:
+        state, roi_a, roi_b = self._state_with_two_rois()
+        received: list[set[int]] = []
+        state.add_listener(events.ACTIVE_CONTOURS_CHANGED, received.append)
+        state.set_active_contours({roi_a, roi_b})
+        snapshot = received[-1]
+
+        state.delete_contour(roi_a)
+
+        assert snapshot == {roi_a, roi_b}
+        assert state.active_contours == {roi_b}
+
+    def test_deleting_an_inactive_roi_emits_no_active_change(self) -> None:
+        state, roi_a, roi_b = self._state_with_two_rois()
+        state.set_active_contours({roi_a})
+        received: list[set[int]] = []
+        state.add_listener(events.ACTIVE_CONTOURS_CHANGED, received.append)
+
+        state.delete_contour(roi_b)
+
+        assert received == []
+
+
+class TestWindowLevelAssignmentValidation:
+    """Direct assignment to window_level reports its own shape errors."""
+
+    def test_valid_pair_is_redirected_to_the_setter(self) -> None:
+        state = SliceViewerState()
+        state.window_level = (400.0, 40.0)
+        assert state.window_level == (400.0, 40.0)
+
+    @pytest.mark.parametrize("bad", [(300.0,), (300.0, 25.0, 1.0), 300.0])
+    def test_malformed_assignment_raises_value_error(self, bad) -> None:
+        state = SliceViewerState()
+        with pytest.raises(ValueError, match="window_level"):
+            state.window_level = bad

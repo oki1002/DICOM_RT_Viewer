@@ -158,7 +158,7 @@ class TestLazyPhaseCache:
         state = self._state()
         state.set_all_phases({"0%": self._phase(1), "50%": self._phase(2)})
         # Nothing resampled until a phase is activated.
-        assert len(state._resampled_phase_cache) == 0
+        assert state._phases.cached_phase_names == ()
         assert state.all_phases_data.keys() == {"0%", "50%"}
 
     def test_activation_resamples_and_caches(self) -> None:
@@ -166,7 +166,7 @@ class TestLazyPhaseCache:
         state.set_all_phases({"0%": self._phase(1), "50%": self._phase(2)})
         state.set_active_phase_as_secondary("0%")
         assert state.current_phase == "0%"
-        assert "0%" in state._resampled_phase_cache
+        assert "0%" in state._phases.cached_phase_names
         assert state.secondary_image is not None
 
     def test_lru_eviction_respects_cap(self) -> None:
@@ -177,7 +177,7 @@ class TestLazyPhaseCache:
         state.set_active_phase_as_secondary("0%")
         state.set_active_phase_as_secondary("50%")
         state.set_active_phase_as_secondary("100%")  # evicts "0%"
-        assert set(state._resampled_phase_cache) == {"50%", "100%"}
+        assert set(state._phases.cached_phase_names) == {"50%", "100%"}
 
     def test_reactivating_keeps_entry_warm(self) -> None:
         state = self._state()  # cap = 2
@@ -188,7 +188,7 @@ class TestLazyPhaseCache:
         state.set_active_phase_as_secondary("50%")
         state.set_active_phase_as_secondary("0%")  # refresh "0%" as MRU
         state.set_active_phase_as_secondary("100%")  # should evict "50%"
-        assert set(state._resampled_phase_cache) == {"0%", "100%"}
+        assert set(state._phases.cached_phase_names) == {"0%", "100%"}
 
     def test_all_phases_data_is_isolated_from_caller_dict(self) -> None:
         """set_all_phases must copy each entry dict, not just the outer

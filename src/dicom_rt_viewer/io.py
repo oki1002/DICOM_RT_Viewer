@@ -502,9 +502,11 @@ def load_rt_dose(dose_path: str | pathlib.Path) -> sitk.Image:
     logger.info(f"Loading RT-DOSE from '{dose_path}' (DoseGridScaling={scaling}).")
 
     image = sitk.ReadImage(str(dose_path))
-    array = sitk.GetArrayFromImage(image).astype(np.float32) * scaling
-    scaled_image = sitk.GetImageFromArray(array)
-    scaled_image.CopyInformation(image)
+    # Scale in SimpleITK rather than round-tripping through NumPy: the
+    # previous GetArrayFromImage -> multiply -> GetImageFromArray path
+    # allocated two extra full-size copies of the dose volume and had to
+    # restore the geometry afterwards with CopyInformation.
+    scaled_image = sitk.Multiply(sitk.Cast(image, sitk.sitkFloat32), scaling)
 
     lps_image, _ = _orient_to_lps(scaled_image)
     return lps_image

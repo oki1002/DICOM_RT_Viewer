@@ -19,6 +19,11 @@ if TYPE_CHECKING:
     from ..state.viewer_state import SliceViewerState
     from ..viewer import DicomViewer
 
+# Matplotlib mouse-button numbers the brush responds to. Any other button
+# is ignored entirely rather than being treated as an erase.
+_PAINT_BUTTON = 1
+_ERASE_BUTTON = 3
+
 
 class BrushEventHandler:
     """Handle brush-tool mouse events for RT-STRUCT contour editing."""
@@ -70,7 +75,16 @@ class BrushEventHandler:
     # Event handlers
     # ------------------------------------------------------------------
     def handle_press(self, event) -> None:
-        """Begin a paint or erase stroke on left / right button press."""
+        """Begin a paint or erase stroke on left / right button press.
+
+        Any other button (middle-click, or the extra buttons some mice
+        expose) is ignored. ``_apply_stroke_to_mask_cached`` treats
+        "not the paint button" as erase, so without this guard a stray
+        middle-click would silently subtract from the mask.
+        """
+        if event.button not in (_PAINT_BUTTON, _ERASE_BUTTON):
+            return
+
         # Guard against a press landing outside any view (e.g. the figure
         # margin): current_axis is "" there and event.xdata/ydata are None,
         # so falling through would slice with an empty axis name and raise
@@ -83,16 +97,16 @@ class BrushEventHandler:
         if roi_number is None or roi_number not in self.state.structure_set:
             return
 
-        self._is_dragging = True
-        self._button = event.button
-        self._active_axis = axis
-
         mask_image = self.state.structure_set.get_mask(roi_number)
         if mask_image is None:
             # __contains__ was checked above, but the entry could in theory
             # be removed between the check and here; guard rather than crash.
-            self._is_dragging = False
             return
+
+        self._is_dragging = True
+        self._button = event.button
+        self._active_axis = axis
+
         mask_slice = self.state.get_slice_data(mask_image, self._active_axis)
         self._stroke_mask = np.zeros_like(mask_slice, dtype=bool)
         # Cached alongside _stroke_radii_px below: the in-plane shape is
@@ -157,7 +171,7 @@ class BrushEventHandler:
         self._active_axis = None
 
         if not axis:
-            self._discard_cache()
+            self._reset_stroke()
             return
 
         # Commit to the ROI the stroke was actually painted into
@@ -170,7 +184,7 @@ class BrushEventHandler:
         # the one that was painted for the ROI active at press time.
         roi_number = self._cached_roi_number
         if roi_number is None or roi_number not in self.state.structure_set:
-            self._discard_cache()
+            self._reset_stroke()
             return
 
         # Apply hole-filling on the final 2-D slice if requested, then commit.
@@ -178,7 +192,7 @@ class BrushEventHandler:
         if mask_volume is None:
             # A press that failed its guards never populated the cache, so
             # there is nothing to commit.
-            self._discard_cache()
+            self._reset_stroke()
             return
 
         # The primary image can be cleared mid-stroke (e.g. a host
@@ -189,27 +203,19 @@ class BrushEventHandler:
         # ``new_mask.CopyInformation(None)`` and raise. Discard the
         # in-progress stroke instead of committing stale geometry.
         if self.state.primary_image is None:
-            self._discard_cache()
-            self._stroke_mask = None
-            self._stroke_radii_px = None
-            self._stroke_slice_shape = None
-            self._last_pos_px = None
+            self._reset_stroke()
             return
 
         slobj = self._make_slobj(axis)
 
-        if self._button == 1 and self.state.brush_fill_inside:
+        if self._button == _PAINT_BUTTON and self.state.brush_fill_inside:
             mask_volume[slobj] = binary_fill_holes(mask_volume[slobj])
 
         new_mask = sitk.GetImageFromArray(mask_volume.astype(np.uint8))
         new_mask.CopyInformation(self.state.primary_image)
         self.state.update_contour_properties(roi_number, {"mask": new_mask})
 
-        self._last_pos_px = None
-        self._stroke_mask = None
-        self._stroke_radii_px = None
-        self._stroke_slice_shape = None
-        self._discard_cache()
+        self._reset_stroke()
 
     def handle_scroll(self, event) -> None:
         """Adjust the brush size by 1 mm per scroll step."""
@@ -364,6 +370,10 @@ class BrushEventHandler:
 
         No ``sitk`` conversion or State notification is performed; the result
         stays in ``_cached_mask_volume`` until ``handle_release`` commits it.
+
+        Both buttons are matched explicitly so that an unexpected value in
+        ``_button`` leaves the mask untouched rather than falling through
+        to the erase branch.
         """
         if self._stroke_mask is None or self._cached_mask_volume is None:
             return
@@ -375,9 +385,9 @@ class BrushEventHandler:
         slobj = self._make_slobj(axis)
         original = self._cached_mask_volume[slobj]
 
-        if self._button == 1:
+        if self._button == _PAINT_BUTTON:
             self._cached_mask_volume[slobj] = np.logical_or(original, self._stroke_mask)
-        else:
+        elif self._button == _ERASE_BUTTON:
             self._cached_mask_volume[slobj] = np.logical_and(
                 original, np.logical_not(self._stroke_mask)
             )
@@ -416,6 +426,22 @@ class BrushEventHandler:
         slobj: list = [slice(None)] * 3
         slobj[self.state.axis_to_numpy_index(axis)] = self.state.indices[axis]
         return tuple(slobj)
+
+    def _reset_stroke(self) -> None:
+        """Clear every piece of per-stroke state, including the mask cache.
+
+        ``handle_release`` leaves a stroke through several paths (committed
+        normally, or abandoned because the axis, ROI or primary image went
+        away mid-drag). Each has to clear the same set of attributes, so
+        they are cleared here in one place instead of being repeated — and
+        occasionally missed — at each exit.
+        """
+        self._stroke_mask = None
+        self._stroke_radii_px = None
+        self._stroke_slice_shape = None
+        self._last_pos_px = None
+        self._button = None
+        self._discard_cache()
 
     def _discard_cache(self) -> None:
         """Release the cached NumPy volume and associated metadata."""

@@ -1146,6 +1146,13 @@ class DicomViewer(ttk.Frame):
         itself documents that its thread pool is lazily recreated on next
         use, which would otherwise leak a new pool if a caller reused a
         state across viewer instances.
+
+        Consequence for host applications: when a state is injected, the
+        host owns it and must call :meth:`SliceViewerState.close` itself
+        (typically from its window-close handler). Skipping that leaves the
+        contour-build thread pool running; because its workers are
+        non-daemon threads, the interpreter waits for any queued task to
+        finish before the process can exit.
         """
         self.drawing_manager.cancel()
         self.event_handler.cancel_pending()
@@ -1163,6 +1170,12 @@ class DicomViewer(ttk.Frame):
             self._cache_rebuild_after_id = None
         if self._owns_state:
             self.viewer_state.close()
+        else:
+            logger.debug(
+                "Viewer destroyed with an injected state; its background "
+                "thread pool stays open. Call SliceViewerState.close() when "
+                "the state itself is no longer needed."
+            )
         super().destroy()
 
     def load_ct(self, ct_dir: Any, window: tuple[int, int] | None = None) -> None:
