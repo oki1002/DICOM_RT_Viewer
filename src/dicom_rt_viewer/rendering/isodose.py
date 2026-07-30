@@ -41,6 +41,7 @@ from matplotlib.colors import BoundaryNorm, ListedColormap, to_rgba
 from matplotlib.image import AxesImage
 
 from ..geometry import AXES
+from ..isodose_levels import DEFAULT_ISODOSE_LEVELS, to_gy_pairs
 
 if TYPE_CHECKING:
     from ..state.viewer_state import SliceViewerState
@@ -80,16 +81,6 @@ class IsoDoseOverlay:
 
     #: Default isodose levels: (percentage of reference dose, colour),
     #: listed from lowest to highest.
-    _DEFAULT_LEVELS_PCT: list[tuple[int, str]] = [
-        (30, "#0000cc"),
-        (50, "#0066ff"),
-        (70, "#00cccc"),
-        (80, "#00cc00"),
-        (90, "#ffcc00"),
-        (95, "#ff6600"),
-        (100, "#ff0000"),
-    ]
-
     #: Stride used to downsample the dose slice before rendering.
     #: Dose distributions are spatially smooth, so step=2 (1/4 of the
     #: pixels) preserves visual quality while quartering both the
@@ -167,10 +158,8 @@ class IsoDoseOverlay:
             ref_dose = self.reference_dose()
             if ref_dose is None or ref_dose <= 0:
                 return []
-            pairs = [
-                (ref_dose * pct / 100.0, color)
-                for pct, color in self._DEFAULT_LEVELS_PCT
-            ]
+            # to_gy_pairs already drops hidden and non-positive levels.
+            return to_gy_pairs(DEFAULT_ISODOSE_LEVELS, ref_dose)
         # Non-positive levels would collapse the lowest band; drop them.
         return [(gy, color) for gy, color in pairs if gy > 0]
 

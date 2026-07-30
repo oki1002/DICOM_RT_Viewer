@@ -227,3 +227,86 @@ class TestWindowLevelAssignmentValidation:
         state = SliceViewerState()
         with pytest.raises(ValueError, match="window_level"):
             state.window_level = bad
+
+
+class TestAddRtStructRois:
+    """Batch import of load_rt_struct output into the StructureSet."""
+
+    @staticmethod
+    def _state() -> SliceViewerState:
+        state = SliceViewerState()
+        ct = sitk.GetImageFromArray(np.zeros((3, 4, 5), dtype=np.int16))
+        state.set_primary_image_data(ct)
+        return state
+
+    @staticmethod
+    def _roi(name: str, color: str = "#ff0000") -> dict:
+        return {"name": name, "mask": np.ones((3, 4, 5), dtype=bool), "color": color}
+
+    def test_adds_every_roi_and_returns_assigned_numbers(self) -> None:
+        state = self._state()
+        numbers = state.add_rt_struct_rois({7: self._roi("PTV"), 9: self._roi("Cord")})
+
+        assert len(numbers) == 2
+        assert [state.structure_set.get_name(n) for n in numbers] == ["PTV", "Cord"]
+        assert state.structure_set.get_color(numbers[0]) == "#ff0000"
+
+    def test_notifies_once_per_event_for_the_whole_batch(self) -> None:
+        state = self._state()
+        all_changed: list[object] = []
+        active_changed: list[object] = []
+        state.add_listener(events.ALL_CONTOURS_CHANGED, all_changed.append)
+        state.add_listener(events.ACTIVE_CONTOURS_CHANGED, active_changed.append)
+
+        state.add_rt_struct_rois({i: self._roi(f"ROI{i}") for i in range(5)})
+
+        assert len(all_changed) == 1
+        assert len(active_changed) == 1
+
+    def test_activates_by_default_and_can_be_disabled(self) -> None:
+        state = self._state()
+        numbers = state.add_rt_struct_rois({1: self._roi("PTV")})
+        assert state.active_contours == set(numbers)
+
+        more = state.add_rt_struct_rois({2: self._roi("Cord")}, activate=False)
+        assert state.active_contours == set(numbers)
+        assert more[0] not in state.active_contours
+
+    def test_resolves_collisions_against_existing_rois(self) -> None:
+        state = self._state()
+        state.add_rt_struct_rois({1: self._roi("PTV")})
+        numbers = state.add_rt_struct_rois({1: self._roi("PTV")})
+        assert state.structure_set.get_name(numbers[0]) == "PTV(2)"
+
+    def test_resolves_collisions_within_one_batch(self) -> None:
+        """Two incoming ROIs sharing a name must not both take the same one."""
+        state = self._state()
+        numbers = state.add_rt_struct_rois(
+            {1: self._roi("PTV"), 2: self._roi("PTV"), 3: self._roi("PTV")}
+        )
+        names = [state.structure_set.get_name(n) for n in numbers]
+        assert names == ["PTV", "PTV(2)", "PTV(3)"]
+
+    def test_collision_resolution_can_be_turned_off(self) -> None:
+        state = self._state()
+        state.add_rt_struct_rois({1: self._roi("PTV")})
+        numbers = state.add_rt_struct_rois(
+            {1: self._roi("PTV")}, resolve_name_collisions=False
+        )
+        assert state.structure_set.get_name(numbers[0]) == "PTV"
+
+    def test_without_a_primary_image_it_adds_nothing(self) -> None:
+        state = SliceViewerState()
+        assert state.add_rt_struct_rois({1: self._roi("PTV")}) == []
+        assert len(state.structure_set) == 0
+
+
+class TestGenerateUniqueNameReserved:
+    def test_reserved_names_are_treated_as_taken(self) -> None:
+        structure_set = StructureSet()
+        mask = sitk.GetImageFromArray(np.zeros((2, 2, 2), dtype=np.uint8))
+        structure_set.add("PTV", mask, "#f00")
+        assert structure_set.generate_unique_name("PTV") == "PTV(2)"
+        assert (
+            structure_set.generate_unique_name("PTV", reserved={"PTV(2)"}) == "PTV(3)"
+        )

@@ -11,6 +11,10 @@ mask2rtstruct(ct_dir, rtss_path, structures) -> None
     Convert NumPy mask arrays to an RT-STRUCT DICOM file, creating or
     updating as appropriate.
 
+save_structure_set(structure_set, ct_dir, rtss_path, lps_image, original_image=None) -> int
+    Write every ROI of a StructureSet to an RT-STRUCT file, resampling
+    each mask back to the original DICOM geometry first.
+
 resample_mask_to_original_space(_lps_image, original_image, lps_mask) -> sitk.Image
     Resample a mask from the LPS-aligned coordinate space back to the
     original image coordinate space.
@@ -22,7 +26,7 @@ random_hex_color() -> str
 import logging
 import pathlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Callable, TypedDict
+from typing import TYPE_CHECKING, Any, Callable, TypedDict
 
 import numpy as np
 import pydicom
@@ -30,6 +34,9 @@ import SimpleITK as sitk
 from rt_utils import RTStructBuilder
 
 from .geometry import resample_binary_mask
+
+if TYPE_CHECKING:
+    from .state.viewer_state import StructureSet
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +84,76 @@ class RoiInfo(TypedDict):
 # ---------------------------------------------------------------------------
 # Resampling
 # ---------------------------------------------------------------------------
+def save_structure_set(
+    structure_set: "StructureSet",
+    ct_dir: str | pathlib.Path,
+    rtss_path: str | pathlib.Path,
+    lps_image: sitk.Image,
+    original_image: sitk.Image | None = None,
+) -> int:
+    """Write every ROI of *structure_set* to an RT-STRUCT file.
+
+    Saving a :class:`~dicom_rt_viewer.state.viewer_state.StructureSet`
+    otherwise requires the caller to bridge two mismatches on its own: the
+    masks are held in the LPS-aligned space the viewer works in and have to
+    be resampled back to the geometry the RT-STRUCT will reference, and each
+    mask has to be converted from a ``sitk.Image`` to the ``(D, H, W)``
+    boolean array :func:`mask2rtstruct` takes. This function owns both, so
+    that "save the structure set I have been editing" is one call.
+
+    ROIs whose mask is missing are skipped with a warning rather than
+    aborting the whole save: a partially populated structure set is still
+    worth writing, and losing the rest of the ROIs to one bad entry is the
+    more damaging outcome.
+
+    Args:
+        structure_set: The ROIs to write. Only the accessors
+            ``get_roi_numbers`` / ``get_name`` / ``get_mask`` / ``get_color``
+            are used.
+        ct_dir: Directory of the reference CT series.
+        rtss_path: Destination path. An existing file is updated in place.
+        lps_image: The LPS-aligned CT the masks share their geometry with —
+            i.e. ``SliceViewerState.primary_image``.
+        original_image: The CT as loaded before LPS alignment
+            (``SeriesInfo["original_sitk_image"]``), which the RT-STRUCT
+            must reference. Pass ``None`` when the series needed no
+            reorientation, in which case *lps_image* is used and the masks
+            are written without a coordinate change.
+
+    Returns:
+        The number of ROIs written.
+
+    Raises:
+        ValueError: If *structure_set* contains no ROI with a usable mask,
+            since that would write an RT-STRUCT with no structures at all.
+        RuntimeError: If rt-utils rejects an ROI (propagated from
+            :func:`mask2rtstruct`).
+    """
+    target_image = original_image if original_image is not None else lps_image
+
+    structures: dict[int, dict[str, Any]] = {}
+    for roi_number in structure_set.get_roi_numbers():
+        mask = structure_set.get_mask(roi_number)
+        if mask is None:
+            logger.warning(f"ROI {roi_number} has no mask; skipping it.")
+            continue
+        resampled = resample_mask_to_original_space(lps_image, target_image, mask)
+        structures[roi_number] = {
+            "name": structure_set.get_name(roi_number),
+            "mask": sitk.GetArrayFromImage(resampled).astype(bool),
+            # rt-utils accepts a "#rrggbb" string directly, so the hex
+            # colour StructureSet stores needs no conversion here.
+            "color": structure_set.get_color(roi_number),
+        }
+
+    if not structures:
+        raise ValueError("Structure set contains no ROI with a mask to save.")
+
+    mask2rtstruct(ct_dir, rtss_path, structures)
+    logger.info(f"Structure set saved to '{rtss_path}' ({len(structures)} ROIs).")
+    return len(structures)
+
+
 def resample_mask_to_original_space(
     _lps_image: sitk.Image,
     original_image: sitk.Image,

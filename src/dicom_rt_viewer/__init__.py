@@ -20,6 +20,12 @@ StructureSet / RoiEntry
     stores. Used internally by ``SliceViewerState``; exposed here for
     callers that build structure sets directly.
 
+IsoDoseLevel / DEFAULT_ISODOSE_LEVELS / to_gy_pairs
+    Iso-dose levels expressed as a percentage of a reference dose, the
+    default ladder the overlay falls back to, and the conversion to the
+    ``(Gy, colour)`` pairs ``DicomViewer.set_isodose_lines`` takes. Use
+    these to build an iso-dose settings UI without restating the levels.
+
 Submodule API (import from the submodule)
 -----------------------------------------
 ``dicom_rt_viewer.io``
@@ -27,8 +33,8 @@ Submodule API (import from the submodule)
     load_all_series, load_dcm_series, normalize_phase_label
 
 ``dicom_rt_viewer.rtstruct_io``
-    load_rt_struct, mask2rtstruct, resample_mask_to_original_space,
-    random_hex_color, RtStructLoadError
+    load_rt_struct, mask2rtstruct, save_structure_set,
+    resample_mask_to_original_space, random_hex_color, RtStructLoadError
 
 ``dicom_rt_viewer.roi_operations``
     interpolate_contour, apply_margin, smooth_contour,
@@ -52,13 +58,22 @@ Quick start::
 
 from typing import TYPE_CHECKING, Any
 
+from .isodose_levels import DEFAULT_ISODOSE_LEVELS, IsoDoseLevel, to_gy_pairs
 from .state.viewer_state import RoiEntry, SliceViewerState, StructureSet
 
 if TYPE_CHECKING:
     from .viewer import DicomViewer
 
-__all__ = ["DicomViewer", "RoiEntry", "SliceViewerState", "StructureSet"]
-__version__ = "0.8.1"
+__all__ = [
+    "DEFAULT_ISODOSE_LEVELS",
+    "DicomViewer",
+    "IsoDoseLevel",
+    "RoiEntry",
+    "SliceViewerState",
+    "StructureSet",
+    "to_gy_pairs",
+]
+__version__ = "0.9.0"
 
 
 def __getattr__(name: str) -> Any:

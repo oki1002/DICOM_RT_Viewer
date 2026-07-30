@@ -4,6 +4,56 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.0] — 2026
+
+Additive release: three pieces of glue that every consumer of this library
+had to write for itself are now provided here. Nothing is removed or
+renamed, so 0.8.1 code keeps working.
+
+### Added
+
+- **`dicom_rt_viewer.isodose_levels`** — `IsoDoseLevel`,
+  `DEFAULT_ISODOSE_LEVELS` and `to_gy_pairs`, also re-exported from the
+  package root. Iso-dose levels are chosen clinically as percentages of a
+  reference dose, but `DicomViewer.set_isodose_lines` takes absolute Gy, so
+  every application that offers a level-settings UI held its own percentage
+  ladder and its own percent-to-Gy conversion. `IsoDoseOverlay` previously
+  kept the default ladder in a private `_DEFAULT_LEVELS_PCT`, which meant
+  the same seven values and colours existed in two places with nothing
+  keeping them in step; it now uses `DEFAULT_ISODOSE_LEVELS`. `to_gy_pairs`
+  produces exactly what `set_isodose_lines` expects — hidden levels
+  dropped, non-positive doses dropped, sorted ascending — so the rule that
+  a level at or below zero swallows the lowest colour band is enforced in
+  one place rather than in each caller. The module imports nothing beyond
+  the standard library.
+- **`rtstruct_io.save_structure_set(...)`** — writes every ROI of a
+  `StructureSet` to an RT-STRUCT file. Saving previously required the
+  caller to resample each mask from the LPS-aligned space the viewer works
+  in back to the geometry the RT-STRUCT references, convert each
+  `sitk.Image` to a `(D, H, W)` boolean array, and — because
+  `StructureSet` stores colours as `"#rrggbb"` while the examples reached
+  for `[R, G, B]` — convert the colour too. The colour conversion turned
+  out to be unnecessary: rt-utils accepts a hex string directly, so it is
+  passed straight through. ROIs whose mask is missing are skipped with a
+  warning instead of aborting the save; a structure set with no usable mask
+  at all raises `ValueError` rather than writing an empty RT-STRUCT.
+- **`SliceViewerState.add_rt_struct_rois(...)`** — adds the
+  `dict[int, RoiInfo]` returned by `load_rt_struct` in one batch. Bridging
+  `load_rt_struct` (NumPy masks, ROI numbers from the file) to
+  `add_contours` (`sitk.Image` masks, ROI numbers assigned by the state)
+  meant wrapping each array, resolving names that collide with ROIs already
+  loaded, and activating the result. Doing it per ROI also fired
+  `all_contours_changed` — and therefore a full contour redraw — once per
+  ROI, so a 30-ROI structure set triggered dozens of redraws; each event now
+  fires once. `activate` and `resolve_name_collisions` are keyword-only
+  options.
+- **`StructureSet.generate_unique_name(base_name, *, reserved=())`** — the
+  new `reserved` argument lets a caller naming several ROIs before adding
+  any of them keep them distinct from each other. Without it, two incoming
+  ROIs sharing a name both resolved to the same free name, because neither
+  was in the container yet for the other to collide with. Used by
+  `add_rt_struct_rois`; the existing single-argument behaviour is unchanged.
+
 ## [0.8.1] — 2026
 
 ### Fixed

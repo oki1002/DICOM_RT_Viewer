@@ -168,14 +168,12 @@ state.update_contour_properties(roi_number, {"color": "#00ff00"})
 state.delete_contour(roi_number)
 ```
 
-Loading many ROIs at once (e.g. from an RT-STRUCT with dozens of
-structures) is faster via `add_contours`, which fires a single redraw
-notification instead of one per ROI. `load_rt_struct` returns each mask as
-a plain NumPy array, so it must be wrapped back into a `sitk.Image` sharing
-the CT's geometry before being added:
+Loading an RT-STRUCT is a single call. `add_rt_struct_rois` wraps each mask
+back into a `sitk.Image` sharing the CT's geometry, resolves names that
+collide with ROIs already loaded, activates the result, and fires one redraw
+notification for the whole batch instead of one per ROI:
 
 ```python
-import SimpleITK as sitk
 from dicom_rt_viewer.rtstruct_io import RtStructLoadError, load_rt_struct
 
 try:
@@ -187,16 +185,34 @@ except RtStructLoadError as exc:
     ...  # the file itself could not be parsed (an empty structure set
     # returns {} instead, so the two cases are distinguishable)
 
-def to_sitk_mask(mask_arr):
-    mask_image = sitk.GetImageFromArray(mask_arr.astype("uint8"))
-    mask_image.CopyInformation(ct_image)  # ct_image: the loaded CT sitk.Image
-    return mask_image
+roi_numbers = state.add_rt_struct_rois(structures)
 
-roi_numbers = state.add_contours(
-    [
-        (info["name"], to_sitk_mask(info["mask"]), info["color"])
-        for info in structures.values()
-    ]
+# Keep the file's names verbatim, and leave the new ROIs hidden:
+roi_numbers = state.add_rt_struct_rois(
+    structures, activate=False, resolve_name_collisions=False
+)
+```
+
+Use `add_contours` directly when the masks are not coming from an RT-STRUCT
+— it takes `(name, sitk.Image, colour)` tuples and applies no name
+resolution.
+
+Writing the current ROIs back out is likewise a single call.
+`save_structure_set` resamples each mask from the LPS-aligned space the
+viewer works in back to the original DICOM geometry, which is what the
+RT-STRUCT has to reference:
+
+```python
+from dicom_rt_viewer.rtstruct_io import save_structure_set
+
+# original_image is SeriesInfo["original_sitk_image"] — the CT as loaded,
+# before LPS alignment. Omit it when the series needed no reorientation.
+written = save_structure_set(
+    state.structure_set,
+    ct_dir,
+    "/path/to/output/rs.dcm",
+    lps_image=state.primary_image,
+    original_image=original_image,
 )
 ```
 
@@ -283,6 +299,28 @@ state.set_prescription_dose(60.0)  # 60 Gy
 # Customise isodose lines on the viewer itself ((Gy, colour) pairs).
 # Pass an empty list to hide all lines.
 viewer.set_isodose_lines([(18.0, "#0000cc"), (54.0, "#ffcc00"), (60.0, "#ff0000")])
+```
+
+Levels are normally chosen as percentages of a reference dose rather than in
+absolute Gy, so `dicom_rt_viewer.isodose_levels` provides the percentage
+form, the default ladder the overlay itself falls back to, and the
+conversion. Build a settings UI on top of these instead of restating the
+levels:
+
+```python
+from dataclasses import replace
+
+from dicom_rt_viewer import DEFAULT_ISODOSE_LEVELS, IsoDoseLevel, to_gy_pairs
+
+levels = list(DEFAULT_ISODOSE_LEVELS)          # 30 / 50 / 70 / 80 / 90 / 95 / 100 %
+levels[0] = replace(levels[0], visible=False)  # IsoDoseLevel is frozen
+levels.append(IsoDoseLevel(107, "#ff00ff"))    # a hot-spot line
+
+# Reference dose: the prescription when set, otherwise Dmax.
+ref_gy = state.prescription_dose or state.get_dose_fallback_ref_gy() or 0.0
+
+# Drops hidden and non-positive levels, sorts ascending.
+viewer.set_isodose_lines(to_gy_pairs(levels, ref_gy))
 ```
 
 ## Layout modes

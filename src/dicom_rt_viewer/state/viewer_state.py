@@ -42,7 +42,7 @@ import logging
 import pathlib
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Callable, ClassVar
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Iterable
 
 import numpy as np
 import SimpleITK as sitk
@@ -85,6 +85,9 @@ from ..geometry import (
 )
 from .phase_manager import PhaseManager
 from .viewer_cache import ContourPathCache, MaskSliceCache, ViewerCacheManager
+
+if TYPE_CHECKING:
+    from ..rtstruct_io import RoiInfo
 
 logger = logging.getLogger(__name__)
 
@@ -174,7 +177,9 @@ class StructureSet:
         entry = self._data.get(roi_number)
         return entry.name if entry else None
 
-    def generate_unique_name(self, base_name: str) -> str:
+    def generate_unique_name(
+        self, base_name: str, *, reserved: Iterable[str] = ()
+    ) -> str:
         """Return a name that does not collide with any existing ROI name.
 
         When *base_name* is already taken, ``"base_name(2)"``,
@@ -185,11 +190,17 @@ class StructureSet:
 
         Args:
             base_name: The desired ROI name.
+            reserved: Additional names to treat as taken. Needed when
+                several ROIs are named in one batch before any of them has
+                been added: without it, two incoming ROIs sharing a name
+                would both resolve to the same free name, since neither is
+                in this container yet to be seen by the other.
 
         Returns:
-            A name guaranteed not to collide with any existing ROI name.
+            A name colliding with neither an existing ROI name nor *reserved*.
         """
         existing_names = {entry.name for entry in self._data.values()}
+        existing_names.update(reserved)
         if base_name not in existing_names:
             return base_name
 
@@ -1323,6 +1334,88 @@ class SliceViewerState:
             roi_numbers.append(roi_number)
         if roi_numbers:
             self._notify(ALL_CONTOURS_CHANGED, self.structure_set)
+        return roi_numbers
+
+    def add_rt_struct_rois(
+        self,
+        rois: dict[int, "RoiInfo"],
+        *,
+        activate: bool = True,
+        resolve_name_collisions: bool = True,
+    ) -> list[int]:
+        """Add the ROIs returned by :func:`~dicom_rt_viewer.rtstruct_io.load_rt_struct`.
+
+        :func:`~dicom_rt_viewer.rtstruct_io.load_rt_struct` yields masks as
+        NumPy arrays keyed by the ROI number recorded in the file, while
+        :meth:`add_contour` and :meth:`add_contours` take ``sitk.Image``
+        masks and assign their own ROI numbers. Bridging the two — wrapping
+        each array with :meth:`create_image_from_numpy`, resolving names
+        that collide with ROIs already loaded, and activating the result —
+        is the same work for every caller, so it is done here.
+
+        Doing it in one batch matters for more than tidiness: adding ROIs
+        one at a time fires ``all_contours_changed`` (and, when activating,
+        ``active_contours_changed``) per ROI, so a 30-ROI structure set
+        triggers dozens of full contour redraws. This method fires each
+        event once.
+
+        Args:
+            rois: The mapping returned by ``load_rt_struct``. Its keys — the
+                ROI numbers from the file — are not preserved; this state
+                assigns its own, which is what the returned list reports.
+            activate: Whether to add the new ROIs to
+                :attr:`active_contours` so they are drawn immediately.
+            resolve_name_collisions: When ``True``, a name already used by
+                an existing ROI is suffixed via
+                :meth:`StructureSet.generate_unique_name`. Pass ``False``
+                to keep the names exactly as recorded in the file, at the
+                cost of allowing duplicates.
+
+        Returns:
+            The ROI numbers assigned by this state, in iteration order of
+            *rois*. ROIs skipped because their mask could not be wrapped
+            are absent from the list.
+
+        Note:
+            Returns an empty list and logs an error when no primary image
+            is loaded, since the masks have no geometry to be interpreted
+            against.
+        """
+        if self.primary_image is None:
+            logger.error("Cannot add RT-STRUCT ROIs: primary image not loaded.")
+            return []
+
+        entries: list[tuple[str, sitk.Image, str]] = []
+        # Names resolved so far in this batch. generate_unique_name only
+        # sees ROIs already added, and nothing is added until add_contours
+        # below, so without this two incoming ROIs sharing a name would both
+        # be given the same one.
+        assigned_names: set[str] = set()
+        for source_number, roi in rois.items():
+            mask_image = self.create_image_from_numpy(roi["mask"].astype(np.uint8))
+            if mask_image is None:
+                # create_image_from_numpy only fails without a primary
+                # image, which is guarded above; keep the branch so a future
+                # failure mode cannot silently drop an ROI.
+                logger.warning(
+                    f"Could not build a mask image for RT-STRUCT ROI "
+                    f"{source_number} ('{roi['name']}'); skipping it."
+                )
+                continue
+            name = (
+                self.structure_set.generate_unique_name(
+                    roi["name"], reserved=assigned_names
+                )
+                if resolve_name_collisions
+                else roi["name"]
+            )
+            assigned_names.add(name)
+            entries.append((name, mask_image, roi["color"]))
+
+        roi_numbers = self.add_contours(entries)
+        if activate and roi_numbers:
+            self.set_active_contours(self.active_contours | set(roi_numbers))
+        logger.info(f"Added {len(roi_numbers)} ROI(s) from an RT-STRUCT.")
         return roi_numbers
 
     def delete_contour(self, roi_number: int) -> None:
