@@ -310,3 +310,100 @@ class TestGenerateUniqueNameReserved:
         assert (
             structure_set.generate_unique_name("PTV", reserved={"PTV(2)"}) == "PTV(3)"
         )
+
+
+class TestPhaseDataIsNotHandedOut:
+    """all_phases_data must not expose the state's own dictionaries.
+
+    The mirror of the active_contours aliasing fix: a reader of the
+    property, or a phases_data_loaded listener, must not be able to drop a
+    phase or swap its image behind the resampled-volume cache's back.
+    """
+
+    @staticmethod
+    def _phase(fill: int) -> dict:
+        arr = np.full((2, 4, 4), fill, dtype=np.int16)
+        return {"sitk_image": sitk.GetImageFromArray(arr), "transform": None}
+
+    def _state_with_phases(self) -> SliceViewerState:
+        state = SliceViewerState()
+        ct = sitk.GetImageFromArray(np.zeros((2, 4, 4), dtype=np.int16))
+        state.set_primary_image_data(ct)
+        state.set_all_phases({"0%": self._phase(1), "50%": self._phase(2)})
+        return state
+
+    def test_outer_mapping_is_read_only(self) -> None:
+        state = self._state_with_phases()
+        # A read-only mapping has no mutating methods at all (AttributeError)
+        # and rejects item assignment / deletion (TypeError).
+        with pytest.raises(AttributeError):
+            state.all_phases_data.pop("0%")  # type: ignore[attr-defined]
+        with pytest.raises(TypeError):
+            del state.all_phases_data["0%"]  # type: ignore[attr-defined]
+        with pytest.raises(TypeError):
+            state.all_phases_data["new"] = {}  # type: ignore[index]
+        assert set(state.all_phases_data) == {"0%", "50%"}
+
+    def test_each_entry_is_read_only(self) -> None:
+        state = self._state_with_phases()
+        with pytest.raises(TypeError):
+            state.all_phases_data["0%"]["sitk_image"] = None  # type: ignore[index]
+
+    def test_listener_cannot_mutate_the_stored_phases(self) -> None:
+        state = SliceViewerState()
+        ct = sitk.GetImageFromArray(np.zeros((2, 4, 4), dtype=np.int16))
+        state.set_primary_image_data(ct)
+        received: list = []
+        state.add_listener(events.PHASES_DATA_LOADED, received.append)
+
+        state.set_all_phases({"0%": self._phase(1)})
+
+        with pytest.raises(TypeError):
+            del received[-1]["0%"]
+        assert set(state.all_phases_data) == {"0%"}
+
+    def test_remains_readable_the_usual_ways(self) -> None:
+        """The view must still support everything a reader legitimately does."""
+        state = self._state_with_phases()
+        phases = state.all_phases_data
+        assert len(phases) == 2
+        assert bool(phases) is True
+        assert "0%" in phases
+        assert phases["0%"]["transform"] is None
+        assert {name for name, _ in phases.items()} == {"0%", "50%"}
+        assert dict(phases).keys() == {"0%", "50%"}
+
+
+class TestAddRtStructRoisRejectsMismatchedMasks:
+    def test_mismatched_shape_raises_and_adds_nothing(self) -> None:
+        state = SliceViewerState()
+        ct = sitk.GetImageFromArray(np.zeros((4, 8, 8), dtype=np.int16))
+        state.set_primary_image_data(ct)
+        rois = {
+            1: {"name": "OK", "mask": np.ones((4, 8, 8), dtype=bool), "color": "#f00"},
+            2: {"name": "Bad", "mask": np.ones((3, 5, 5), dtype=bool), "color": "#0f0"},
+        }
+
+        with pytest.raises(ValueError, match="different series"):
+            state.add_rt_struct_rois(rois)
+
+        # The valid ROI preceding the bad one must not have been added.
+        assert len(state.structure_set) == 0
+
+
+class TestActiveContourNotificationIsImmutable:
+    def test_listener_receives_a_frozenset(self) -> None:
+        state = SliceViewerState()
+        ct = sitk.GetImageFromArray(np.zeros((2, 4, 4), dtype=np.int16))
+        state.set_primary_image_data(ct)
+        mask = sitk.GetImageFromArray(np.ones((2, 4, 4), dtype=np.uint8))
+        mask.CopyInformation(ct)
+        roi = state.add_contour("PTV", mask, "#f00")
+
+        received: list = []
+        state.add_listener(events.ACTIVE_CONTOURS_CHANGED, received.append)
+        state.set_active_contours({roi})
+
+        assert received[-1] == {roi}
+        with pytest.raises(AttributeError):
+            received[-1].add(99)

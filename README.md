@@ -462,6 +462,12 @@ Set `max_cached_phases=len(phases)` to eagerly retain every activated phase
 (closest to the old always-resident behaviour), or lower it to minimise peak
 memory when phases are viewed once in sequence.
 
+`state.all_phases_data` is a read-only view, as is each phase entry inside
+it. Reading it works as normal; mutating it raises, because replacing a
+phase's image behind the viewer's back would leave a cached resampled volume
+that no longer matches the phase it is keyed by. Call `set_all_phases` again
+to change what is loaded.
+
 Ownership note: `DicomViewer.destroy()` shuts the state's thread pool down
 only when the viewer created the state itself. If you inject a shared
 `SliceViewerState`, you own its lifecycle — call `state.close()` yourself

@@ -4,6 +4,61 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.1] — 2026
+
+Follow-up to 0.9.0, from a review of the changes it introduced.
+
+### Fixed
+
+- **`all_phases_data` handed out the state's own dictionaries.** The same
+  aliasing problem 0.8.1 fixed for `active_contours` remained on the 4DCT
+  path, and 0.9.0 moved that code into `PhaseManager` without addressing
+  it: the property returned the stored mapping itself, and
+  `phases_data_loaded` listeners were passed the same object. Dropping a
+  phase or replacing its `"sitk_image"` through either route left the
+  resampled-volume LRU cache holding a volume that no longer matched the
+  phase it was keyed by. Both now expose a read-only view of the outer
+  mapping *and* of each phase entry. Every read a caller legitimately
+  performs (indexing, `in`, `len`, `items()`, `dict(...)`) is unaffected;
+  only mutation now raises.
+- **`add_rt_struct_rois` documented graceful skipping it did not do.** Its
+  docstring said ROIs whose mask "could not be wrapped" were skipped, but
+  the only branch that could skip was unreachable, and the realistic
+  failure — a mask whose shape does not match the primary image, i.e. an
+  RT-STRUCT belonging to a different series — surfaced as a `RuntimeError`
+  from deep inside SimpleITK. Mask shapes are now validated up front and
+  a mismatch raises `ValueError` naming the ROI, both shapes and the likely
+  cause. Validation completes before any ROI is added, so the structure set
+  is left untouched rather than half-populated.
+- **`save_structure_set` resampled every mask even when there was nothing
+  to resample to.** With `original_image` omitted the target geometry was
+  `lps_image` itself, so each ROI paid a full nearest-neighbour resample to
+  reach the grid it was already on. The resample is now skipped in that
+  case.
+
+### Changed
+
+- `active_contours_changed` listeners now receive a `frozenset` rather than
+  a `set` copy — an immutable snapshot needs no defensive copying by either
+  side. Code that only reads the argument is unaffected.
+- `IsoDoseOverlay._resolve_levels` was restructured in 0.9.0 so that its
+  `else` branch returned while the final statement was reachable only from
+  the `if`, making it read as though both paths fell through. Rewritten as
+  a plain early return.
+- `Iterable` is imported from `collections.abc` rather than the deprecated
+  `typing` aliases.
+- The 4DCT cache limit is clamped with a warning when read at runtime, not
+  silently, matching what `SliceViewerState` already does when the same
+  value is out of range at construction time.
+
+### Documentation
+
+- 0.9.0 changed the colour written for an ROI with no colour set: the
+  previous host-side code substituted white, whereas `save_structure_set`
+  passes `None` through and lets rt-utils assign from its palette. This was
+  an undocumented behaviour change in a release billed as additive; it is
+  recorded here.
+
 ## [0.9.0] — 2026
 
 Additive release: three pieces of glue that every consumer of this library

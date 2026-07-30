@@ -35,10 +35,29 @@ class TestDefaultLevels:
         assert percents == sorted(percents)
 
     def test_overlay_falls_back_to_the_shared_ladder(self) -> None:
-        """The overlay must not keep its own copy of the default levels."""
-        from dicom_rt_viewer.rendering import isodose
+        """With no explicit levels set, the overlay resolves this ladder.
 
-        assert not hasattr(isodose.IsoDoseOverlay, "_DEFAULT_LEVELS_PCT")
+        Asserts the resolved result rather than the absence of a private
+        attribute, so the test pins the behaviour that matters (one source
+        of default levels) instead of one particular way of achieving it.
+        """
+        import numpy as np
+        import SimpleITK as sitk
+
+        from dicom_rt_viewer.rendering.isodose import IsoDoseOverlay
+        from dicom_rt_viewer.state.viewer_state import SliceViewerState
+
+        state = SliceViewerState()
+        ct = sitk.GetImageFromArray(np.zeros((2, 4, 4), dtype=np.int16))
+        state.set_primary_image_data(ct)
+        dose = sitk.GetImageFromArray(np.full((2, 4, 4), 50.0, dtype=np.float32))
+        dose.CopyInformation(ct)
+        state.set_rt_dose_image(dose)
+        state.set_prescription_dose(60.0)
+
+        overlay = IsoDoseOverlay(state, on_artists_changed=lambda axis: None)
+
+        assert overlay._resolve_levels() == to_gy_pairs(DEFAULT_ISODOSE_LEVELS, 60.0)
 
 
 class TestToGyPairs:

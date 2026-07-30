@@ -113,3 +113,53 @@ class TestSaveStructureSet:
                 StructureSet(), "/ct", "/out/rs.dcm", lps_image=_image()
             )
         assert "structures" not in captured_structures
+
+
+class TestSaveStructureSetResampling:
+    """Resampling must happen only when there is a different geometry to reach."""
+
+    def _one_roi(self, lps: sitk.Image) -> StructureSet:
+        structure_set = StructureSet()
+        structure_set.add("PTV", _mask(lps), "#ff0000")
+        return structure_set
+
+    def test_omitting_original_image_skips_the_resample(
+        self, captured_structures, monkeypatch
+    ) -> None:
+        calls: list = []
+        monkeypatch.setattr(
+            rtstruct_io,
+            "resample_mask_to_original_space",
+            lambda *args: calls.append(args) or args[2],
+        )
+        lps = _image()
+
+        rtstruct_io.save_structure_set(
+            self._one_roi(lps), "/ct", "/out/rs.dcm", lps_image=lps
+        )
+
+        assert calls == []
+
+    def test_a_separate_original_image_is_resampled_to(
+        self, captured_structures, monkeypatch
+    ) -> None:
+        calls: list = []
+        real = rtstruct_io.resample_mask_to_original_space
+        monkeypatch.setattr(
+            rtstruct_io,
+            "resample_mask_to_original_space",
+            lambda *args: calls.append(args) or real(*args),
+        )
+        lps = _image()
+        original = _image()
+        original.SetOrigin((10.0, 10.0, 10.0))
+
+        rtstruct_io.save_structure_set(
+            self._one_roi(lps),
+            "/ct",
+            "/out/rs.dcm",
+            lps_image=lps,
+            original_image=original,
+        )
+
+        assert len(calls) == 1

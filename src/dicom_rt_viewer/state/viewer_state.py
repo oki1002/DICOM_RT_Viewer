@@ -41,8 +41,9 @@ import dataclasses
 import logging
 import pathlib
 from collections import defaultdict
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, ClassVar, Iterable
+from typing import TYPE_CHECKING, Any, Callable, ClassVar
 
 import numpy as np
 import SimpleITK as sitk
@@ -1063,10 +1064,16 @@ class SliceViewerState:
     # 4DCT phases
     # =========================================================
     @property
-    def all_phases_data(self) -> dict[str, Any]:
+    def all_phases_data(self) -> Mapping[str, Mapping[str, Any]]:
         """The loaded 4DCT phase entries, keyed by phase name.
 
-        Read-only view onto :class:`~dicom_rt_viewer.state.phase_manager.PhaseManager`.
+        A read-only view — of the outer mapping and of each entry — onto
+        :class:`~dicom_rt_viewer.state.phase_manager.PhaseManager`, so that
+        neither a reader of this property nor a ``phases_data_loaded``
+        listener can replace a phase's image or drop a phase behind the
+        resampled-volume cache's back. Build a plain ``dict`` from it when a
+        mutable copy is wanted.
+
         The ``"sitk_image"`` in each entry is the raw image as passed to
         :meth:`set_all_phases`, *not* resampled to the primary grid; see
         that method for the rationale.
@@ -1078,7 +1085,7 @@ class SliceViewerState:
         """Name of the 4DCT phase currently shown as the secondary image."""
         return self._phases.current_phase
 
-    def set_all_phases(self, phases_data: dict[str, Any]) -> None:
+    def set_all_phases(self, phases_data: Mapping[str, Mapping[str, Any]]) -> None:
         """Store all 4DCT phase images for lazy, on-demand resampling.
 
         Each entry in *phases_data* must be a dict containing at minimum:
@@ -1283,7 +1290,9 @@ class SliceViewerState:
         active_roi_numbers = set(active_roi_numbers)
         if self.active_contours != active_roi_numbers:
             object.__setattr__(self, "active_contours", active_roi_numbers)
-            self._notify(ACTIVE_CONTOURS_CHANGED, set(active_roi_numbers))
+            # frozenset rather than another set(): listeners get a snapshot
+            # that cannot be mutated at all, and it needs no further copy.
+            self._notify(ACTIVE_CONTOURS_CHANGED, frozenset(active_roi_numbers))
 
     def set_selected_roi(self, roi_number: int | None) -> None:
         """Set the ROI that the brush tool will edit."""
@@ -1372,9 +1381,16 @@ class SliceViewerState:
                 cost of allowing duplicates.
 
         Returns:
-            The ROI numbers assigned by this state, in iteration order of
-            *rois*. ROIs skipped because their mask could not be wrapped
-            are absent from the list.
+            The ROI numbers assigned by this state, one per entry in *rois*
+            and in its iteration order.
+
+        Raises:
+            ValueError: If any mask's shape does not match the primary
+                image. Every mask is checked before a single ROI is added,
+                so a mismatch leaves the structure set untouched rather
+                than half-populated — which matters because the usual cause
+                is an RT-STRUCT belonging to a different series, where none
+                of the ROIs are wanted.
 
         Note:
             Returns an empty list and logs an error when no primary image
@@ -1385,6 +1401,9 @@ class SliceViewerState:
             logger.error("Cannot add RT-STRUCT ROIs: primary image not loaded.")
             return []
 
+        # (z, y, x), matching the NumPy masks load_rt_struct produces.
+        expected_shape = tuple(reversed(self.primary_image.GetSize()))
+
         entries: list[tuple[str, sitk.Image, str]] = []
         # Names resolved so far in this batch. generate_unique_name only
         # sees ROIs already added, and nothing is added until add_contours
@@ -1392,16 +1411,22 @@ class SliceViewerState:
         # be given the same one.
         assigned_names: set[str] = set()
         for source_number, roi in rois.items():
-            mask_image = self.create_image_from_numpy(roi["mask"].astype(np.uint8))
-            if mask_image is None:
-                # create_image_from_numpy only fails without a primary
-                # image, which is guarded above; keep the branch so a future
-                # failure mode cannot silently drop an ROI.
-                logger.warning(
-                    f"Could not build a mask image for RT-STRUCT ROI "
-                    f"{source_number} ('{roi['name']}'); skipping it."
+            mask = roi["mask"]
+            if mask.shape != expected_shape:
+                raise ValueError(
+                    f"RT-STRUCT ROI {source_number} ('{roi['name']}') has mask "
+                    f"shape {mask.shape}, but the primary image is "
+                    f"{expected_shape}. The RT-STRUCT probably belongs to a "
+                    f"different series than the loaded one."
                 )
-                continue
+            mask_image = self.create_image_from_numpy(mask.astype(np.uint8))
+            if mask_image is None:
+                # Unreachable: create_image_from_numpy only returns None
+                # without a primary image, which is guarded above.
+                raise RuntimeError(
+                    f"Could not build a mask image for RT-STRUCT ROI "
+                    f"{source_number} ('{roi['name']}')."
+                )
             name = (
                 self.structure_set.generate_unique_name(
                     roi["name"], reserved=assigned_names

@@ -152,16 +152,14 @@ class IsoDoseOverlay:
     # ------------------------------------------------------------------
     def _resolve_levels(self) -> list[tuple[float, str]]:
         """Return the active ``(dose_gy, colour)`` pairs (may be empty)."""
-        if self._custom_levels_gy is not None:
-            pairs = self._custom_levels_gy
-        else:
+        if self._custom_levels_gy is None:
             ref_dose = self.reference_dose()
             if ref_dose is None or ref_dose <= 0:
                 return []
             # to_gy_pairs already drops hidden and non-positive levels.
             return to_gy_pairs(DEFAULT_ISODOSE_LEVELS, ref_dose)
         # Non-positive levels would collapse the lowest band; drop them.
-        return [(gy, color) for gy, color in pairs if gy > 0]
+        return [(gy, color) for gy, color in self._custom_levels_gy if gy > 0]
 
     def _fill_alpha(self) -> float:
         """Return the current fill opacity derived from the blend slider."""

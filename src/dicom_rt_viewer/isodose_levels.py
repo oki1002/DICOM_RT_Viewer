@@ -17,8 +17,8 @@ importing it costs nothing and it can be used to build or persist level
 definitions in a process that never renders anything.
 """
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 
 __all__ = ["DEFAULT_ISODOSE_LEVELS", "IsoDoseLevel", "to_gy_pairs"]
 

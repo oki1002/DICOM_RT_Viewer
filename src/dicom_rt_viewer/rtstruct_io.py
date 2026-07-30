@@ -129,15 +129,21 @@ def save_structure_set(
         RuntimeError: If rt-utils rejects an ROI (propagated from
             :func:`mask2rtstruct`).
     """
-    target_image = original_image if original_image is not None else lps_image
-
     structures: dict[int, dict[str, Any]] = {}
     for roi_number in structure_set.get_roi_numbers():
         mask = structure_set.get_mask(roi_number)
         if mask is None:
             logger.warning(f"ROI {roi_number} has no mask; skipping it.")
             continue
-        resampled = resample_mask_to_original_space(lps_image, target_image, mask)
+        # Resampling onto lps_image's own grid would be a no-op, so it is
+        # skipped entirely when there is no separate original geometry to
+        # return to (otherwise a whole-volume nearest-neighbour resample
+        # would run once per ROI).
+        resampled = (
+            mask
+            if original_image is None
+            else resample_mask_to_original_space(lps_image, original_image, mask)
+        )
         structures[roi_number] = {
             "name": structure_set.get_name(roi_number),
             "mask": sitk.GetArrayFromImage(resampled).astype(bool),
