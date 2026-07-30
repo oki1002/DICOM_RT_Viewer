@@ -37,12 +37,12 @@ Performance:
     via :meth:`get_dose_fallback_ref_gy`.
 """
 
-import dataclasses
 import logging
 import pathlib
 from collections import defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Callable, ClassVar
 
 import numpy as np
@@ -85,6 +85,11 @@ from ..geometry import (
     slice_along_axis,
 )
 from .phase_manager import PhaseManager
+
+# Re-exported: StructureSet and RoiEntry moved to their own module, but
+# dicom_rt_viewer.state.viewer_state stays their documented import path.
+from .structure_set import RoiEntry as RoiEntry
+from .structure_set import StructureSet as StructureSet
 from .viewer_cache import ContourPathCache, MaskSliceCache, ViewerCacheManager
 
 if TYPE_CHECKING:
@@ -95,156 +100,6 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # StructureSet
-# ---------------------------------------------------------------------------
-@dataclass
-class RoiEntry:
-    """A single ROI's stored properties inside :class:`StructureSet`.
-
-    Replaces the previous ``dict[str, Any]`` entry shape so that field
-    names and types (``name: str``, ``mask: sitk.Image``, ``color: str``)
-    are checked statically instead of relying on string keys that a typo
-    could silently miss.
-    """
-
-    name: str
-    mask: sitk.Image
-    color: str
-
-
-class StructureSet:
-    """Container for RT-STRUCT ROI masks, keyed by integer ROI number.
-
-    Masks are stored as ``sitk.Image`` objects.  ROI numbers are assigned
-    automatically starting from 1 and never reused within an instance.
-
-    Example::
-
-        ss = StructureSet()
-        num = ss.add("PTV", mask_image, color="#ff0000")  # -> 1
-        mask  = ss.get_mask(num)    # -> sitk.Image
-        name  = ss.get_name(num)    # -> "PTV"
-        color = ss.get_color(num)   # -> "#ff0000"
-        nums  = ss.get_roi_numbers()  # -> [1, ...]
-        unique = ss.generate_unique_name("PTV")  # -> "PTV(2)"
-    """
-
-    def __init__(self) -> None:
-        self._data: dict[int, RoiEntry] = {}
-        self._next_number: int = 1
-
-    def add(self, name: str, mask: sitk.Image, color: str) -> int:
-        """Add an ROI and return its assigned ROI number.
-
-        Args:
-            name:  Human-readable structure name (e.g. ``"PTV"``).
-            mask:  Binary mask as a ``sitk.Image`` (same geometry as the CT).
-            color: Hex colour string (e.g. ``"#ff0000"``).
-
-        Returns:
-            The auto-assigned ROI number (starts at 1).
-        """
-        roi_number = self._next_number
-        self._next_number += 1
-        self._data[roi_number] = RoiEntry(name=name, mask=mask, color=color)
-        return roi_number
-
-    def remove(self, roi_number: int) -> None:
-        """Remove the ROI identified by *roi_number*. No-op if not found."""
-        self._data.pop(roi_number, None)
-
-    def update(self, roi_number: int, props: dict[str, Any]) -> None:
-        """Update properties (``name``, ``mask``, ``color``) for *roi_number*.
-
-        Raises:
-            ValueError: If *props* contains a key that is not a field of
-                :class:`RoiEntry` — this used to update a plain dict with
-                no feedback, so a typo'd key (e.g. ``"colour"``) would be
-                silently stored and never actually applied.
-        """
-        entry = self._data.get(roi_number)
-        if entry is None:
-            return
-        valid_fields = {f.name for f in dataclasses.fields(RoiEntry)}
-        unknown = props.keys() - valid_fields
-        if unknown:
-            raise ValueError(
-                f"Unknown RoiEntry field(s) {sorted(unknown)}; expected one of {sorted(valid_fields)}."
-            )
-        for key, value in props.items():
-            setattr(entry, key, value)
-
-    def get_name(self, roi_number: int) -> str | None:
-        """Return the structure name for *roi_number*, or ``None``."""
-        entry = self._data.get(roi_number)
-        return entry.name if entry else None
-
-    def generate_unique_name(
-        self, base_name: str, *, reserved: Iterable[str] = ()
-    ) -> str:
-        """Return a name that does not collide with any existing ROI name.
-
-        When *base_name* is already taken, ``"base_name(2)"``,
-        ``"base_name(3)"``, ... is tried until a free name is found.
-        Centralising this rule here ensures every ROI-creation call site
-        (manual addition, RT-STRUCT import, inference results, ...)
-        resolves name collisions the same way.
-
-        Args:
-            base_name: The desired ROI name.
-            reserved: Additional names to treat as taken. Needed when
-                several ROIs are named in one batch before any of them has
-                been added: without it, two incoming ROIs sharing a name
-                would both resolve to the same free name, since neither is
-                in this container yet to be seen by the other.
-
-        Returns:
-            A name colliding with neither an existing ROI name nor *reserved*.
-        """
-        existing_names = {entry.name for entry in self._data.values()}
-        existing_names.update(reserved)
-        if base_name not in existing_names:
-            return base_name
-
-        counter = 2
-        candidate = f"{base_name}({counter})"
-        while candidate in existing_names:
-            counter += 1
-            candidate = f"{base_name}({counter})"
-        return candidate
-
-    def get_mask(self, roi_number: int) -> sitk.Image | None:
-        """Return the binary mask for *roi_number*, or ``None``."""
-        entry = self._data.get(roi_number)
-        return entry.mask if entry else None
-
-    def get_color(self, roi_number: int) -> str | None:
-        """Return the hex colour string for *roi_number*, or ``None``."""
-        entry = self._data.get(roi_number)
-        return entry.color if entry else None
-
-    def get_roi_numbers(self) -> list[int]:
-        """Return a list of all ROI numbers in insertion order."""
-        return list(self._data.keys())
-
-    def get_all(self) -> dict[int, RoiEntry]:
-        """Return a shallow copy of the internal ``{roi_number: RoiEntry}`` mapping.
-
-        The copy is of the outer dict only; ``RoiEntry`` instances (and the
-        ``sitk.Image`` masks they hold) are shared with the internal
-        storage, consistent with the rest of this class's shallow-copy
-        semantics elsewhere.
-        """
-        return dict(self._data)
-
-    def __len__(self) -> int:
-        return len(self._data)
-
-    def __contains__(self, roi_number: int) -> bool:
-        return roi_number in self._data
-
-
-# ---------------------------------------------------------------------------
-# SliceViewerState
 # ---------------------------------------------------------------------------
 @dataclass
 class SliceViewerState:
@@ -333,7 +188,11 @@ class SliceViewerState:
     # --- Slice state ---
     current_axis: str = ""
     window_level: tuple[float, float] = (300.0, 25.0)  # (window_width, window_level)
-    indices: dict[str, int] = field(default_factory=lambda: {axis: 0 for axis in AXES})
+    # Private storage: exposed through the read-only ``indices`` property so
+    # that navigation always goes through set_index() and stays observable.
+    _indices: dict[str, int] = field(
+        init=False, repr=False, default_factory=lambda: {axis: 0 for axis in AXES}
+    )
 
     # --- ROI ---
     structure_set: StructureSet = field(default_factory=StructureSet)
@@ -348,14 +207,14 @@ class SliceViewerState:
 
     # --- Crosshair ---
     crosshair_visible: bool = False
-    crosshair_pos: dict[str, tuple[float, float] | None] = field(
-        default_factory=lambda: {axis: None for axis in AXES}
+    _crosshair_pos: dict[str, tuple[float, float] | None] = field(
+        init=False, repr=False, default_factory=lambda: {axis: None for axis in AXES}
     )
 
     # --- Bounding box (physical coords: x_min, y_min, width, height) ---
     bbox_visible: bool = False
-    bounding_boxes: dict[str, tuple[float, float, float, float] | None] = field(
-        default_factory=lambda: {axis: None for axis in AXES}
+    _bounding_boxes: dict[str, tuple[float, float, float, float] | None] = field(
+        init=False, repr=False, default_factory=lambda: {axis: None for axis in AXES}
     )
 
     # --- Observer ---
@@ -565,6 +424,38 @@ class SliceViewerState:
                 logger.exception(f"Listener error for '{event_type}'.")
 
     # =========================================================
+    # Per-axis mappings (read-only views)
+    # =========================================================
+    # These three are stored privately and published as read-only views.
+    # Each has a setter that clamps or normalises the value and notifies
+    # listeners; handing out the live dictionary let callers assign into it
+    # and skip both, leaving the viewer showing one slice while the state
+    # reported another, with no event to reconcile them. Reading is
+    # unchanged — indexing, ``in``, ``len``, ``items()``, ``dict(...)`` all
+    # work; only mutation now raises.
+
+    @property
+    def indices(self) -> Mapping[str, int]:
+        """Current slice index per axis. Change with :meth:`set_index`."""
+        return MappingProxyType(self._indices)
+
+    @property
+    def crosshair_pos(self) -> Mapping[str, tuple[float, float] | None]:
+        """Crosshair position per axis in physical coords, or ``None``.
+
+        Derived from :attr:`indices`; recomputed by
+        :meth:`update_crosshair_by_index` rather than set directly.
+        """
+        return MappingProxyType(self._crosshair_pos)
+
+    @property
+    def bounding_boxes(self) -> Mapping[str, tuple[float, float, float, float] | None]:
+        """Bounding box per axis as ``(x_min, y_min, width, height)`` in
+        physical coords, or ``None``. Change with :meth:`set_bounding_box`.
+        """
+        return MappingProxyType(self._bounding_boxes)
+
+    # =========================================================
     # Axis index helpers
     # =========================================================
     def axis_to_xyz_index(self, axis: str) -> int:
@@ -590,9 +481,9 @@ class SliceViewerState:
         if self.primary_image is None:
             return 0.0
         numpy_indices = [
-            self.indices.get("axial", 0),
-            self.indices.get("coronal", 0),
-            self.indices.get("sagittal", 0),
+            self._indices.get("axial", 0),
+            self._indices.get("coronal", 0),
+            self._indices.get("sagittal", 0),
         ]
         numpy_indices[_AXIS_TO_NUMPY_DIM[axis]] = index
         # Reverse (z, y, x) to SimpleITK's (x, y, z) ordering.
@@ -612,9 +503,9 @@ class SliceViewerState:
         if self.primary_image is None:
             return (0.0, 0.0, 0.0)
         sitk_indices = (
-            self.indices.get("sagittal", 0),
-            self.indices.get("coronal", 0),
-            self.indices.get("axial", 0),
+            self._indices.get("sagittal", 0),
+            self._indices.get("coronal", 0),
+            self._indices.get("axial", 0),
         )
         px, py, pz = self.primary_image.TransformIndexToPhysicalPoint(sitk_indices)
         return (float(px), float(py), float(pz))
@@ -648,7 +539,7 @@ class SliceViewerState:
         arr = sitk.GetArrayViewFromImage(volume)
         if arr.size == 0:
             return np.array([])
-        return slice_along_axis(arr, axis, self.indices[axis])
+        return slice_along_axis(arr, axis, self._indices[axis])
 
     def get_extent(self, axis: str) -> tuple[float, float, float, float]:
         """Return ``(left, right, bottom, top)`` in physical coordinates.
@@ -684,8 +575,8 @@ class SliceViewerState:
         rule instead of duplicating ``max(0, min(...))`` at each call site.
         """
         clamped = int(np.clip(value, 0, self.get_max_index(axis)))
-        if self.indices.get(axis) != clamped:
-            self.indices[axis] = clamped
+        if self._indices.get(axis) != clamped:
+            self._indices[axis] = clamped
             self._notify(INDEX_CHANGED, axis, clamped)
             if update_crosshair:
                 self.update_crosshair_by_index()
@@ -762,7 +653,7 @@ class SliceViewerState:
         self.structure_set = StructureSet()
         object.__setattr__(self, "active_contours", set())
         object.__setattr__(self, "selected_roi_number", None)
-        self.bounding_boxes = {axis: None for axis in AXES}
+        self._bounding_boxes = {axis: None for axis in AXES}
         self.secondary_image = None
         object.__setattr__(self, "blend_alpha", 1.0)
         object.__setattr__(self, "secondary_clim", None)
@@ -780,9 +671,9 @@ class SliceViewerState:
         #
         # Listeners for secondary_image_data_changed / rt_dose_changed (e.g.
         # DicomViewer._on_secondary_image_data_changed) re-render the primary
-        # slice using self.indices as it stands at notification time. If the
+        # slice using self._indices as it stands at notification time. If the
         # previous image had more slices along an axis than the new one,
-        # self.indices still held an out-of-range value here, and the plain
+        # self._indices still held an out-of-range value here, and the plain
         # NumPy indexing in slice_along_axis() raised IndexError. That
         # exception propagated out of this method *before*
         # primary_image_data_changed was notified, so _reset_artists() and
@@ -793,15 +684,15 @@ class SliceViewerState:
         # first listener runs, while preserving the existing mid-slice jump
         # performed by the set_index() calls below.
         if image is not None:
-            self.indices = {
+            self._indices = {
                 axis: int(
-                    np.clip(self.indices.get(axis, 0), 0, self.get_max_index(axis))
+                    np.clip(self._indices.get(axis, 0), 0, self.get_max_index(axis))
                 )
                 for axis in AXES
             }
             self._cache.build_primary_array(image)
         else:
-            self.indices = {axis: 0 for axis in AXES}
+            self._indices = {axis: 0 for axis in AXES}
 
         self._notify(SECONDARY_IMAGE_DATA_CHANGED, None)
         self._notify(RT_DOSE_CHANGED, None)
@@ -950,7 +841,7 @@ class SliceViewerState:
         (float promotion happens later in ``slice_to_rgba``). Falls back to
         ``get_slice_data`` when the cache has not been built.
         """
-        cached = self._cache.get_primary_slice(axis, self.indices[axis])
+        cached = self._cache.get_primary_slice(axis, self._indices[axis])
         if cached is None:
             return self.get_slice_data(self.primary_image, axis)
         return cached
@@ -963,7 +854,7 @@ class SliceViewerState:
         """
         if self.secondary_image is None:
             return np.array([], dtype=np.float32)
-        cached = self._cache.get_secondary_slice(axis, self.indices[axis])
+        cached = self._cache.get_secondary_slice(axis, self._indices[axis])
         if cached is None:
             return self.get_slice_data(self.secondary_image, axis)
         return cached
@@ -979,7 +870,7 @@ class SliceViewerState:
             A 2-D ``float32`` NumPy array, or an empty array when the dose
             volume is absent or the CT slice lies outside the dose grid.
         """
-        cached = self._cache.get_dose_slice(axis, self.indices[axis])
+        cached = self._cache.get_dose_slice(axis, self._indices[axis])
         if cached is None:
             return self.get_dose_slice(axis)
         return cached
@@ -1022,7 +913,7 @@ class SliceViewerState:
             return np.array([])
 
         dose = self.rt_dose_image
-        physical_coord = self.index_to_physical(axis, self.indices[axis])
+        physical_coord = self.index_to_physical(axis, self._indices[axis])
 
         sitk_dim = _AXIS_TO_XYZ_DIM[axis]
 
@@ -1156,7 +1047,7 @@ class SliceViewerState:
         artists are repositioned after an artist reset.
         """
         # Force notification by clearing the previous position first.
-        self.crosshair_pos = {axis: None for axis in AXES}
+        self._crosshair_pos = {axis: None for axis in AXES}
         self.update_crosshair_by_index()
 
     def update_crosshair_by_index(self) -> None:
@@ -1175,8 +1066,8 @@ class SliceViewerState:
             "coronal": (x, z),
             "sagittal": (y, z),
         }
-        if self.crosshair_pos != new_pos:
-            self.crosshair_pos = new_pos
+        if self._crosshair_pos != new_pos:
+            self._crosshair_pos = new_pos
             self._notify(CROSSHAIR_CHANGED)
 
     def set_crosshair_visible(self, visible: bool) -> None:
@@ -1199,15 +1090,15 @@ class SliceViewerState:
         When a non-``None`` box is set for *axis*, any existing box on
         another axis is cleared automatically.
         """
-        if self.bounding_boxes.get(axis) == bbox:
+        if self._bounding_boxes.get(axis) == bbox:
             return
         # Clear boxes on all other axes when placing a new box.
         if bbox is not None:
             for other in AXES:
-                if other != axis and self.bounding_boxes.get(other) is not None:
-                    self.bounding_boxes[other] = None
+                if other != axis and self._bounding_boxes.get(other) is not None:
+                    self._bounding_boxes[other] = None
                     self._notify(BOUNDING_BOXES_CHANGED, other, None)
-        self.bounding_boxes[axis] = bbox
+        self._bounding_boxes[axis] = bbox
         self._notify(BOUNDING_BOXES_CHANGED, axis, bbox)
 
     def set_bbox_visible(self, visible: bool) -> None:
@@ -1216,7 +1107,7 @@ class SliceViewerState:
             object.__setattr__(self, "bbox_visible", visible)
             for axis in AXES:
                 self._notify(
-                    BOUNDING_BOXES_CHANGED, axis, self.bounding_boxes.get(axis)
+                    BOUNDING_BOXES_CHANGED, axis, self._bounding_boxes.get(axis)
                 )
 
     def get_bbox_pixel_coords(self, axis: str) -> tuple[int, int, int, int]:
@@ -1228,7 +1119,7 @@ class SliceViewerState:
         Raises:
             ValueError: If no bounding box has been set for *axis*.
         """
-        bbox = self.bounding_boxes.get(axis)
+        bbox = self._bounding_boxes.get(axis)
         if bbox is None:
             raise ValueError(f"No bounding box set for axis '{axis}'")
         x0_p, y0_p, w_p, h_p = bbox

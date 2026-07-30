@@ -462,6 +462,12 @@ Set `max_cached_phases=len(phases)` to eagerly retain every activated phase
 (closest to the old always-resident behaviour), or lower it to minimise peak
 memory when phases are viewed once in sequence.
 
+`state.indices`, `state.crosshair_pos` and `state.bounding_boxes` are
+read-only mappings for the same reason: each is clamped, derived or
+normalised by its setter, so assigning into them directly would bypass both
+the validation and the notification. Read them as usual and change them
+through `set_index`, `set_bounding_box` and `update_crosshair_by_index`.
+
 `state.all_phases_data` is a read-only view, as is each phase entry inside
 it. Reading it works as normal; mutating it raises, because replacing a
 phase's image behind the viewer's back would leave a cached resampled volume

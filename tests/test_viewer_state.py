@@ -407,3 +407,57 @@ class TestActiveContourNotificationIsImmutable:
         assert received[-1] == {roi}
         with pytest.raises(AttributeError):
             received[-1].add(99)
+
+
+class TestPerAxisMappingsAreReadOnly:
+    """indices / crosshair_pos / bounding_boxes must go through their setters.
+
+    Each has a setter that clamps or normalises the value and notifies
+    listeners. Assigning into the published mapping would skip both, leaving
+    the viewer and the state disagreeing with no event to reconcile them.
+    """
+
+    @staticmethod
+    def _state() -> SliceViewerState:
+        state = SliceViewerState()
+        ct = sitk.GetImageFromArray(np.zeros((6, 8, 8), dtype=np.int16))
+        state.set_primary_image_data(ct)
+        return state
+
+    @pytest.mark.parametrize("attr", ["indices", "crosshair_pos", "bounding_boxes"])
+    def test_item_assignment_is_rejected(self, attr: str) -> None:
+        mapping = getattr(self._state(), attr)
+        with pytest.raises(TypeError):
+            mapping["axial"] = None  # type: ignore[index]
+
+    @pytest.mark.parametrize("attr", ["indices", "crosshair_pos", "bounding_boxes"])
+    def test_mutating_methods_are_absent(self, attr: str) -> None:
+        mapping = getattr(self._state(), attr)
+        for method in ("pop", "clear", "update", "setdefault"):
+            assert not hasattr(mapping, method)
+
+    def test_reads_still_work(self) -> None:
+        state = self._state()
+        state.set_index("axial", 3)
+        assert state.indices["axial"] == 3
+        assert "coronal" in state.indices
+        assert len(state.indices) == 3
+        assert dict(state.indices)["axial"] == 3
+        assert state.bounding_boxes.get("axial") is None
+
+    def test_setters_remain_the_way_to_change_them(self) -> None:
+        state = self._state()
+        received: list = []
+        state.add_listener(
+            events.BOUNDING_BOXES_CHANGED, lambda a, b: received.append(a)
+        )
+
+        state.set_bounding_box("axial", (1.0, 2.0, 3.0, 4.0))
+
+        assert state.bounding_boxes["axial"] == (1.0, 2.0, 3.0, 4.0)
+        assert received == ["axial"]
+
+    def test_index_setter_still_clamps(self) -> None:
+        state = self._state()
+        state.set_index("axial", 999)
+        assert state.indices["axial"] == state.get_max_index("axial")

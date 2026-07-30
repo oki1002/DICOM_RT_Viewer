@@ -4,6 +4,46 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.0.0] — 2026
+
+First release with a stable public surface. The two changes below were
+deferred from 0.9.1 because both alter published API; they are grouped here
+rather than shipped piecemeal.
+
+### Changed (breaking)
+
+- **`indices`, `crosshair_pos` and `bounding_boxes` are now read-only
+  mappings.** Each is derived or validated: `set_index` clamps to the image
+  bounds, `set_bounding_box` clears the box on every other axis, and
+  `crosshair_pos` is recomputed from the indices. Publishing the live
+  dictionaries let a caller assign into them and skip all of that, leaving
+  the viewer drawing one slice while the state reported another with no
+  event to reconcile them — the same class of aliasing 0.8.1 and 0.9.1
+  fixed for `active_contours` and `all_phases_data`. They are now backed by
+  private storage and exposed as views.
+
+  Reading is unaffected: indexing, `in`, `len()`, `.get()`, `.items()` and
+  `dict(...)` all behave as before, so code that only reads them needs no
+  change. Assigning into them now raises `TypeError`, and mutating methods
+  (`pop`, `clear`, `update`, `setdefault`) are gone. Use `set_index`,
+  `set_bounding_box` / `set_bbox_from_pixel_coords`, and
+  `update_crosshair_by_index` / `refresh_crosshair` instead.
+
+  They are also no longer accepted as `SliceViewerState(...)` keyword
+  arguments. Passing them at construction never had any effect — the
+  setters are the only supported entry points — so this affects no working
+  code.
+
+### Changed
+
+- **`StructureSet` and `RoiEntry` moved to
+  `dicom_rt_viewer.state.structure_set`.** The ROI container has no
+  dependency on `SliceViewerState`: it holds no image, emits no events, and
+  knows nothing about slices or caches, which is what lets it be built and
+  inspected outside a viewer. It is re-exported from both
+  `dicom_rt_viewer` and `dicom_rt_viewer.state.viewer_state`, so existing
+  imports from either path keep working.
+
 ## [0.9.1] — 2026
 
 Follow-up to 0.9.0, from a review of the changes it introduced.
