@@ -3,12 +3,16 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-# Distribution name: "dicom-rt-viewer" (RT support is the differentiator and
-# plain "dicom-viewer" is too generic to be discoverable on PyPI). The import
-# package is "dicom_rt_viewer" — hyphens are not valid in Python identifiers,
-# so the import name mirrors the distribution name with underscores in
-# place of hyphens, keeping the two names aligned.
-name = "dicom-rt-viewer"
+# Distribution name: "tk-rt-viewer" (renamed from "dicom-rt-viewer" in 2.0.0;
+# see CHANGELOG). "dicom-rt-viewer" said what file formats this library reads
+# but not what makes it embeddable as-is: it is a Tkinter widget, not a
+# standalone application or another framework's plugin, and the old name was
+# also close enough to several unrelated DICOM-tooling projects on PyPI to be
+# mistaken for one of them. The import package is "tk_rt_viewer" — hyphens
+# are not valid in Python identifiers, so the import name mirrors the
+# distribution name with underscores in place of hyphens, keeping the two
+# names aligned.
+name = "tk-rt-viewer"
 dynamic = ["version"]
 description = "SimpleITK-based DICOM-RT MPR viewer widget for Tkinter (CT, RT-DOSE, RT-STRUCT, DVH)"
 readme = "README.md"
@@ -61,7 +65,7 @@ Issues = "https://github.com/oki1002/DICOM_RT_Viewer/issues"
 Changelog = "https://github.com/oki1002/DICOM_RT_Viewer/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-# Install with: pip install dicom-rt-viewer[dev]
+# Install with: pip install tk-rt-viewer[dev]
 dev = [
     "pytest>=7",
     "mypy>=1.0",
@@ -72,12 +76,12 @@ dev = [
 [tool.hatch.version]
 # __init__.py's __version__ is the single source of truth; pyproject.toml
 # no longer duplicates it, so the two can no longer drift apart.
-path = "src/dicom_rt_viewer/__init__.py"
+path = "src/tk_rt_viewer/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 # src layout: only the package under src/ is included in the wheel.
 # py.typed is picked up automatically because it lives inside the package.
-packages = ["src/dicom_rt_viewer"]
+packages = ["src/tk_rt_viewer"]
 
 [tool.mypy]
 python_version = "3.12"

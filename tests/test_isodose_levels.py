@@ -4,7 +4,7 @@ from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
-from dicom_rt_viewer.isodose_levels import (
+from tk_rt_viewer.isodose_levels import (
     DEFAULT_ISODOSE_LEVELS,
     IsoDoseLevel,
     to_gy_pairs,
@@ -44,8 +44,8 @@ class TestDefaultLevels:
         import numpy as np
         import SimpleITK as sitk
 
-        from dicom_rt_viewer.rendering.isodose import IsoDoseOverlay
-        from dicom_rt_viewer.state.viewer_state import SliceViewerState
+        from tk_rt_viewer.rendering.isodose import IsoDoseOverlay
+        from tk_rt_viewer.state.viewer_state import SliceViewerState
 
         state = SliceViewerState()
         ct = sitk.GetImageFromArray(np.zeros((2, 4, 4), dtype=np.int16))

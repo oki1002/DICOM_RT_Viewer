@@ -11,8 +11,8 @@ import numpy as np
 import pytest
 import SimpleITK as sitk
 
-from dicom_rt_viewer import rtstruct_io
-from dicom_rt_viewer.state.viewer_state import StructureSet
+from tk_rt_viewer import rtstruct_io
+from tk_rt_viewer.state.viewer_state import StructureSet
 
 
 @pytest.fixture()

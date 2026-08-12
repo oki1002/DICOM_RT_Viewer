@@ -45,9 +45,9 @@ def resample_binary_mask(mask: sitk.Image, reference: sitk.Image) -> sitk.Image:
 
     Uses nearest-neighbour interpolation to preserve binary (0/1) values,
     with 0 filled outside *mask*'s original extent. This is the exact
-    resampler configuration needed by :func:`dicom_rt_viewer.rtstruct_io.\
+    resampler configuration needed by :func:`tk_rt_viewer.rtstruct_io.\
 resample_mask_to_original_space` (LPS-space mask -> original DICOM
-    geometry) and :func:`dicom_rt_viewer.roi_operations.boolean_operation`
+    geometry) and :func:`tk_rt_viewer.roi_operations.boolean_operation`
     (aligning the second operand onto the first mask's grid); centralising
     it here keeps both call sites from drifting apart if the
     configuration ever needs to change.

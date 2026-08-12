@@ -25,7 +25,7 @@ Performance:
     All performance caches (primary / secondary / dose array caches, the
     per-slice contour path cache, the per-ROI mask volume cache, and the
     background contour-build thread pool) are owned by
-    :class:`dicom_rt_viewer.state.viewer_cache.ViewerCacheManager`, kept out of this
+    :class:`tk_rt_viewer.state.viewer_cache.ViewerCacheManager`, kept out of this
     class so that the state stays focused on observable logical state.
     ``SliceViewerState`` exposes thin ``get_*_slice_cached`` accessors and
     delegates cache lifecycle (build / invalidate / clear) to the manager.
@@ -87,7 +87,7 @@ from ..geometry import (
 from .phase_manager import PhaseManager
 
 # Re-exported: StructureSet and RoiEntry moved to their own module, but
-# dicom_rt_viewer.state.viewer_state stays their documented import path.
+# tk_rt_viewer.state.viewer_state stays their documented import path.
 from .structure_set import RoiEntry as RoiEntry
 from .structure_set import StructureSet as StructureSet
 from .viewer_cache import ContourPathCache, MaskSliceCache, ViewerCacheManager
@@ -139,7 +139,7 @@ class SliceViewerState:
         ``"contour_cache_built"``          — ``(roi_number: int)``
 
     Every event name above has a matching constant in
-    :mod:`dicom_rt_viewer.events` (e.g. ``events.INDEX_CHANGED``); prefer those
+    :mod:`tk_rt_viewer.events` (e.g. ``events.INDEX_CHANGED``); prefer those
     over string literals when calling :meth:`add_listener`.
     """
 
@@ -407,7 +407,7 @@ class SliceViewerState:
 
         Raises:
             ValueError: If *event_type* is not one of the names declared in
-                :mod:`dicom_rt_viewer.events`. Every call site in this class
+                :mod:`tk_rt_viewer.events`. Every call site in this class
                 uses those constants rather than string literals, so this
                 only fires for a genuinely unknown event — e.g. a typo in
                 third-party code driving the state directly.
@@ -415,7 +415,7 @@ class SliceViewerState:
         if event_type not in ALL_EVENTS:
             raise ValueError(
                 f"Unknown event type: {event_type!r}. "
-                f"See dicom_rt_viewer.events for the full list."
+                f"See tk_rt_viewer.events for the full list."
             )
         for listener in list(self._listeners[event_type]):
             try:
@@ -941,7 +941,7 @@ class SliceViewerState:
                 Sagittal), or ``"single"`` (one Axes, keyed as ``"axial"``).
 
         Raises:
-            ValueError: If *mode* is not one of :data:`~dicom_rt_viewer.geometry.LAYOUT_MODES`.
+            ValueError: If *mode* is not one of :data:`~tk_rt_viewer.geometry.LAYOUT_MODES`.
         """
         if mode not in LAYOUT_MODES:
             raise ValueError(
@@ -959,7 +959,7 @@ class SliceViewerState:
         """The loaded 4DCT phase entries, keyed by phase name.
 
         A read-only view — of the outer mapping and of each entry — onto
-        :class:`~dicom_rt_viewer.state.phase_manager.PhaseManager`, so that
+        :class:`~tk_rt_viewer.state.phase_manager.PhaseManager`, so that
         neither a reader of this property nor a ``phases_data_loaded``
         listener can replace a phase's image or drop a phase behind the
         resampled-volume cache's back. Build a plain ``dict`` from it when a
@@ -1221,7 +1221,7 @@ class SliceViewerState:
         Args:
             rois: List of ``(name, mask, color)`` tuples, e.g. built from
                 the ``RoiInfo`` dicts returned by
-                :func:`~dicom_rt_viewer.rtstruct_io.load_rt_struct`.
+                :func:`~tk_rt_viewer.rtstruct_io.load_rt_struct`.
 
         Returns:
             ROI numbers in the same order as *rois*.
@@ -1243,9 +1243,9 @@ class SliceViewerState:
         activate: bool = True,
         resolve_name_collisions: bool = True,
     ) -> list[int]:
-        """Add the ROIs returned by :func:`~dicom_rt_viewer.rtstruct_io.load_rt_struct`.
+        """Add the ROIs returned by :func:`~tk_rt_viewer.rtstruct_io.load_rt_struct`.
 
-        :func:`~dicom_rt_viewer.rtstruct_io.load_rt_struct` yields masks as
+        :func:`~tk_rt_viewer.rtstruct_io.load_rt_struct` yields masks as
         NumPy arrays keyed by the ROI number recorded in the file, while
         :meth:`add_contour` and :meth:`add_contours` take ``sitk.Image``
         masks and assign their own ROI numbers. Bridging the two — wrapping

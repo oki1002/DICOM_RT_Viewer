@@ -7,7 +7,7 @@ slices, caches or rendering. Keeping it free of those concerns is what lets
 it be built and inspected outside a viewer — when importing an RT-STRUCT
 before any image is displayed, or when writing one out.
 
-:class:`~dicom_rt_viewer.state.viewer_state.SliceViewerState` owns an
+:class:`~tk_rt_viewer.state.viewer_state.SliceViewerState` owns an
 instance, delegates ROI storage to it, and is responsible for turning every
 mutation into the matching notification.
 """
@@ -168,8 +168,3 @@ class StructureSet:
 
     def __contains__(self, roi_number: int) -> bool:
         return roi_number in self._data
-
-
-# ---------------------------------------------------------------------------
-# SliceViewerState
-# ---------------------------------------------------------------------------

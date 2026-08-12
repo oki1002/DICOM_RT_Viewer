@@ -4,6 +4,38 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] — 2026
+
+Both the distribution and the import package are renamed. This is the same
+shape of change already made once for `dicom_viewer` → `dicom_rt_viewer` in
+0.6.0/0.7.0, applied again for the same underlying reason: the name did not
+say enough about what makes this library reusable.
+
+### Changed (breaking)
+
+- **Distribution renamed to `tk-rt-viewer`.** `dicom-rt-viewer` correctly
+  signalled the file formats this library reads (DICOM, RT-STRUCT, RT-DOSE)
+  but said nothing about the one fact that most affects whether a given
+  project can use it as-is: it is a Tkinter widget, not a standalone
+  application, a web viewer, or another GUI framework's plugin. The name was
+  also close enough to several unrelated DICOM-tooling projects on PyPI to
+  be mistaken for one of them in a search result. `pip install dicom-rt-viewer`
+  is replaced by `pip install tk-rt-viewer`.
+- **Import package renamed from `dicom_rt_viewer` to `tk_rt_viewer`**,
+  matching the distribution name as before (hyphens are not valid in Python
+  identifiers, so the import name uses underscores in their place). Update
+  `from dicom_rt_viewer import ...` to `from tk_rt_viewer import ...`; every
+  submodule path moves the same way (`dicom_rt_viewer.io` →
+  `tk_rt_viewer.io`, and likewise for `.rtstruct_io`, `.roi_operations`,
+  `.events`, `.isodose_levels`, and `.state.*`). Nothing else about the
+  public surface changes — every class, function, and argument keeps its
+  1.0.0 name and behaviour.
+
+`dicom-rt-viewer` will not receive further releases on PyPI beyond 1.0.0.
+Pin `dicom-rt-viewer==1.0.0` if you are not ready to migrate; there is no
+functional reason to, since 2.0.0 is import-path-identical to 1.0.0 aside
+from the package name itself.
+
 ## [1.0.0] — 2026
 
 First release with a stable public surface. The two changes below were

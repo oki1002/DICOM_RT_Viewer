@@ -13,7 +13,7 @@ between recently viewed phases stays cheap. Peak memory is bound by the
 number of *recently viewed* phases rather than the total phase count.
 
 The manager is a plain collaborator: it holds no observable state and emits
-no events. :class:`~dicom_rt_viewer.state.viewer_state.SliceViewerState`
+no events. :class:`~tk_rt_viewer.state.viewer_state.SliceViewerState`
 owns an instance, delegates its phase API to it, and is solely responsible
 for firing ``phases_data_loaded`` / ``phase_changed``.
 """
@@ -187,7 +187,7 @@ class PhaseManager:
         adjust it at runtime, which means it can also be set to a value
         that would evict the phase currently being displayed. Clamping is
         reported rather than applied silently, to match the warning
-        :class:`~dicom_rt_viewer.state.viewer_state.SliceViewerState` emits
+        :class:`~tk_rt_viewer.state.viewer_state.SliceViewerState` emits
         when the same value is out of range at construction time.
         """
         limit = self._max_cached()

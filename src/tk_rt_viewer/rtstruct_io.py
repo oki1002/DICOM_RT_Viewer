@@ -93,7 +93,7 @@ def save_structure_set(
 ) -> int:
     """Write every ROI of *structure_set* to an RT-STRUCT file.
 
-    Saving a :class:`~dicom_rt_viewer.state.viewer_state.StructureSet`
+    Saving a :class:`~tk_rt_viewer.state.viewer_state.StructureSet`
     otherwise requires the caller to bridge two mismatches on its own: the
     masks are held in the LPS-aligned space the viewer works in and have to
     be resampled back to the geometry the RT-STRUCT will reference, and each

@@ -1,4 +1,4 @@
-"""dicom_rt_viewer — SimpleITK-based DICOM MPR viewer widget for Tkinter.
+"""tk_rt_viewer — SimpleITK-based DICOM MPR viewer widget for Tkinter.
 
 Public API (re-exported here)
 -----------------------------
@@ -13,7 +13,7 @@ SliceViewerState
     Observable state container.  Holds all mutable state: images, indices,
     window/level, ROI masks, brush settings, bounding boxes, crosshair
     positions, and 4DCT phase data. Change events are declared as constants
-    in :mod:`dicom_rt_viewer.events`.
+    in :mod:`tk_rt_viewer.events`.
 
 StructureSet / RoiEntry
     ROI mask container keyed by integer ROI number, and the typed entry it
@@ -28,25 +28,25 @@ IsoDoseLevel / DEFAULT_ISODOSE_LEVELS / to_gy_pairs
 
 Submodule API (import from the submodule)
 -----------------------------------------
-``dicom_rt_viewer.io``
+``tk_rt_viewer.io``
     validate_dicom_files, find_reg_matrices,
     load_all_series, load_dcm_series, normalize_phase_label
 
-``dicom_rt_viewer.rtstruct_io``
+``tk_rt_viewer.rtstruct_io``
     load_rt_struct, mask2rtstruct, save_structure_set,
     resample_mask_to_original_space, random_hex_color, RtStructLoadError
 
-``dicom_rt_viewer.roi_operations``
+``tk_rt_viewer.roi_operations``
     interpolate_contour, apply_margin, smooth_contour,
     boolean_operation, thin_slices
 
-``dicom_rt_viewer.events``
+``tk_rt_viewer.events``
     Event-name constants for ``SliceViewerState.add_listener``.
 
 Quick start::
 
     import tkinter as tk
-    from dicom_rt_viewer import DicomViewer, SliceViewerState
+    from tk_rt_viewer import DicomViewer, SliceViewerState
 
     root = tk.Tk()
     state = SliceViewerState()
@@ -73,7 +73,7 @@ __all__ = [
     "StructureSet",
     "to_gy_pairs",
 ]
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 
 def __getattr__(name: str) -> Any:
@@ -86,7 +86,7 @@ def __getattr__(name: str) -> Any:
     build, so those helpers could not be used from a headless process
     (a batch converter, an inference worker, a CI runner without
     ``python3-tk``). Deferring the import keeps the widget available as
-    ``dicom_rt_viewer.DicomViewer`` while leaving the GUI-free modules
+    ``tk_rt_viewer.DicomViewer`` while leaving the GUI-free modules
     importable on their own.
     """
     if name == "DicomViewer":

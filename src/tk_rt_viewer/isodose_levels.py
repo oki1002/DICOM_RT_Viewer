@@ -1,6 +1,6 @@
 """isodose_levels.py — Iso-dose level definitions shared by the overlay and host UI.
 
-:class:`~dicom_rt_viewer.rendering.isodose.IsoDoseOverlay` renders iso-dose
+:class:`~tk_rt_viewer.rendering.isodose.IsoDoseOverlay` renders iso-dose
 levels expressed in absolute dose (Gy), because that is what a dose
 distribution is measured in. Clinically, though, levels are chosen relative
 to a reference dose — "the 95% line", not "the 66.5 Gy line" — so any
@@ -57,7 +57,7 @@ class IsoDoseLevel:
             reference_dose: The dose (Gy) that 100% corresponds to —
                 typically the prescription dose, or Dmax when no
                 prescription is recorded (see
-                :meth:`~dicom_rt_viewer.state.viewer_state.SliceViewerState.get_dose_fallback_ref_gy`).
+                :meth:`~tk_rt_viewer.state.viewer_state.SliceViewerState.get_dose_fallback_ref_gy`).
 
         Returns:
             ``reference_dose * percent / 100``.
@@ -69,7 +69,7 @@ class IsoDoseLevel:
 #:
 #: A tuple of frozen levels, so it is safe to share and cannot be edited in
 #: place; build a list from it when a mutable working copy is needed.
-#: :class:`~dicom_rt_viewer.rendering.isodose.IsoDoseOverlay` falls back to
+#: :class:`~tk_rt_viewer.rendering.isodose.IsoDoseOverlay` falls back to
 #: this ladder when no explicit levels have been set.
 DEFAULT_ISODOSE_LEVELS: tuple[IsoDoseLevel, ...] = (
     IsoDoseLevel(30, "#0000cc"),
@@ -88,7 +88,7 @@ def to_gy_pairs(
     """Convert *levels* to the ``(dose_gy, colour)`` pairs the viewer expects.
 
     Produces exactly the argument
-    :meth:`~dicom_rt_viewer.viewer.DicomViewer.set_isodose_lines` requires:
+    :meth:`~tk_rt_viewer.viewer.DicomViewer.set_isodose_lines` requires:
     hidden levels dropped, non-positive doses dropped, and the remainder
     sorted ascending by dose.
 

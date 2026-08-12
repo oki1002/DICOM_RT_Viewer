@@ -21,8 +21,8 @@ matplotlib.use("Agg")
 import numpy as np
 import SimpleITK as sitk
 
-from dicom_rt_viewer.event_controllers.brush_handler import BrushEventHandler
-from dicom_rt_viewer.state.viewer_state import SliceViewerState
+from tk_rt_viewer.event_controllers.brush_handler import BrushEventHandler
+from tk_rt_viewer.state.viewer_state import SliceViewerState
 
 
 class _FakeDrawingManager:
