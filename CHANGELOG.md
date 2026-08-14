@@ -4,6 +4,40 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.1] — 2026
+
+### Fixed
+
+- **Oblique acquisitions (gantry-tilted CT, sagittal/coronal MR) were
+  resampled to the wrong location, discarding a large fraction of the
+  volume.** `io._orient_to_lps` resamples a rotated series onto an
+  axis-aligned grid so that downstream rendering — which only reads
+  origin/spacing and assumes identity direction — displays it correctly.
+  The resample built a custom `AffineTransform` from the image's direction
+  matrix, but the transform had no rotation center set (defaulting to the
+  world origin, not the image origin) and was applied inverted. For a
+  volume with a non-trivial gantry tilt or scan-plane rotation, this
+  silently sampled the output tens to over a hundred millimetres away from
+  the intended physical location — for a 10° tilt with a typical DICOM
+  origin, roughly two-thirds of the volume fell outside the resampled
+  output. Axis-aligned series (identity direction; the common case for CT)
+  were unaffected, since they skip the resample entirely.
+
+  The fix removes the custom transform: `ResampleImageFilter` already
+  converts between physical points and each image's own index space using
+  that image's own Direction/Origin/Spacing, so mapping an output physical
+  point straight onto the same input physical point (the filter's default,
+  identity transform) already reslices correctly — no rotation matrix
+  needs to be constructed or applied by the caller. Verified against a
+  synthetic oblique volume with a known off-center feature: the physical
+  centroid of the resampled feature now stays within a sub-voxel margin of
+  its true location (was off by over 100 mm before this fix), across
+  tested tilt angles from a few degrees up to 25°.
+
+  Anyone whose application code compensated for this (e.g. by discarding
+  or otherwise working around vanished slices on oblique series) can
+  remove that workaround after upgrading.
+
 ## [1.1.0] — 2026
 
 Both the distribution and the import package are renamed. This is the same

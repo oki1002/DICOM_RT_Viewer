@@ -240,7 +240,34 @@ def _read_series(
 
 
 def _orient_to_lps(image: sitk.Image) -> tuple[sitk.Image, sitk.Image]:
-    """Orient *image* to LPS, resampling to axis-aligned grid if rotated.
+    """Orient *image* to LPS, resampling to an axis-aligned grid if rotated.
+
+    ``sitk.DICOMOrient`` only permutes and flips axes to the closest LPS-like
+    arrangement; a genuinely oblique acquisition (gantry-tilted CT, sagittal
+    or coronal MR with residual rotation) keeps a non-identity direction
+    after that call. Downstream rendering (``geometry.compute_extent`` and
+    every ``imshow(extent=...)`` call built on it) only ever reads
+    origin/spacing and assumes an axis-aligned grid, so that residual
+    rotation has to be resolved here, once, rather than by every caller.
+
+    The resample below deliberately uses the *default* (identity) transform
+    together with ``SetReferenceImage`` + ``SetOutputDirection(identity)``:
+    ``ResampleImageFilter`` converts between physical points and each
+    image's own index space using that image's own Direction/Origin/Spacing,
+    so mapping an output physical point straight onto the same input
+    physical point already reslices a rotated input onto an axis-aligned
+    output correctly. No custom rotation transform is needed — constructing
+    one from the direction matrix (as an earlier version of this function
+    did) is not just redundant but actively wrong unless its rotation
+    center is set to the image origin and its direction of application
+    exactly cancels the very rotation being resolved; get either detail
+    wrong and the output silently samples tens to over a hundred millimetres
+    away from the intended location, discarding a large fraction of the
+    volume in the process. Anyone tempted to reintroduce a transform here to
+    "explicitly" apply the rotation should re-derive it against a synthetic
+    oblique volume with a known off-center feature and check that the
+    resampled feature's physical centroid does not move (beyond ordinary
+    interpolation error), the way this fix was validated.
 
     Returns:
         ``(lps_image, original_image)``. When no rotation is present both
@@ -254,17 +281,12 @@ def _orient_to_lps(image: sitk.Image) -> tuple[sitk.Image, sitk.Image]:
         return image_lps, original_image
 
     logger.info("Rotation detected; resampling to identity orientation.")
-    transform = sitk.AffineTransform(3)
-    transform.SetMatrix(image_lps.GetDirection())
-
     resample = sitk.ResampleImageFilter()
     resample.SetReferenceImage(image_lps)
-    resample.SetSize(image_lps.GetSize())
-    resample.SetOutputSpacing(image_lps.GetSpacing())
-    resample.SetOutputOrigin(image_lps.GetOrigin())
     resample.SetOutputDirection(np.eye(3).flatten())
     resample.SetInterpolator(sitk.sitkLinear)
-    resample.SetTransform(transform.GetInverse())
+    # Transform is deliberately left at its default (identity) — see the
+    # docstring above for why that is correct here, not an oversight.
     return resample.Execute(image_lps), original_image
 
 
