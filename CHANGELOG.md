@@ -4,6 +4,33 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.2] — 2026
+
+### Fixed
+
+- **The brush cursor crashed with `NotImplementedError: cannot remove
+  artist` after a primary-image reload or layout-mode switch.**
+  `DicomViewer._reset_artists()` calls `Axes.clear()` on every view, which
+  silently invalidates any patch added via `ax.add_patch()` — matplotlib's
+  `cla()` discards the artist's removal hook without calling
+  `Artist.remove()` on it. The method already dropped its own stale
+  references for every other overlay it owns (isodose, crosshair, bbox,
+  contour) immediately after the `clear()` calls, but
+  `BrushEventHandler.brush_circle` was not among them. The next mouse-move
+  or axes-leave event then reached `BrushEventHandler._remove_brush_cursor()`,
+  which tried to `.remove()` the already-invalidated circle a second time
+  and hit matplotlib's guard, raising instead of the expected no-op. In a
+  host application forwarding this through `FigureCanvasTkAgg`'s event
+  loop (`on_motion` / `on_leave_axes`), it surfaced as an identical
+  traceback logged on every pointer movement across the affected view.
+
+  `BrushEventHandler.reset()` is added, following the same pattern as
+  `IsodoseOverlay.reset()` / `ContourOverlay.reset()`: it only drops the
+  stale reference (`self.brush_circle = None`) without calling `.remove()`
+  on it. `DicomViewer._reset_artists()` now calls it alongside the other
+  overlay resets. The cursor circle is recreated lazily on the next
+  mouse-move, so no visible behavior changes beyond the crash going away.
+
 ## [1.1.1] — 2026
 
 ### Fixed

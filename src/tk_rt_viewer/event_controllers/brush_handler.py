@@ -71,6 +71,22 @@ class BrushEventHandler:
         self._remove_brush_cursor()
         self.viewer.canvas.draw_idle()
 
+    def reset(self) -> None:
+        """Drop the cursor artist reference after the owning Axes were cleared.
+
+        Call this after ``ax.clear()`` / a layout rebuild (see
+        ``DicomViewer._reset_artists``). At that point ``brush_circle`` is
+        already gone from the Axes — matplotlib's ``cla()`` discards the
+        artist bookkeeping without calling ``Artist.remove()`` on each
+        child — so ``_remove_brush_cursor`` calling ``.remove()`` on the
+        stale reference would raise ``NotImplementedError: cannot remove
+        artist``. Only the reference is released here; the cursor circle
+        is recreated lazily on the next mouse-move via
+        ``_update_brush_cursor``, mirroring ``ContourOverlay.reset`` /
+        ``IsodoseOverlay.reset``.
+        """
+        self.brush_circle = None
+
     # ------------------------------------------------------------------
     # Event handlers
     # ------------------------------------------------------------------

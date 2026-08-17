@@ -18,6 +18,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 
+import matplotlib.pyplot as plt
 import numpy as np
 import SimpleITK as sitk
 
@@ -32,12 +33,20 @@ class _FakeDrawingManager:
         pass
 
 
+class _FakeToolbar:
+    """Stand-in for the matplotlib NavigationToolbar2Tk; brush_handler only
+    reads ``.mode`` to detect zoom/pan mode being active."""
+
+    mode: str = ""
+
+
 class _FakeViewer:
     """Minimal stand-in for DicomViewer; brush_handler only needs these."""
 
     def __init__(self) -> None:
         self.drawing_manager = _FakeDrawingManager()
         self.axs: dict = {}
+        self.toolbar = _FakeToolbar()
 
     def draw_axis_contours_with_override(self, axis, override_mask=None) -> None:
         pass
@@ -165,3 +174,99 @@ class TestOnlyPaintAndEraseButtonsAct:
     def test_right_click_still_erases(self) -> None:
         before, after = self._stroke(button=3)
         assert after < before
+
+
+class TestResetAfterAxesCleared:
+    """Pins the fix for a NotImplementedError crash reported against a host
+
+    application: DicomViewer._reset_artists() (called on primary-image
+    reload / layout rebuild) runs Axes.clear() on every view, which
+    silently invalidates any patch added via ax.add_patch() — including
+    the brush cursor circle. A real Figure/Axes pair is used here (not
+    _FakeViewer) because the crash depends on matplotlib's actual artist
+    bookkeeping: Axes.clear() discards each child artist's removal hook
+    without calling Artist.remove() on it, so calling .remove() on the
+    same artist afterwards raises NotImplementedError('cannot remove
+    artist') instead of a plain no-op.
+    """
+
+    def test_stale_circle_after_axes_clear_raises_without_reset(self) -> None:
+        """Confirms the failure mode this test module guards against.
+
+        Without calling handler.reset() after ax.clear(), the next cursor
+        removal (e.g. the pointer leaving the view) hits the matplotlib
+        bug described above. This test exists to document the crash, not
+        to assert desired behaviour.
+        """
+        fig, ax = plt.subplots()
+        try:
+            fake_viewer = _FakeViewer()
+            fake_viewer.axs = {"axial": ax}
+
+            state, _ = _make_state_with_roi()
+            state.current_axis = "axial"
+            handler = BrushEventHandler(state, fake_viewer)
+            handler.activate()
+            handler._update_brush_cursor(_Event(xdata=1.0, ydata=1.0))
+            assert handler.brush_circle is not None
+
+            ax.clear()  # Mirrors DicomViewer._reset_artists()
+
+            try:
+                handler._remove_brush_cursor()
+            except NotImplementedError:
+                pass
+            else:
+                raise AssertionError(
+                    "matplotlib no longer raises on a stale artist; "
+                    "the workaround this test documents may be obsolete."
+                )
+        finally:
+            plt.close(fig)
+
+    def test_reset_drops_stale_reference_without_raising(self) -> None:
+        """BrushEventHandler.reset() must be called after ax.clear()."""
+        fig, ax = plt.subplots()
+        try:
+            fake_viewer = _FakeViewer()
+            fake_viewer.axs = {"axial": ax}
+
+            state, _ = _make_state_with_roi()
+            state.current_axis = "axial"
+            handler = BrushEventHandler(state, fake_viewer)
+            handler.activate()
+            handler._update_brush_cursor(_Event(xdata=1.0, ydata=1.0))
+            assert handler.brush_circle is not None
+
+            ax.clear()  # Mirrors DicomViewer._reset_artists()
+            handler.reset()  # DicomViewer._reset_artists() must call this
+            assert handler.brush_circle is None
+
+            # Must not raise: no stale artist reference remains.
+            handler._remove_brush_cursor()
+            handler.handle_motion(_Event(xdata=1.0, ydata=1.0))
+            handler.remove_cursor()
+        finally:
+            plt.close(fig)
+
+    def test_cursor_reappears_after_reset_on_next_motion(self) -> None:
+        """The cursor must be recreated lazily, not permanently lost."""
+        fig, ax = plt.subplots()
+        try:
+            fake_viewer = _FakeViewer()
+            fake_viewer.axs = {"axial": ax}
+
+            state, _ = _make_state_with_roi()
+            state.current_axis = "axial"
+            handler = BrushEventHandler(state, fake_viewer)
+            handler.activate()
+            handler._update_brush_cursor(_Event(xdata=1.0, ydata=1.0))
+            assert handler.brush_circle is not None
+
+            ax.clear()
+            handler.reset()
+
+            handler.handle_motion(_Event(xdata=2.0, ydata=2.0))
+            assert handler.brush_circle is not None
+        finally:
+            plt.close(fig)

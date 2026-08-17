@@ -833,6 +833,13 @@ class DicomViewer(ttk.Frame):
         # ax.clear() invalidates any host-application overlay artists too;
         # drop the references so the blit layer never touches a removed artist.
         self._extra_blit_artists = {axis: [] for axis in AXES}
+        # Same reasoning applies to the brush cursor circle: it is added via
+        # ax.add_patch() by BrushEventHandler, so it is silently invalidated
+        # by ax.clear() above just like the overlays reset on the surrounding
+        # lines. Without this, a stale reference survives here and the next
+        # mouse-move raises NotImplementedError ("cannot remove artist") from
+        # BrushEventHandler._remove_brush_cursor().
+        self.event_handler.brush_handler.reset()
         self.contours.reset()
         self._backgrounds = {axis: None for axis in AXES}
         # Reset the same-slice early-exit counters and blit caches so the
