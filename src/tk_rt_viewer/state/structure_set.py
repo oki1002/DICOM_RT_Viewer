@@ -95,7 +95,8 @@ class StructureSet:
         unknown = props.keys() - valid_fields
         if unknown:
             raise ValueError(
-                f"Unknown RoiEntry field(s) {sorted(unknown)}; expected one of {sorted(valid_fields)}."
+                f"Unknown RoiEntry field(s) {sorted(unknown)}; "
+                f"expected one of {sorted(valid_fields)}."
             )
         for key, value in props.items():
             setattr(entry, key, value)

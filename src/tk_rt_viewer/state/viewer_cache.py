@@ -17,16 +17,16 @@ Thread-safety notes for the background contour build are documented on
 """
 
 import logging
+import threading
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Callable
 
 import numpy as np
 import SimpleITK as sitk
 
-from ..geometry import AXES
+from ..geometry import AXES, compute_extent, mask_slice_to_paths, slice_along_axis
 from ..geometry import AXIS_TO_NUMPY_DIM as _AXIS_TO_NUMPY_DIM
 from ..geometry import AXIS_TO_XYZ_DIM as _AXIS_TO_XYZ_DIM
-from ..geometry import compute_extent, mask_slice_to_paths, slice_along_axis
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +47,19 @@ class ContourPathCache:
         - :meth:`clear` removes all entries.
           Call this when the primary image or the entire structure set is
           replaced.
+
+    Thread safety:
+        Every method takes a lock. Writes come from two directions at once —
+        the background contour-build pool pre-computes whole ROIs while the
+        UI thread stores paths for slices it renders before the build reaches
+        them (see :meth:`ContourOverlay.draw`) — so the two do write the same
+        ROI concurrently. The individual dict operations are atomic under the
+        GIL, but ``setdefault`` followed by an item assignment is not: two
+        threads adding the first entry for the same ROI can each create a
+        nested dict, and one of the two writes is then dropped. The lost entry
+        is only recomputed rather than corrupting anything, but the lock costs
+        nothing measurable next to ``find_contours`` and removes the need to
+        reason about it at all.
     """
 
     def __init__(self) -> None:
@@ -54,28 +67,34 @@ class ContourPathCache:
         # Nested per-ROI so invalidate_roi is O(1) (a flat dict required
         # a full key scan).
         self._cache: dict[int, dict[tuple[str, int], list]] = {}
+        self._lock = threading.Lock()
 
     def get(self, roi_number: int, axis: str, index: int) -> list | None:
         """Return cached paths, or ``None`` when the entry is absent."""
-        roi_cache = self._cache.get(roi_number)
-        if roi_cache is None:
-            return None
-        return roi_cache.get((axis, index))
+        with self._lock:
+            roi_cache = self._cache.get(roi_number)
+            if roi_cache is None:
+                return None
+            return roi_cache.get((axis, index))
 
     def set(self, roi_number: int, axis: str, index: int, paths: list) -> None:
         """Store *paths* for the given key."""
-        self._cache.setdefault(roi_number, {})[(axis, index)] = paths
+        with self._lock:
+            self._cache.setdefault(roi_number, {})[(axis, index)] = paths
 
     def invalidate_roi(self, roi_number: int) -> None:
         """Remove all cached entries for *roi_number*."""
-        self._cache.pop(roi_number, None)
+        with self._lock:
+            self._cache.pop(roi_number, None)
 
     def clear(self) -> None:
         """Remove every cached entry."""
-        self._cache.clear()
+        with self._lock:
+            self._cache.clear()
 
     def __len__(self) -> int:
-        return sum(len(roi_cache) for roi_cache in self._cache.values())
+        with self._lock:
+            return sum(len(roi_cache) for roi_cache in self._cache.values())
 
 
 # ---------------------------------------------------------------------------
@@ -497,12 +516,12 @@ class ViewerCacheManager:
                 This prevents paths computed with a stale extent from
                 leaking into a re-numbered ROI number for a new image.
 
-        Thread safety: writes to ``contour_path_cache`` are not guarded by a
-        lock, but the ``(roi_number, axis, index)`` keys written here are
-        never written concurrently by the UI thread (brush-dragging skips
-        the cache for the active ROI but does not write to it). The GIL
-        protection on dict insertion is therefore considered sufficient
-        in practice.
+        Thread safety: ``contour_path_cache`` is internally locked, which is
+        what makes the unsynchronised interleaving here safe. The UI thread
+        does write the same ROI concurrently — ``ContourOverlay.draw`` stores
+        the paths for any slice it renders before this build reaches it — so
+        the two are genuinely concurrent writers, not merely potentially so.
+        See :class:`ContourPathCache` for the failure mode the lock removes.
         """
         if primary_image is None:
             return

@@ -39,6 +39,29 @@ class DvhPanel:
         """
         self._state = state
 
+    @staticmethod
+    def _dose_voxels_in_roi(dose_arr: np.ndarray, mask_arr: np.ndarray) -> np.ndarray:
+        """Return the dose values inside *mask_arr* as a 1-D array.
+
+        The mask is reduced to its bounding box before the values are
+        extracted. Boolean-indexing the whole volume allocates a full-volume
+        temporary for the comparison and scans every voxel, which is paid once
+        per active ROI on every DVH update — and a brush stroke triggers one
+        of those on release. An ROI typically occupies a few percent of the
+        grid, so cropping first turns that into a small fraction of the work
+        while producing exactly the same set of values.
+        """
+        occupied = [
+            np.flatnonzero(mask_arr.any(axis=axes)) for axes in ((1, 2), (0, 2), (0, 1))
+        ]
+        if any(indices.size == 0 for indices in occupied):
+            return np.empty(0, dtype=dose_arr.dtype)
+        box = tuple(
+            slice(int(indices[0]), int(indices[-1]) + 1) for indices in occupied
+        )
+        mask_box = mask_arr[box]
+        return np.asarray(dose_arr[box][mask_box != 0])
+
     def style_axes(self, ax: Axes) -> None:
         """Apply dark-theme styling to the DVH axes.
 
@@ -108,7 +131,7 @@ class DvhPanel:
                 mask_arr = sitk.GetArrayViewFromImage(mask_sitk)
             if mask_arr.shape != dose_arr.shape:
                 continue
-            voxels = dose_arr[mask_arr != 0]
+            voxels = self._dose_voxels_in_roi(dose_arr, mask_arr)
             if voxels.size == 0:
                 continue
 

@@ -16,9 +16,11 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from ..protocols import ViewerHost
+from ..state.viewer_state import SliceViewerState
+
 if TYPE_CHECKING:
-    from ..state.viewer_state import SliceViewerState
-    from ..viewer import DicomViewer
+    from .viewer_events import ViewerEventHandler
 
 
 class BboxEventHandler:
@@ -30,9 +32,22 @@ class BboxEventHandler:
     #: Minimum allowed box dimension (in data units) during a resize.
     _MIN_SIZE: float = 1.0
 
-    def __init__(self, state: "SliceViewerState", viewer: "DicomViewer") -> None:
+    def __init__(
+        self,
+        state: SliceViewerState,
+        viewer: ViewerHost,
+        hover: "ViewerEventHandler",
+    ) -> None:
+        """Initialise the handler.
+
+        Args:
+            state: The shared viewer state.
+            viewer: The host viewer, seen through :class:`ViewerHost`.
+            hover: The dispatcher that tracks which view the pointer is in.
+        """
         self.state = state
         self.viewer = viewer
+        self._hover = hover
 
         self._interaction_mode: str | None = None  # "create" | "move" | "resize"
         self._resize_handle: str | None = None  # "t" | "b" | "l" | "r" | corners
@@ -58,7 +73,7 @@ class BboxEventHandler:
         if not self.state.bbox_visible:
             return False
 
-        axis = self.state.current_axis
+        axis = self._hover.current_axis
         if not axis or event.xdata is None or event.ydata is None:
             return False
 
@@ -183,12 +198,12 @@ class BboxEventHandler:
         handle is returned regardless of ylim orientation.
         """
         bbox = self.state.bounding_boxes.get(axis)
-        if bbox is None or not self.viewer.axs.get(axis):
+        if bbox is None or self.viewer.axes_map.get(axis) is None:
             return None
         if event.xdata is None or event.ydata is None:
             return None
 
-        ax = self.viewer.axs[axis]
+        ax = self.viewer.axes_map[axis]
         x, y, w, h = bbox
         x_min, x_max = x, x + w
         y_min, y_max = y, y + h

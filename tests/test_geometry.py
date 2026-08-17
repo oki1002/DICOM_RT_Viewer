@@ -68,7 +68,7 @@ class TestComputeExtent:
         size = img.GetSize()
         spacing = img.GetSpacing()
         origin = img.GetOrigin()
-        for d, (lo, hi) in zip(dims, ((x0, x1), (y0, y1))):
+        for d, (lo, hi) in zip(dims, ((x0, x1), (y0, y1)), strict=False):
             w = size[d]
             for i in (0, w // 2, w - 1):
                 imshow_center = lo + (i + 0.5) * (hi - lo) / w

@@ -4,6 +4,8 @@ import matplotlib
 
 matplotlib.use("Agg")
 
+import pathlib
+
 import numpy as np
 import pytest
 import SimpleITK as sitk
@@ -63,7 +65,8 @@ class TestSetattrGuard:
         state = SliceViewerState()
         received: list[tuple[float, float]] = []
         state.add_listener(
-            events.WINDOW_LEVEL_CHANGED, lambda w, l: received.append((w, l))
+            events.WINDOW_LEVEL_CHANGED,
+            lambda width, level: received.append((width, level)),
         )
         state.window_level = (400.0, 40.0)
         assert state.window_level == (400.0, 40.0)
@@ -295,9 +298,17 @@ class TestAddRtStructRois:
         )
         assert state.structure_set.get_name(numbers[0]) == "PTV"
 
-    def test_without_a_primary_image_it_adds_nothing(self) -> None:
+    def test_without_a_primary_image_it_raises(self) -> None:
+        """Masks have no geometry to be interpreted against without an image.
+
+        This used to log an error and return an empty list, which is
+        indistinguishable at the call site from an RT-STRUCT that legitimately
+        contained no ROIs — so a caller loading a structure set before its CT
+        saw a silent no-op instead of a fixable ordering mistake.
+        """
         state = SliceViewerState()
-        assert state.add_rt_struct_rois({1: self._roi("PTV")}) == []
+        with pytest.raises(RuntimeError, match="no primary image"):
+            state.add_rt_struct_rois({1: self._roi("PTV")})
         assert len(state.structure_set) == 0
 
 
@@ -461,3 +472,135 @@ class TestPerAxisMappingsAreReadOnly:
         state = self._state()
         state.set_index("axial", 999)
         assert state.indices["axial"] == state.get_max_index("axial")
+
+
+class TestSecondaryWindowLevel:
+    """The secondary image carries its own display window.
+
+    Following the primary is the default because the usual overlay (a 4DCT
+    phase, a MAR reconstruction) shares its intensity scale; a PET, MR or dose
+    overlay does not, and needs its own.
+    """
+
+    @staticmethod
+    def _state() -> SliceViewerState:
+        state = SliceViewerState()
+        state.set_window_level(400.0, 40.0)
+        return state
+
+    def test_it_follows_the_primary_by_default(self) -> None:
+        state = self._state()
+        assert state.secondary_window_level is None
+        assert state.effective_secondary_window_level() == (400.0, 40.0)
+
+    def test_the_override_wins_once_set(self) -> None:
+        state = self._state()
+        state.set_secondary_window_level(80.0, 20.0)
+        assert state.effective_secondary_window_level() == (80.0, 20.0)
+
+    def test_the_primary_is_untouched_by_the_override(self) -> None:
+        state = self._state()
+        state.set_secondary_window_level(80.0, 20.0)
+        assert state.window_level == (400.0, 40.0)
+
+    def test_passing_none_restores_following(self) -> None:
+        state = self._state()
+        state.set_secondary_window_level(80.0, 20.0)
+        state.set_secondary_window_level(None)
+        assert state.secondary_window_level is None
+        assert state.effective_secondary_window_level() == (400.0, 40.0)
+
+    def test_a_pair_can_be_passed_back_in_unchanged(self) -> None:
+        state = self._state()
+        state.set_secondary_window_level((120.0, 60.0))
+        state.set_secondary_window_level(state.secondary_window_level)
+        assert state.secondary_window_level == (120.0, 60.0)
+
+    def test_a_lone_window_width_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="window and a level"):
+            self._state().set_secondary_window_level(80.0)
+
+    def test_a_malformed_pair_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="pair"):
+            self._state().set_secondary_window_level((80.0, 20.0, 5.0))
+
+    def test_listeners_are_notified_with_the_resolved_value(self) -> None:
+        state = self._state()
+        seen: list = []
+        state.add_listener(events.SECONDARY_WINDOW_LEVEL_CHANGED, seen.append)
+        state.set_secondary_window_level(80.0, 20.0)
+        state.set_secondary_window_level(80.0, 20.0)  # unchanged: no event
+        state.set_secondary_window_level(None)
+        assert seen == [(80.0, 20.0), None]
+
+    def test_a_direct_assignment_still_notifies(self) -> None:
+        state = self._state()
+        seen: list = []
+        state.add_listener(events.SECONDARY_WINDOW_LEVEL_CHANGED, seen.append)
+        state.secondary_window_level = (200.0, 100.0)
+        assert seen == [(200.0, 100.0)]
+
+    def test_loading_a_new_primary_image_clears_the_override(self) -> None:
+        state = self._state()
+        state.set_secondary_window_level(80.0, 20.0)
+        image = sitk.GetImageFromArray(np.zeros((2, 4, 4), dtype=np.int16))
+        state.set_primary_image_data(image)
+        assert state.secondary_window_level is None
+
+
+class TestWindowLevelTarget:
+    def test_it_defaults_to_the_primary(self) -> None:
+        assert SliceViewerState().window_level_target == "primary"
+
+    def test_an_unknown_target_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="window_level_target"):
+            SliceViewerState().set_window_level_target("tertiary")
+
+    def test_changing_it_notifies(self) -> None:
+        state = SliceViewerState()
+        seen: list[str] = []
+        state.add_listener(events.WINDOW_LEVEL_TARGET_CHANGED, seen.append)
+        state.set_window_level_target("secondary")
+        state.set_window_level_target("secondary")
+        assert seen == ["secondary"]
+
+    @pytest.mark.parametrize("target", ["primary", "secondary"])
+    def test_apply_delta_routes_to_the_named_image(self, target: str) -> None:
+        state = SliceViewerState()
+        state.set_window_level(400.0, 40.0)
+        state.apply_window_level_delta(target, 111.0, 22.0)
+        if target == "primary":
+            assert state.window_level == (111.0, 22.0)
+            assert state.secondary_window_level is None
+        else:
+            assert state.window_level == (400.0, 40.0)
+            assert state.secondary_window_level == (111.0, 22.0)
+
+    def test_apply_delta_rejects_an_unknown_target(self) -> None:
+        with pytest.raises(ValueError, match="target"):
+            SliceViewerState().apply_window_level_delta("tertiary", 1.0, 1.0)
+
+
+class TestBrushSizeClamp:
+    """A zero radius used to divide by zero inside the stroke interpolation."""
+
+    @pytest.mark.parametrize("requested", [0.0, -5.0])
+    def test_a_non_positive_radius_is_clamped(self, requested: float) -> None:
+        state = SliceViewerState()
+        state.set_brush_size_mm(requested)
+        assert state.brush_size_mm > 0
+
+    def test_an_ordinary_radius_is_kept(self) -> None:
+        state = SliceViewerState()
+        state.set_brush_size_mm(7.5)
+        assert state.brush_size_mm == pytest.approx(7.5)
+
+
+class TestPackagingMarker:
+    """The py.typed marker was advertised in the docs but never shipped."""
+
+    def test_the_marker_file_is_installed(self) -> None:
+        import tk_rt_viewer
+
+        marker = pathlib.Path(tk_rt_viewer.__file__).parent / "py.typed"
+        assert marker.is_file()

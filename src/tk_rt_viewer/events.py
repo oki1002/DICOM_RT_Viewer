@@ -17,7 +17,8 @@ PRIMARY_IMAGE_DATA_CHANGED: Final = "primary_image_data_changed"
 SECONDARY_IMAGE_DATA_CHANGED: Final = "secondary_image_data_changed"
 BLEND_ALPHA_CHANGED: Final = "blend_alpha_changed"
 SECONDARY_IMAGE_CMAP_CHANGED: Final = "secondary_image_cmap_changed"
-SECONDARY_CLIM_CHANGED: Final = "secondary_clim_changed"
+SECONDARY_WINDOW_LEVEL_CHANGED: Final = "secondary_window_level_changed"
+WINDOW_LEVEL_TARGET_CHANGED: Final = "window_level_target_changed"
 PHASES_DATA_LOADED: Final = "phases_data_loaded"
 PHASE_CHANGED: Final = "phase_changed"
 RT_DOSE_CHANGED: Final = "rt_dose_changed"
@@ -45,7 +46,8 @@ ALL_EVENTS: Final[frozenset[str]] = frozenset(
         SECONDARY_IMAGE_DATA_CHANGED,
         BLEND_ALPHA_CHANGED,
         SECONDARY_IMAGE_CMAP_CHANGED,
-        SECONDARY_CLIM_CHANGED,
+        SECONDARY_WINDOW_LEVEL_CHANGED,
+        WINDOW_LEVEL_TARGET_CHANGED,
         PHASES_DATA_LOADED,
         PHASE_CHANGED,
         RT_DOSE_CHANGED,

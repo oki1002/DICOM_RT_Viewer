@@ -7,11 +7,10 @@ These pin two fixes from the 0.7.1 review:
       the host application switches state.selected_roi_number to a
       different ROI before the mouse button is released.
 
-BrushEventHandler only needs a handful of DicomViewer's attributes
-(drawing_manager.add_request, axs, draw_axis_contours_with_override), so a
-minimal fake stands in for it. This avoids constructing a real DicomViewer,
-which requires a Tk display that is not available in a headless test
-environment.
+BrushEventHandler sees its viewer only through
+:class:`~tk_rt_viewer.protocols.ViewerHost`, so a small stand-in satisfies it
+here. This avoids constructing a real DicomViewer, which requires a Tk display
+that is not available in a headless test environment.
 """
 
 import matplotlib
@@ -26,30 +25,45 @@ from tk_rt_viewer.event_controllers.brush_handler import BrushEventHandler
 from tk_rt_viewer.state.viewer_state import SliceViewerState
 
 
-class _FakeDrawingManager:
-    """No-op stand-in for rendering.drawing_manager.DrawingManager."""
-
-    def add_request(self, axis: str) -> None:
-        pass
-
-
-class _FakeToolbar:
-    """Stand-in for the matplotlib NavigationToolbar2Tk; brush_handler only
-    reads ``.mode`` to detect zoom/pan mode being active."""
-
-    mode: str = ""
-
-
 class _FakeViewer:
-    """Minimal stand-in for DicomViewer; brush_handler only needs these."""
+    """Stand-in for DicomViewer satisfying the ViewerHost protocol."""
 
     def __init__(self) -> None:
-        self.drawing_manager = _FakeDrawingManager()
         self.axs: dict = {}
-        self.toolbar = _FakeToolbar()
+        self.toolbar_mode: str = ""
+        self.redraw_requests: list[str] = []
 
-    def draw_axis_contours_with_override(self, axis, override_mask=None) -> None:
+    @property
+    def axes_map(self) -> dict:
+        return self.axs
+
+    def request_redraw(self, axis: str) -> None:
+        self.redraw_requests.append(axis)
+
+    def flush_redraws(self) -> None:
         pass
+
+    def refresh_canvas(self) -> None:
+        pass
+
+    def draw_contours_with_override(self, axis, override_mask=None) -> None:
+        pass
+
+    def schedule(self, delay_ms, callback):
+        return None
+
+    def cancel_scheduled(self, handle) -> None:
+        pass
+
+    def add_axes_artist(self, axis: str, artist) -> None:
+        self.axs[axis].add_artist(artist)
+
+
+class _FakeHover:
+    """Stand-in for the dispatcher that tracks the hovered view."""
+
+    def __init__(self) -> None:
+        self.current_axis: str = ""
 
 
 class _Event:
@@ -81,15 +95,17 @@ def _make_state_with_roi() -> tuple[SliceViewerState, int]:
 class TestHandlePressEmptyAxisGuard:
     def test_press_outside_any_view_does_not_raise(self) -> None:
         state, _ = _make_state_with_roi()
-        handler = BrushEventHandler(state, _FakeViewer())
-        state.current_axis = ""  # e.g. cursor is over the figure margin
+        hover = _FakeHover()
+        handler = BrushEventHandler(state, _FakeViewer(), hover)
+        hover.current_axis = ""  # e.g. cursor is over the figure margin
         handler.handle_press(_Event(xdata=None, ydata=None))  # must not raise
         assert handler._is_dragging is False
 
     def test_press_with_no_xdata_does_not_raise(self) -> None:
         state, _ = _make_state_with_roi()
-        handler = BrushEventHandler(state, _FakeViewer())
-        state.current_axis = "axial"
+        hover = _FakeHover()
+        handler = BrushEventHandler(state, _FakeViewer(), hover)
+        hover.current_axis = "axial"
         handler.handle_press(_Event(xdata=None, ydata=None))
         assert handler._is_dragging is False
 
@@ -100,8 +116,9 @@ class TestHandleReleaseCommitsToStrokeRoi:
         roi_b = state.add_contour("CTV", _make_mask(state.primary_image), "#00ff00")
 
         state.set_selected_roi(roi_a)
-        handler = BrushEventHandler(state, _FakeViewer())
-        state.current_axis = "axial"
+        hover = _FakeHover()
+        handler = BrushEventHandler(state, _FakeViewer(), hover)
+        hover.current_axis = "axial"
 
         x_min, x_max, y_min, y_max = state.get_extent("axial")
         cx, cy = (x_min + x_max) / 2, (y_min + y_max) / 2
@@ -131,7 +148,7 @@ class TestOnlyPaintAndEraseButtonsAct:
     """
 
     @staticmethod
-    def _filled_state() -> tuple[SliceViewerState, int]:
+    def _filled_state() -> tuple[SliceViewerState, int, "_FakeHover"]:
         state = SliceViewerState()
         img = sitk.GetImageFromArray(np.zeros((4, 16, 16), dtype=np.int16))
         img.SetSpacing((1.0, 1.0, 1.0))
@@ -141,8 +158,9 @@ class TestOnlyPaintAndEraseButtonsAct:
         roi_number = state.add_contour("PTV", filled, "#ff0000")
         state.set_selected_roi(roi_number)
         state.set_brush_size_mm(3.0)
-        state.current_axis = "axial"
-        return state, roi_number
+        hover = _FakeHover()
+        hover.current_axis = "axial"
+        return state, roi_number, hover
 
     @staticmethod
     def _voxel_count(state: SliceViewerState, roi_number: int) -> int:
@@ -151,9 +169,9 @@ class TestOnlyPaintAndEraseButtonsAct:
         return int(sitk.GetArrayFromImage(mask).sum())
 
     def _stroke(self, button: int) -> tuple[int, int]:
-        state, roi_number = self._filled_state()
+        state, roi_number, hover = self._filled_state()
         before = self._voxel_count(state, roi_number)
-        handler = BrushEventHandler(state, _FakeViewer())
+        handler = BrushEventHandler(state, _FakeViewer(), hover)
         handler.activate()
         event = _Event(xdata=8.0, ydata=8.0, button=button)
         handler.handle_press(event)
@@ -165,8 +183,8 @@ class TestOnlyPaintAndEraseButtonsAct:
         assert after == before
 
     def test_middle_click_does_not_start_a_drag(self) -> None:
-        state, _ = self._filled_state()
-        handler = BrushEventHandler(state, _FakeViewer())
+        state, _, hover = self._filled_state()
+        handler = BrushEventHandler(state, _FakeViewer(), hover)
         handler.activate()
         handler.handle_press(_Event(xdata=8.0, ydata=8.0, button=2))
         assert handler._is_dragging is False
@@ -204,8 +222,9 @@ class TestResetAfterAxesCleared:
             fake_viewer.axs = {"axial": ax}
 
             state, _ = _make_state_with_roi()
-            state.current_axis = "axial"
-            handler = BrushEventHandler(state, fake_viewer)
+            hover = _FakeHover()
+            hover.current_axis = "axial"
+            handler = BrushEventHandler(state, fake_viewer, hover)
             handler.activate()
             handler._update_brush_cursor(_Event(xdata=1.0, ydata=1.0))
             assert handler.brush_circle is not None
@@ -232,8 +251,9 @@ class TestResetAfterAxesCleared:
             fake_viewer.axs = {"axial": ax}
 
             state, _ = _make_state_with_roi()
-            state.current_axis = "axial"
-            handler = BrushEventHandler(state, fake_viewer)
+            hover = _FakeHover()
+            hover.current_axis = "axial"
+            handler = BrushEventHandler(state, fake_viewer, hover)
             handler.activate()
             handler._update_brush_cursor(_Event(xdata=1.0, ydata=1.0))
             assert handler.brush_circle is not None
@@ -257,8 +277,9 @@ class TestResetAfterAxesCleared:
             fake_viewer.axs = {"axial": ax}
 
             state, _ = _make_state_with_roi()
-            state.current_axis = "axial"
-            handler = BrushEventHandler(state, fake_viewer)
+            hover = _FakeHover()
+            hover.current_axis = "axial"
+            handler = BrushEventHandler(state, fake_viewer, hover)
             handler.activate()
             handler._update_brush_cursor(_Event(xdata=1.0, ydata=1.0))
             assert handler.brush_circle is not None

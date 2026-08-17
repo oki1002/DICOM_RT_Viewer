@@ -4,6 +4,8 @@ Pins the docstring claim that _shift_accumulate's filter-based
 implementation is equivalent to iterated-roll OR/AND dilation/erosion.
 """
 
+import dataclasses
+
 import numpy as np
 import pytest
 import SimpleITK as sitk
@@ -214,3 +216,175 @@ class TestThinSlices:
         arr = np.ones((4, 4, 4), dtype=np.uint8)
         with pytest.raises(ValueError):
             thin_slices(make_mask(arr), interval=1)
+
+
+class TestMarginConfigValidation:
+    """Expansion and contraction cannot be combined in one configuration.
+
+    An ellipsoid cannot grow one face while shrinking another, and applying
+    the six directions sequentially instead makes the result depend on the
+    order they happen to be applied in.
+    """
+
+    def test_mixing_signs_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="mix expansion and contraction"):
+            MarginConfig(superior=5.0, inferior=-5.0)
+
+    def test_the_error_names_the_way_out(self) -> None:
+        with pytest.raises(ValueError, match="two separate apply_margin calls"):
+            MarginConfig(anterior=3.0, posterior=-1.0)
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            MarginConfig.uniform(5.0),
+            MarginConfig.uniform(-5.0),
+            MarginConfig(superior=5.0, inferior=0.0),
+            MarginConfig(superior=-5.0, inferior=0.0),
+            MarginConfig(),
+        ],
+    )
+    def test_a_single_sign_is_accepted(self, config: MarginConfig) -> None:
+        assert config.as_tuple() is not None
+
+    def test_it_is_immutable(self) -> None:
+        config = MarginConfig.uniform(5.0)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            config.superior = -5.0  # type: ignore[misc]
+
+    def test_expansion_and_contraction_are_reported(self) -> None:
+        assert MarginConfig.uniform(5.0).expands is True
+        assert MarginConfig.uniform(-5.0).expands is False
+        assert MarginConfig().is_zero is True
+
+    def test_an_asymmetric_pair_becomes_a_radius_and_an_offset(self) -> None:
+        config = MarginConfig(superior=10.0, inferior=4.0)
+        assert config.radii_mm()[2] == pytest.approx(7.0)
+        assert config.offset_mm()[2] == pytest.approx(3.0)
+
+
+class TestMarginIsSpherical:
+    """Pins the box-to-ball fix.
+
+    Composing three 1-D dilations grows a box: a uniform 5 mm margin reached
+    5 mm along the axes but sqrt(3) * 5 ~ 8.7 mm diagonally.
+    """
+
+    @staticmethod
+    def _sphere(
+        radius_mm: float = 10.0, spacing: tuple[float, float, float] = (1.0, 1.0, 2.0)
+    ) -> tuple[sitk.Image, np.ndarray]:
+        shape = (32, 64, 64)
+        zz, yy, xx = np.mgrid[0 : shape[0], 0 : shape[1], 0 : shape[2]]
+        distance = np.sqrt(
+            ((xx - 32) * spacing[0]) ** 2
+            + ((yy - 32) * spacing[1]) ** 2
+            + ((zz - 16) * spacing[2]) ** 2
+        )
+        image = sitk.GetImageFromArray((distance <= radius_mm).astype(np.uint8))
+        image.SetSpacing(spacing)
+        return image, distance
+
+    def test_expansion_reaches_the_same_distance_in_every_direction(self) -> None:
+        image, distance = self._sphere()
+        out = sitk.GetArrayFromImage(
+            apply_margin(image, MarginConfig.uniform(5.0))
+        ).astype(bool)
+        # Every included voxel is within 15 mm of the centre (10 + 5), and the
+        # margin actually reaches that far. A box margin would have reached
+        # ~17 mm diagonally.
+        assert distance[out].max() == pytest.approx(15.0, abs=1.0)
+        assert not (distance[out] > 15.6).any()
+
+    def test_contraction_shrinks_to_the_expected_radius(self) -> None:
+        image, distance = self._sphere()
+        out = sitk.GetArrayFromImage(
+            apply_margin(image, MarginConfig.uniform(-4.0))
+        ).astype(bool)
+        assert distance[out].max() == pytest.approx(6.0, abs=1.0)
+
+    def test_an_anisotropic_margin_uses_an_ellipsoid(self) -> None:
+        image, _distance = self._sphere()
+        config = MarginConfig(
+            superior=8.0, inferior=8.0, anterior=2.0, posterior=2.0, left=2.0, right=2.0
+        )
+        out = sitk.GetArrayFromImage(apply_margin(image, config)).astype(bool)
+        z_indices = np.flatnonzero(out.any(axis=(1, 2)))
+        x_indices = np.flatnonzero(out.any(axis=(0, 1)))
+        # Base sphere spans 20 mm in each direction; z spacing is 2 mm.
+        assert (z_indices.max() - z_indices.min()) * 2 == pytest.approx(36.0, abs=2.0)
+        assert (x_indices.max() - x_indices.min()) == pytest.approx(24.0, abs=2.0)
+
+    def test_an_empty_mask_is_returned_untouched(self) -> None:
+        empty = sitk.GetImageFromArray(np.zeros((4, 8, 8), dtype=np.uint8))
+        out = apply_margin(empty, MarginConfig.uniform(5.0))
+        assert int(sitk.GetArrayFromImage(out).sum()) == 0
+
+    def test_the_geometry_is_preserved(self) -> None:
+        image, _distance = self._sphere()
+        out = apply_margin(image, MarginConfig.uniform(3.0))
+        assert out.GetSpacing() == image.GetSpacing()
+        assert out.GetOrigin() == image.GetOrigin()
+        assert out.GetSize() == image.GetSize()
+
+
+class TestInterpolateContourMorphs:
+    """Pins the distance-field interpolation fix.
+
+    Averaging two binary slices and thresholding at 0.5 is not interpolation:
+    it reduces to the nearer neighbour on each side of the gap, so an
+    off-centre structure jumped rather than travelled.
+    """
+
+    @staticmethod
+    def _two_offset_squares() -> sitk.Image:
+        arr = np.zeros((9, 32, 32), dtype=np.uint8)
+        arr[0, 4:12, 4:12] = 1
+        arr[8, 20:28, 20:28] = 1
+        image = sitk.GetImageFromArray(arr)
+        image.SetSpacing((1.0, 1.0, 1.0))
+        return image
+
+    @staticmethod
+    def _centroid(slice_arr: np.ndarray) -> tuple[float, float]:
+        rows, cols = np.nonzero(slice_arr)
+        return float(rows.mean()), float(cols.mean())
+
+    def test_the_gap_is_filled(self) -> None:
+        out = sitk.GetArrayFromImage(
+            interpolate_contour(self._two_offset_squares())
+        ).astype(bool)
+        assert all(out[z].any() for z in range(9))
+
+    def test_the_shape_travels_instead_of_jumping(self) -> None:
+        out = sitk.GetArrayFromImage(
+            interpolate_contour(self._two_offset_squares())
+        ).astype(bool)
+        centroids = [self._centroid(out[z])[0] for z in range(9)]
+        # Strictly increasing: the old implementation produced two flat runs
+        # with a single step in the middle.
+        assert all(b > a for a, b in zip(centroids, centroids[1:], strict=False))
+
+    def test_the_midpoint_sits_between_the_two_ends(self) -> None:
+        out = sitk.GetArrayFromImage(
+            interpolate_contour(self._two_offset_squares())
+        ).astype(bool)
+        first = self._centroid(out[0])[0]
+        last = self._centroid(out[8])[0]
+        middle = self._centroid(out[4])[0]
+        assert first < middle < last
+        assert middle == pytest.approx((first + last) / 2, abs=1.5)
+
+    def test_the_original_slices_are_preserved(self) -> None:
+        source = self._two_offset_squares()
+        arr = sitk.GetArrayFromImage(source).astype(bool)
+        out = sitk.GetArrayFromImage(interpolate_contour(source)).astype(bool)
+        np.testing.assert_array_equal(out[0], arr[0])
+        np.testing.assert_array_equal(out[8], arr[8])
+
+    def test_a_single_slice_is_left_alone(self) -> None:
+        arr = np.zeros((5, 16, 16), dtype=np.uint8)
+        arr[2, 4:8, 4:8] = 1
+        image = sitk.GetImageFromArray(arr)
+        out = sitk.GetArrayFromImage(interpolate_contour(image))
+        np.testing.assert_array_equal(out.astype(bool), arr.astype(bool))

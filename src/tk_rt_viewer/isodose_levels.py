@@ -110,4 +110,7 @@ def to_gy_pairs(
     pairs = [
         (level.to_gy(reference_dose), level.color) for level in levels if level.visible
     ]
-    return sorted((gy, color) for gy, color in pairs if gy > 0)
+    # Sorted on the dose alone: sorting the (gy, colour) tuples would fall
+    # back to comparing colour strings whenever two levels resolve to the same
+    # dose, which is an arbitrary tie-break dressed up as an ordering.
+    return sorted((pair for pair in pairs if pair[0] > 0), key=lambda pair: pair[0])

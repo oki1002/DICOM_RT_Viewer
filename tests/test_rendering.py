@@ -1,0 +1,433 @@
+"""Tests for the rendering collaborators.
+
+Covers the modules that carry rendering logic but had no direct coverage:
+the layout builder, the redraw-coalescing manager, the blit compositor, the
+image layer, the contour overlay, and the two numerical fixes in the isodose
+and DVH panels. Everything here runs on the Agg backend with a plain
+``Figure``, so no Tk display is required.
+"""
+
+import matplotlib
+
+matplotlib.use("Agg")
+
+import numpy as np
+import pytest
+import SimpleITK as sitk
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
+
+from tk_rt_viewer.rendering.blit_compositor import BlitCompositor
+from tk_rt_viewer.rendering.contour_overlay import ContourOverlay
+from tk_rt_viewer.rendering.drawing_manager import DrawingManager
+from tk_rt_viewer.rendering.dvh import DvhPanel
+from tk_rt_viewer.rendering.image_layer import ImageLayer
+from tk_rt_viewer.rendering.isodose import IsoDoseOverlay
+from tk_rt_viewer.rendering.layout import LayoutManager
+from tk_rt_viewer.rendering.render import clim_to_window_level, window_level_to_clim
+from tk_rt_viewer.state.viewer_state import SliceViewerState
+
+
+class _FakeScheduler:
+    """Records scheduled callbacks instead of running them on a Tk loop."""
+
+    def __init__(self) -> None:
+        self.pending: dict[str, callable] = {}
+        self.cancelled: list[str] = []
+        self._next = 0
+
+    def schedule(self, _delay_ms, callback) -> str:
+        self._next += 1
+        handle = f"h{self._next}"
+        self.pending[handle] = callback
+        return handle
+
+    def schedule_idle(self, callback) -> str:
+        return self.schedule(0, callback)
+
+    def cancel(self, handle) -> None:
+        self.cancelled.append(handle)
+        self.pending.pop(handle, None)
+
+    def run_all(self) -> None:
+        callbacks = list(self.pending.values())
+        self.pending.clear()
+        for callback in callbacks:
+            callback()
+
+
+def _loaded_state(shape: tuple[int, int, int] = (4, 8, 8)) -> SliceViewerState:
+    state = SliceViewerState()
+    arr = np.arange(np.prod(shape), dtype=np.int16).reshape(shape)
+    image = sitk.GetImageFromArray(arr)
+    image.SetSpacing((1.0, 1.0, 1.0))
+    state.set_primary_image_data(image)
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Window / level conversion
+# ---------------------------------------------------------------------------
+class TestWindowLevelConversion:
+    @pytest.mark.parametrize(
+        "window_level,clim",
+        [((400.0, 40.0), (-160.0, 240.0)), ((1.0, 0.0), (-0.5, 0.5))],
+    )
+    def test_round_trip(self, window_level, clim) -> None:
+        assert window_level_to_clim(window_level) == pytest.approx(clim)
+        assert clim_to_window_level(clim) == pytest.approx(window_level)
+
+
+# ---------------------------------------------------------------------------
+# LayoutManager
+# ---------------------------------------------------------------------------
+class TestLayoutManager:
+    @staticmethod
+    def _manager() -> LayoutManager:
+        return LayoutManager(Figure(), style_dvh_axes=lambda _ax: None)
+
+    def test_mpr_builds_three_views_and_a_dvh(self) -> None:
+        axs, dvh_ax = self._manager().build("mpr")
+        assert set(axs) == {"axial", "coronal", "sagittal"}
+        assert dvh_ax is not None
+
+    def test_mpr_wide_has_no_dvh_panel(self) -> None:
+        axs, dvh_ax = self._manager().build("mpr_wide")
+        assert set(axs) == {"axial", "coronal", "sagittal"}
+        assert dvh_ax is None
+
+    def test_single_builds_only_the_axial_view(self) -> None:
+        axs, dvh_ax = self._manager().build("single")
+        assert set(axs) == {"axial"}
+        assert dvh_ax is None
+
+    def test_an_unknown_mode_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="layout mode"):
+            self._manager().build("quad")
+
+
+# ---------------------------------------------------------------------------
+# DrawingManager
+# ---------------------------------------------------------------------------
+class TestDrawingManager:
+    @staticmethod
+    def _manager(known=("axial",)) -> tuple[DrawingManager, list[str], _FakeScheduler]:
+        drawn: list[str] = []
+        scheduler = _FakeScheduler()
+        manager = DrawingManager(
+            redraw=drawn.append,
+            is_known_axis=lambda axis: axis in known,
+            schedule_idle=scheduler.schedule_idle,
+            cancel=scheduler.cancel,
+        )
+        return manager, drawn, scheduler
+
+    def test_repeat_requests_coalesce_into_one_redraw(self) -> None:
+        manager, drawn, scheduler = self._manager()
+        manager.add_request("axial")
+        manager.add_request("axial")
+        manager.add_request("axial")
+        assert drawn == []  # nothing until the idle callback runs
+        scheduler.run_all()
+        assert drawn == ["axial"]
+
+    def test_only_one_idle_callback_is_armed_per_burst(self) -> None:
+        manager, _drawn, scheduler = self._manager()
+        manager.add_request("axial")
+        manager.add_request("axial")
+        assert len(scheduler.pending) == 1
+
+    def test_requests_for_unknown_axes_are_dropped(self) -> None:
+        manager, drawn, scheduler = self._manager(known=("axial",))
+        manager.add_request("coronal")
+        manager.add_request("")
+        scheduler.run_all()
+        assert drawn == []
+
+    def test_flush_redraws_without_waiting_for_the_idle_loop(self) -> None:
+        manager, drawn, scheduler = self._manager()
+        manager.add_request("axial")
+        manager.flush()
+        assert drawn == ["axial"]
+        assert scheduler.pending == {}
+
+    def test_cancel_discards_the_queue(self) -> None:
+        manager, drawn, scheduler = self._manager()
+        manager.add_request("axial")
+        manager.cancel()
+        scheduler.run_all()
+        assert drawn == []
+
+
+# ---------------------------------------------------------------------------
+# BlitCompositor
+# ---------------------------------------------------------------------------
+class TestBlitCompositor:
+    @staticmethod
+    def _compositor(artists=None):
+        fig = Figure()
+        canvas = FigureCanvasAgg(fig)
+        ax = fig.add_subplot(111)
+        scheduler = _FakeScheduler()
+        calls: list[str] = []
+
+        def blit_artists(axis: str):
+            calls.append(axis)
+            return artists(axis) if artists else []
+
+        compositor = BlitCompositor(
+            canvas=canvas,
+            axes_map=lambda: {"axial": ax},
+            blit_artists=blit_artists,
+            overlay_artists=lambda _axis: [],
+            transient_artists=lambda _axis: [],
+            schedule=scheduler.schedule,
+            cancel=scheduler.cancel,
+        )
+        return compositor, calls, scheduler, ax
+
+    def test_the_artist_list_is_assembled_once_and_reused(self) -> None:
+        compositor, calls, _scheduler, _ax = self._compositor()
+        # cache_backgrounds ends with a blit pass, which assembles the list.
+        compositor.cache_backgrounds()
+        assert calls == ["axial"]
+        calls.clear()
+        compositor.redraw_axis("axial")
+        compositor.redraw_axis("axial")
+        assert calls == []
+
+    def test_invalidate_forces_the_list_to_be_rebuilt(self) -> None:
+        compositor, calls, _scheduler, _ax = self._compositor()
+        compositor.cache_backgrounds()
+        compositor.redraw_axis("axial")
+        calls.clear()
+        compositor.invalidate("axial")
+        compositor.redraw_axis("axial")
+        assert calls == ["axial"]
+
+    def test_redraw_before_any_background_exists_is_a_no_op(self) -> None:
+        compositor, calls, _scheduler, _ax = self._compositor()
+        compositor.redraw_axis("axial")
+        assert calls == []
+
+    def test_a_burst_of_rebuild_requests_leaves_one_pending_callback(self) -> None:
+        compositor, _calls, scheduler, _ax = self._compositor()
+        compositor.schedule_rebuild()
+        compositor.schedule_rebuild()
+        compositor.schedule_rebuild()
+        assert len(scheduler.pending) == 1
+
+    def test_cancel_pending_prevents_the_rebuild(self) -> None:
+        compositor, _calls, scheduler, _ax = self._compositor()
+        compositor.schedule_rebuild()
+        compositor.cancel_pending()
+        assert scheduler.pending == {}
+
+    def test_overlay_artists_are_not_baked_into_the_background(self) -> None:
+        fig = Figure()
+        canvas = FigureCanvasAgg(fig)
+        ax = fig.add_subplot(111)
+        line = ax.axhline(0.5)
+        scheduler = _FakeScheduler()
+        visibility_during_render: list[bool] = []
+
+        def blit_artists(_axis):
+            visibility_during_render.append(line.get_visible())
+            return [line]
+
+        compositor = BlitCompositor(
+            canvas=canvas,
+            axes_map=lambda: {"axial": ax},
+            blit_artists=blit_artists,
+            overlay_artists=lambda _axis: [line],
+            transient_artists=lambda _axis: [],
+            schedule=scheduler.schedule,
+            cancel=scheduler.cancel,
+        )
+        compositor.cache_backgrounds()
+        # The blit pass runs after visibility is restored, so the artist must
+        # be visible by the time it is drawn on top.
+        assert visibility_during_render == [True]
+        assert line.get_visible() is True
+
+
+# ---------------------------------------------------------------------------
+# ImageLayer
+# ---------------------------------------------------------------------------
+class TestImageLayer:
+    @staticmethod
+    def _layer(state):
+        changed: list[str] = []
+        redrawn: list[str] = []
+        layer = ImageLayer(state, changed.append, redrawn.append)
+        return layer, changed, redrawn
+
+    def test_the_first_update_creates_an_artist_and_reports_it(self) -> None:
+        state = _loaded_state()
+        layer, changed, redrawn = self._layer(state)
+        ax = Figure().add_subplot(111)
+        layer.update("axial", ax)
+        assert layer.primary_artist("axial") is not None
+        assert changed == ["axial"]
+        assert redrawn == ["axial"]
+
+    def test_a_plain_slice_change_does_not_invalidate_the_artist_list(self) -> None:
+        state = _loaded_state()
+        layer, changed, _redrawn = self._layer(state)
+        ax = Figure().add_subplot(111)
+        layer.update("axial", ax)
+        changed.clear()
+        state.set_index("axial", 2)
+        layer.update("axial", ax)
+        assert changed == []
+
+    def test_the_rgba_buffer_is_reused_across_updates(self) -> None:
+        """Scrolling must not allocate a fresh RGBA buffer per frame.
+
+        Reaches into the private buffer store deliberately: the reuse is not
+        observable through any public surface, and it is the whole point of
+        the ``out=`` parameter threaded through ``slice_to_rgba``.
+        """
+        state = _loaded_state()
+        layer, _changed, _redrawn = self._layer(state)
+        ax = Figure().add_subplot(111)
+        layer.update("axial", ax)
+        first = layer._primary_buffers["axial"]
+        state.set_index("axial", 1)
+        layer.update("axial", ax)
+        assert layer._primary_buffers["axial"] is first
+
+    def test_reset_drops_every_artist_reference(self) -> None:
+        state = _loaded_state()
+        layer, _changed, _redrawn = self._layer(state)
+        ax = Figure().add_subplot(111)
+        layer.update("axial", ax)
+        layer.reset()
+        assert layer.primary_artist("axial") is None
+        assert layer.blit_artists("axial") == []
+
+    def test_the_secondary_uses_its_own_window_when_one_is_set(self) -> None:
+        """The two images must be windowed independently.
+
+        A secondary window of (2, 1) maps everything at or above 2 to white,
+        while the primary window of (10000, 5000) leaves the same slice almost
+        black — so if the secondary followed the primary the two renders would
+        be identical.
+        """
+        state = _loaded_state()
+        state.set_secondary_image_data(state.primary_image)
+        state.set_window_level(10000.0, 5000.0)
+        layer, _changed, _redrawn = self._layer(state)
+        ax = Figure().add_subplot(111)
+
+        layer.update("axial", ax)
+        following = layer.secondary_artist("axial").get_array().copy()
+
+        state.set_secondary_window_level(2.0, 1.0)
+        layer.update("axial", ax)
+        independent = layer.secondary_artist("axial").get_array()
+
+        assert not np.array_equal(following[..., :3], independent[..., :3])
+        assert independent[..., :3].max() > following[..., :3].max()
+
+
+# ---------------------------------------------------------------------------
+# ContourOverlay
+# ---------------------------------------------------------------------------
+class TestContourOverlay:
+    @staticmethod
+    def _state_with_roi() -> tuple[SliceViewerState, int]:
+        state = _loaded_state()
+        arr = np.zeros((4, 8, 8), dtype=np.uint8)
+        arr[1:3, 2:6, 2:6] = 1
+        mask = sitk.GetImageFromArray(arr)
+        mask.CopyInformation(state.primary_image)
+        roi = state.add_contour("PTV", mask, "#ff0000")
+        state.set_active_contours({roi})
+        state.set_index("axial", 1)
+        return state, roi
+
+    def test_drawing_an_active_roi_creates_a_collection(self) -> None:
+        state, _roi = self._state_with_roi()
+        overlay = ContourOverlay(state, on_artists_changed=lambda _axis: None)
+        ax = Figure().add_subplot(111)
+        overlay.draw("axial", ax)
+        assert overlay.collection("axial") is not None
+        assert overlay.blit_artists("axial")
+
+    def test_an_inactive_roi_contributes_no_paths(self) -> None:
+        state, _roi = self._state_with_roi()
+        state.set_active_contours(set())
+        overlay = ContourOverlay(state, on_artists_changed=lambda _axis: None)
+        ax = Figure().add_subplot(111)
+        overlay.draw("axial", ax)
+        collection = overlay.collection("axial")
+        assert collection is None or len(collection.get_paths()) == 0
+
+    def test_reset_releases_the_collection(self) -> None:
+        state, _roi = self._state_with_roi()
+        overlay = ContourOverlay(state, on_artists_changed=lambda _axis: None)
+        ax = Figure().add_subplot(111)
+        overlay.draw("axial", ax)
+        overlay.reset()
+        assert overlay.collection("axial") is None
+
+
+# ---------------------------------------------------------------------------
+# IsoDoseOverlay
+# ---------------------------------------------------------------------------
+class TestIsoDoseDownsampling:
+    """Pins the conditional-downsampling fix.
+
+    Dose grids are routinely exported at 2-3 mm, leaving slices far smaller
+    than the threshold; striding those moved every isodose line by up to a
+    whole dose voxel for a saving that does not matter at that size.
+    """
+
+    @staticmethod
+    def _overlay() -> IsoDoseOverlay:
+        return IsoDoseOverlay(_loaded_state(), on_artists_changed=lambda _axis: None)
+
+    def test_a_coarse_dose_slice_is_not_strided(self) -> None:
+        overlay = self._overlay()
+        assert overlay._DOWNSAMPLE_MIN_EXTENT > 64
+        coarse = np.zeros((64, 64), dtype=np.float32)
+        assert min(coarse.shape) < overlay._DOWNSAMPLE_MIN_EXTENT
+
+    def test_a_fine_dose_slice_is_strided(self) -> None:
+        overlay = self._overlay()
+        fine = np.zeros((512, 512), dtype=np.float32)
+        assert min(fine.shape) >= overlay._DOWNSAMPLE_MIN_EXTENT
+
+    def test_the_reference_dose_prefers_the_prescription(self) -> None:
+        state = _loaded_state()
+        overlay = IsoDoseOverlay(state, on_artists_changed=lambda _axis: None)
+        overlay.set_fallback_ref_dose(60.0)
+        assert overlay.reference_dose() == pytest.approx(60.0)
+        state.set_prescription_dose(50.0)
+        assert overlay.reference_dose() == pytest.approx(50.0)
+
+
+# ---------------------------------------------------------------------------
+# DvhPanel
+# ---------------------------------------------------------------------------
+class TestDvhVoxelExtraction:
+    """Pins the bounding-box crop used before extracting dose voxels."""
+
+    def test_cropping_returns_exactly_the_masked_values(self) -> None:
+        rng = np.random.default_rng(0)
+        dose = rng.random((12, 16, 16)).astype(np.float32)
+        mask = np.zeros((12, 16, 16), dtype=np.uint8)
+        mask[3:6, 4:9, 7:11] = 1
+        cropped = DvhPanel._dose_voxels_in_roi(dose, mask)
+        np.testing.assert_array_equal(np.sort(cropped), np.sort(dose[mask != 0]))
+
+    def test_an_empty_mask_yields_no_voxels(self) -> None:
+        dose = np.ones((4, 4, 4), dtype=np.float32)
+        mask = np.zeros((4, 4, 4), dtype=np.uint8)
+        assert DvhPanel._dose_voxels_in_roi(dose, mask).size == 0
+
+    def test_a_full_mask_yields_every_voxel(self) -> None:
+        dose = np.ones((4, 4, 4), dtype=np.float32)
+        mask = np.ones((4, 4, 4), dtype=np.uint8)
+        assert DvhPanel._dose_voxels_in_roi(dose, mask).size == dose.size

@@ -2,7 +2,8 @@
 
 Public API
 ----------
-load_rt_struct(ct_dir, rtstruct_path, progress_callback=None, max_workers=1) -> dict[int, RoiInfo]
+load_rt_struct(ct_dir, rtstruct_path, progress_callback=None, max_workers=1)
+    -> dict[int, RoiInfo]
     Parse an RT-STRUCT file and return a mapping of ROI number to mask
     and display metadata. Raises RtStructLoadError if the file itself
     cannot be parsed.
@@ -11,7 +12,8 @@ mask2rtstruct(ct_dir, rtss_path, structures) -> None
     Convert NumPy mask arrays to an RT-STRUCT DICOM file, creating or
     updating as appropriate.
 
-save_structure_set(structure_set, ct_dir, rtss_path, lps_image, original_image=None) -> int
+save_structure_set(structure_set, ct_dir, rtss_path, lps_image,
+                   original_image=None) -> int
     Write every ROI of a StructureSet to an RT-STRUCT file, resampling
     each mask back to the original DICOM geometry first.
 
@@ -25,8 +27,9 @@ random_hex_color() -> str
 
 import logging
 import pathlib
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import TYPE_CHECKING, Any, Callable, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import numpy as np
 import pydicom
@@ -269,7 +272,8 @@ def load_rt_struct(
             mask = np.transpose(mask, (2, 0, 1))
         except Exception as exc:
             logger.warning(
-                f"Could not get mask for ROI '{roi_name}' (ROINumber: {roi_number}): {exc}"
+                f"Could not get mask for ROI '{roi_name}' "
+                f"(ROINumber: {roi_number}): {exc}"
             )
             return None
         return roi_number, RoiInfo(name=roi_name, mask=mask, color=color_hex)

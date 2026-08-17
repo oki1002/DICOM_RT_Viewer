@@ -1,18 +1,20 @@
 """crosshair_handler.py — Crosshair drag event handler.
 
 Design:
-    - The crosshair position is owned by :class:`SliceViewerState` as
-      physical LPS coordinates; this class only converts mouse events to
-      index updates via :meth:`SliceViewerState.set_index`.
+    - The crosshair position is owned by :class:`SliceViewerState` as physical
+      LPS coordinates; this class only converts mouse events to index updates
+      via :meth:`SliceViewerState.set_index`.
     - Rendering is handled by :class:`DicomViewer` through the
       ``"crosshair_changed"`` listener — this class never draws anything.
 """
 
 from typing import TYPE_CHECKING
 
+from ..protocols import ViewerHost
+from ..state.viewer_state import SliceViewerState
+
 if TYPE_CHECKING:
-    from ..state.viewer_state import SliceViewerState
-    from ..viewer import DicomViewer
+    from .viewer_events import ViewerEventHandler
 
 
 # Per-view mapping of (drag direction) -> (target axis, event-coord attribute).
@@ -29,12 +31,26 @@ _DRAG_TARGETS: dict[str, dict[str, tuple[str, str]]] = {
 class CrosshairEventHandler:
     """Handle mouse interactions with the crosshair overlay."""
 
-    #: Pixel radius within which a crosshair line is considered hit (display coordinates).
+    #: Pixel radius within which a crosshair line is considered hit (display
+    #: coordinates).
     TOLERANCE_PIXELS: int = 5
 
-    def __init__(self, state: "SliceViewerState", viewer: "DicomViewer") -> None:
+    def __init__(
+        self,
+        state: SliceViewerState,
+        viewer: ViewerHost,
+        hover: "ViewerEventHandler",
+    ) -> None:
+        """Initialise the handler.
+
+        Args:
+            state: The shared viewer state.
+            viewer: The host viewer, seen through :class:`ViewerHost`.
+            hover: The dispatcher that tracks which view the pointer is in.
+        """
         self.state = state
         self.viewer = viewer
+        self._hover = hover
 
         self._is_dragging: bool = False
         self._drag_target: str | None = None  # "h" | "v" | "cross"
@@ -56,7 +72,7 @@ class CrosshairEventHandler:
         """
         if event.button != 1 or not self.state.crosshair_visible:
             return False
-        axis = self.state.current_axis
+        axis = self._hover.current_axis
         if not (axis and event.xdata is not None and event.ydata is not None):
             return False
 
@@ -64,7 +80,7 @@ class CrosshairEventHandler:
         if not pos:
             return False
 
-        ax = self.viewer.axs.get(axis)
+        ax = self.viewer.axes_map.get(axis)
         if ax is None:
             # current_axis can name a view that the active layout does not
             # build (e.g. "coronal" after switching to "single").
@@ -107,7 +123,8 @@ class CrosshairEventHandler:
         else:
             targets = []
 
-        # Batch-update all affected indices before triggering a single crosshair recompute.
+        # Batch-update all affected indices before triggering a single
+        # crosshair recompute.
         for target_axis, coord_attr in targets:
             coord = getattr(event, coord_attr)
             idx = self.state.physical_to_index(target_axis, coord)

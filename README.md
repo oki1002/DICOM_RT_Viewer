@@ -22,9 +22,9 @@ The distribution name on PyPI is `tk-rt-viewer`; the import package is
 - **Observer-pattern state management** — All view state lives in `SliceViewerState`; the widget reacts to changes without polling.
 - **SimpleITK-native coordinates** — Physical LPS coordinates, origin, spacing, and direction cosines are preserved throughout; axis reordering between SimpleITK and NumPy conventions is handled internally by the library.
 - **Interactive navigation** — Crosshair drag, mouse wheel, and keyboard (↑ / ↓ / PageUp / PageDown).
-- **Window / level adjustment** — Right-click drag: horizontal → window width (WW), vertical → window centre (WL).
+- **Independent window / level per image** — The primary and secondary images each carry their own display window, so a PET, MR, or dose overlay can be windowed without disturbing the CT underneath. The secondary follows the primary until an override is set. Right-click drag adjusts whichever image is targeted: horizontal → window width (WW), vertical → window centre (WL).
 - **RT-STRUCT support** — ROI masks stored in `StructureSet` (keyed by integer ROI number); contour overlay with optional semi-transparent fill; brush tool for mask editing.
-- **ROI operations** — Inter-slice interpolation, directional margin (uniform or 6-direction), Gaussian smoothing, and boolean operations (union / intersection / subtraction).
+- **ROI operations** — Shape-based inter-slice interpolation, true Euclidean margins (uniform or 6-direction anisotropic), Gaussian smoothing, and boolean operations (union / intersection / subtraction).
 - **Bounding box tool** — Create, move, and resize a bounding box with click-drag interactions.
 - **RT-DOSE overlay** — RT-DOSE volumes are displayed as isodose fills and contour lines; a DVH panel is available in the `"mpr"` layout mode.
 - **Custom overlay artists** — Host applications can register their own Matplotlib artists (e.g. manual point markers) via `add_overlay_artist` so they survive the blit-restore cycle like any built-in overlay, without `DicomViewer` needing to know what they represent.
@@ -68,22 +68,31 @@ tk_rt_viewer/
 ├── __init__.py
 ├── py.typed                    # PEP 561 marker: the package ships inline types
 ├── events.py                   # Event-name constants for SliceViewerState listeners
+├── protocols.py                # ViewerHost: what event handlers ask of the viewer
 ├── viewer.py                   # DicomViewer widget (wires up the collaborators below)
 ├── geometry.py                 # Pure geometric helpers (slicing, extent, contour paths)
 ├── io.py                       # DICOM series loading utilities (CT, RT-DOSE, REG)
-├── rtstruct_io.py               # RT-STRUCT read / write utilities
-├── roi_operations.py             # Interpolation, margin, smoothing, boolean ops
+├── rtstruct_io.py              # RT-STRUCT read / write utilities
+├── roi_operations.py           # Interpolation, margin, smoothing, boolean ops
+├── isodose_levels.py           # Isodose level definitions and resolution
 ├── state/
-│   ├── viewer_state.py          # SliceViewerState, StructureSet
-│   └── viewer_cache.py           # ViewerCacheManager, ContourPathCache, MaskSliceCache
+│   ├── viewer_state.py         # SliceViewerState (observable surface)
+│   ├── structure_set.py        # StructureSet, RoiEntry
+│   ├── roi_manager.py          # ROI lifecycle + cache bookkeeping
+│   ├── dose_manager.py         # RT-DOSE in both geometries, Dmax, slice lookup
+│   ├── phase_manager.py        # 4DCT phases with lazy resampling + LRU
+│   └── viewer_cache.py         # ViewerCacheManager, ContourPathCache, MaskSliceCache
 ├── rendering/
-│   ├── drawing_manager.py        # DrawingManager (idle-driven blit redraw)
-│   ├── render.py                  # RGBA colormap LUT helpers
-│   ├── isodose.py                 # IsoDoseOverlay (fill bands + contour lines)
-│   ├── dvh.py                     # DvhPanel (cumulative DVH panel)
-│   └── layout.py                  # LayoutManager (single / mpr / mpr_wide layouts)
+│   ├── drawing_manager.py      # DrawingManager (idle-driven redraw coalescing)
+│   ├── blit_compositor.py      # Background bitmaps, blit pass, artist-list cache
+│   ├── image_layer.py          # Primary / secondary base-image artists
+│   ├── contour_overlay.py      # ContourOverlay (ROI contour paths)
+│   ├── render.py               # RGBA colormap LUT and window/level helpers
+│   ├── isodose.py              # IsoDoseOverlay (fill bands + contour lines)
+│   ├── dvh.py                  # DvhPanel (cumulative DVH panel)
+│   └── layout.py               # LayoutManager (single / mpr / mpr_wide layouts)
 └── event_controllers/
-    ├── viewer_events.py      # ViewerEventHandler (top-level dispatcher)
+    ├── viewer_events.py        # ViewerEventHandler (dispatcher + hover state)
     ├── crosshair_handler.py
     ├── brush_handler.py
     └── bbox_handler.py
@@ -91,9 +100,11 @@ tk_rt_viewer/
 
 `state/` holds the Tkinter-independent observable state and performance
 caches; `rendering/` holds the canvas-rendering collaborators that
-`DicomViewer` constructs and wires together in `__init__`. Each class in
-`rendering/` is constructed with the state, figure, or callback it needs
-(dependency injection), so none of them import `DicomViewer` itself.
+`DicomViewer` constructs and wires together. Each collaborator is
+constructed with the state, figure, or callbacks it needs (dependency
+injection), so none of them imports `DicomViewer` itself. The event
+controllers see the viewer only through the `ViewerHost` protocol in
+`protocols.py`, so every handler can be exercised without a Tk display.
 
 ## Quick start
 
@@ -140,13 +151,43 @@ if validate_dicom_files("/path/to/dicom"):
 
 ## Setting the display window
 
-```python
-# Window width / level directly
-state.set_window_level(window=400, level=40)   # soft-tissue window
+The primary and secondary images carry independent windows. The secondary
+follows the primary until you set an override, which is what you want for a
+4DCT phase or a MAR reconstruction (same intensity scale) and what you do
+*not* want for a PET, MR, or dose overlay.
 
-# Or using vmin / vmax (HU)
-viewer.set_window(vmin=-160, vmax=240)
+```python
+# --- Primary image ---
+state.set_window_level(window=400, level=40)   # soft-tissue window
+viewer.set_window(vmin=-160, vmax=240)         # or as vmin / vmax (HU)
+
+# --- Secondary image ---
+state.set_secondary_window_level(window=6, level=3)   # e.g. a PET overlay
+viewer.set_secondary_window(vmin=0, vmax=60)          # or as vmin / vmax (Gy)
+
+# Which window is actually in effect for the overlay
+state.effective_secondary_window_level()
+
+# Drop the override; the secondary follows the primary again
+state.set_secondary_window_level(None)
 ```
+
+Right-click drag adjusts whichever image `state.window_level_target` names
+(`"primary"` by default). Host applications can expose that as a toggle:
+
+```python
+state.set_window_level_target("secondary")
+```
+
+Holding **Shift** during a right-click drag targets the other image for that
+drag alone, which is ignored when no secondary image is loaded. The target is
+resolved once when the drag starts, so changing it mid-drag never makes the
+adjustment jump from one image's window to the other's.
+
+Listen for `events.SECONDARY_WINDOW_LEVEL_CHANGED` (payload:
+`tuple[float, float] | None`) and `events.WINDOW_LEVEL_TARGET_CHANGED`
+(payload: `str`) to keep a UI in sync. Loading a new primary image clears the
+secondary override.
 
 ## Working with ROI contours
 
@@ -194,6 +235,14 @@ roi_numbers = state.add_rt_struct_rois(
 )
 ```
 
+`add_rt_struct_rois` raises rather than failing quietly, because both failure
+modes are caller mistakes worth surfacing: `RuntimeError` when no primary
+image is loaded (the masks have no geometry to be interpreted against, so
+load the CT first), and `ValueError` when a mask's shape does not match the
+primary image — usually an RT-STRUCT belonging to a different series. Every
+mask is checked before any ROI is added, so a mismatch leaves the structure
+set untouched rather than half-populated.
+
 Use `add_contours` directly when the masks are not coming from an RT-STRUCT
 — it takes `(name, sitk.Image, colour)` tuples and applies no name
 resolution.
@@ -232,7 +281,7 @@ from tk_rt_viewer.roi_operations import (
     MarginConfig,
 )
 
-# Fill empty slices between existing mask slices
+# Fill empty slices between existing mask slices (shape-based morphing)
 filled_mask = interpolate_contour(mask_sitk_image)
 
 # Uniform 5 mm expansion (use negative values to shrink)
@@ -250,6 +299,53 @@ smoothed = smooth_contour(mask_sitk_image, sigma_mm=2.0)
 # Boolean operations: UNION, INTERSECTION, SUBTRACTION
 combined = boolean_operation(mask_a, mask_b, BooleanOp.UNION)
 ```
+
+### Margins are spherical
+
+`apply_margin` grows or shrinks the mask by the Minkowski sum / difference
+with an **ellipsoid** whose semi-axes are the requested margins, evaluated in
+millimetres through a signed Euclidean distance field. A uniform margin is
+therefore a sphere: the result lies the requested distance from the source
+surface in every direction, not just along the axes.
+
+An asymmetric pair of opposing directions (superior 10 mm with inferior 4 mm)
+is realised as that ellipsoid centred off the origin — a symmetric margin of
+the mean extent followed by a sub-voxel translation of half the difference.
+Distances are measured centre-to-centre between voxels, so a margin smaller
+than half a voxel along some axis may not move that face at all.
+
+### Expansion and contraction cannot be mixed
+
+Every value in a `MarginConfig` must share one sign; zeros are compatible
+with both. A mixed configuration raises `ValueError` at construction:
+
+```python
+MarginConfig(superior=5.0, inferior=-5.0)   # ValueError
+```
+
+There is no single structuring element that grows one face while shrinking
+another, and applying the six directions sequentially instead makes the
+result depend on the order they happen to be applied in — a contraction
+applied after an expansion does not undo it. Split the operation into two
+explicit calls when both are wanted:
+
+```python
+grown = apply_margin(mask, MarginConfig(superior=5.0, inferior=5.0))
+final = apply_margin(grown, MarginConfig(anterior=-2.0, posterior=-2.0))
+```
+
+`MarginConfig` is frozen, so a validated configuration cannot be mutated into
+an invalid one afterwards.
+
+### Interpolation morphs rather than copies
+
+`interpolate_contour` fills each gap by blending the two bounding slices'
+signed distance fields and re-binarising at zero, with each field first
+translated onto the interpolated centroid. Intermediate contours therefore
+change shape continuously and travel along the line between the two slices.
+It does not solve correspondence between multiple disconnected components:
+where a slice's component count changes, components merge or split around the
+middle of the gap.
 
 ## Brush tool
 
@@ -390,24 +486,36 @@ calling the artist's own `remove()`.
 ## Architecture overview
 
 ```
-SliceViewerState (state/viewer_state.py)     # owns all mutable state; broadcasts events
-    ├─ StructureSet                           # ROI masks keyed by integer ROI number
-    └─ ViewerCacheManager (state/viewer_cache.py)
+SliceViewerState (state/viewer_state.py)   # observable surface: fields, setters, events
+    ├─ RoiManager (state/)                 # StructureSet + ROI cache bookkeeping
+    ├─ DoseManager (state/)                # RT-DOSE in both geometries, Dmax
+    ├─ PhaseManager (state/)               # 4DCT phases, lazy resample + LRU
+    └─ ViewerCacheManager (state/)         # slice / contour caches, background builds
 
-DicomViewer (ttk.Frame, viewer.py)
-    ├─ DrawingManager (rendering/)     # idle-driven blit-redraw coalescing
-    ├─ IsoDoseOverlay (rendering/)     # isodose fill bands + contour lines
-    ├─ DvhPanel (rendering/)           # cumulative DVH panel
-    ├─ LayoutManager (rendering/)      # single / mpr / mpr_wide GridSpec layouts
-    └─ ViewerEventHandler              # routes canvas events to sub-handlers
+DicomViewer (ttk.Frame, viewer.py)         # wiring layer; no rendering algorithm of its own
+    ├─ LayoutManager (rendering/)          # single / mpr / mpr_wide GridSpec layouts
+    ├─ ImageLayer (rendering/)             # primary / secondary base-image artists
+    ├─ ContourOverlay (rendering/)         # ROI contour paths
+    ├─ IsoDoseOverlay (rendering/)         # isodose fill bands + contour lines
+    ├─ DvhPanel (rendering/)               # cumulative DVH panel
+    ├─ BlitCompositor (rendering/)         # background bitmaps + blit pass
+    ├─ DrawingManager (rendering/)         # idle-driven redraw coalescing
+    └─ ViewerEventHandler                  # dispatches canvas events; owns hover state
         ├─ CrosshairEventHandler
         ├─ BrushEventHandler
         └─ BboxEventHandler
 ```
 
-Every collaborator under `rendering/` is constructed by `DicomViewer` with
-the state, figure, or callback it needs rather than importing the viewer
-itself, so each one can be exercised independently of Tkinter in tests.
+Every collaborator is constructed by its owner with the state, figure, or
+callbacks it needs rather than importing that owner, so each can be exercised
+independently of Tkinter in tests. The event controllers depend on
+`ViewerHost` (`protocols.py`) — a small protocol covering the Axes map, the
+toolbar mode, redraw requests and the Tk scheduler — rather than on
+`DicomViewer`, so the dependency runs one way only.
+
+"Which view is the pointer over" lives on `ViewerEventHandler`, not on the
+state: it is transient input state, nothing listens for it, and it has no
+meaning to a headless consumer of `SliceViewerState`.
 
 ## Listening to state changes
 
@@ -441,6 +549,10 @@ Tcl interpreter built with thread support — which is the default for
 CPython's bundled Tk on all mainstream platforms, but is stated here as an
 explicit assumption. Everything else (rendering, event handling, mask
 editing) runs on the main thread.
+
+`ContourPathCache` is internally locked, because the background build and the
+UI thread genuinely do write the same ROI concurrently: the overlay stores
+the paths for any slice it renders before the background build reaches it.
 
 `load_rt_struct` decodes ROI masks sequentially by default; parallel
 decoding is opt-in via `max_workers` because rt-utils does not document
@@ -495,14 +607,20 @@ instead.
 ```bash
 pip install -e ".[dev]"
 
-pytest            # run the test suite (headless: MPLBACKEND=Agg)
+pytest                      # run the test suite (headless: MPLBACKEND=Agg)
 mypy src/tk_rt_viewer
-black src tests
-isort src tests
+ruff format src tests       # formatting
+ruff check src tests        # lint (pyflakes, isort, pyupgrade, bugbear, ...)
 ```
 
-CI (GitHub Actions) runs Black, isort, mypy, and pytest on every push and
-pull request. See `CHANGELOG.md` for release history.
+The test suite runs entirely without a Tk display: `SliceViewerState` and
+everything under `state/` is Tkinter-free by construction, and the rendering
+and event-controller collaborators take their dependencies as callbacks or as
+the `ViewerHost` protocol, so they are exercised against the Agg backend and
+small stand-ins.
+
+CI (GitHub Actions) runs Ruff, mypy, and pytest on every push and pull
+request. See `CHANGELOG.md` for release history.
 
 ## License
 

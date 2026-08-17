@@ -93,5 +93,27 @@ def slice_to_rgba(
     return lut[indices]
 
 
+def window_level_to_clim(window_level: tuple[float, float]) -> tuple[float, float]:
+    """Convert ``(window_width, window_level)`` to ``(vmin, vmax)``.
+
+    Display windows are authored and stored as width/level because that is
+    what DICOM records and what clinicians work in, while every renderer needs
+    the two bounds. Defining the conversion once here keeps the primary and
+    secondary display paths from drifting apart.
+    """
+    window, level = window_level
+    return (level - window / 2.0, level + window / 2.0)
+
+
+def clim_to_window_level(clim: tuple[float, float]) -> tuple[float, float]:
+    """Convert ``(vmin, vmax)`` to ``(window_width, window_level)``.
+
+    Inverse of :func:`window_level_to_clim`, for callers that think in bounds
+    (e.g. "show 0-60 Gy") but must store a window.
+    """
+    vmin, vmax = clim
+    return (vmax - vmin, (vmax + vmin) / 2.0)
+
+
 #: Shared grayscale LUT for the primary CT display. Treat as read-only.
 GRAY_LUT: np.ndarray = build_cmap_lut("gray")

@@ -19,7 +19,8 @@ Coupling:
 """
 
 import logging
-from typing import TYPE_CHECKING, Callable
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import numpy as np
 from matplotlib.axes import Axes
@@ -59,9 +60,7 @@ class ContourOverlay:
         """
         self._state = state
         self._on_artists_changed = on_artists_changed
-        self._collections: dict[str, PathCollection | None] = {
-            axis: None for axis in AXES
-        }
+        self._collections: dict[str, PathCollection | None] = dict.fromkeys(AXES)
 
     # ------------------------------------------------------------------
     # Rendering
@@ -188,4 +187,4 @@ class ContourOverlay:
         resets the reference to avoid touching an already-removed artist
         after a layout rebuild.
         """
-        self._collections = {axis: None for axis in AXES}
+        self._collections = dict.fromkeys(AXES)

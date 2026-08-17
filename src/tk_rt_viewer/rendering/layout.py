@@ -6,7 +6,7 @@ construction (typically DvhPanel.style_axes), so it never imports or
 touches DicomViewer.
 """
 
-from typing import Callable
+from collections.abc import Callable
 
 import matplotlib.gridspec as gridspec
 from matplotlib.axes import Axes

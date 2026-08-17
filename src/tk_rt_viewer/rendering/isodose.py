@@ -30,7 +30,8 @@ Coupling:
 """
 
 import logging
-from typing import TYPE_CHECKING, Callable
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import numpy as np
 from contourpy import LineType, contour_generator
@@ -79,13 +80,22 @@ class IsoDoseOverlay:
     fire the callback.
     """
 
-    #: Default isodose levels: (percentage of reference dose, colour),
-    #: listed from lowest to highest.
-    #: Stride used to downsample the dose slice before rendering.
-    #: Dose distributions are spatially smooth, so step=2 (1/4 of the
-    #: pixels) preserves visual quality while quartering both the
+    #: Stride used to downsample the dose slice before rendering. Dose
+    #: distributions are spatially smooth, so dropping to 1/4 of the pixels
+    #: preserves visual quality on a fine grid while quartering both the
     #: BoundaryNorm mapping and the contourpy line-generation cost.
     _DOWNSAMPLE_STEP: int = 2
+
+    #: Smallest in-plane dimension for which downsampling is applied. Dose
+    #: grids are commonly exported at 2-3 mm, which on a body-sized field
+    #: leaves slices well under a hundred samples across; striding those
+    #: displaces every isodose line by up to one dose voxel — several
+    #: millimetres — which is not an acceptable trade for a rendering cost
+    #: that is already negligible at that size. Downsampling therefore only
+    #: applies once a slice is large enough for the saving to matter and for
+    #: the positional error to be sub-voxel on the CT grid the lines are read
+    #: against.
+    _DOWNSAMPLE_MIN_EXTENT: int = 128
 
     #: The fill opacity is (1 - blend_alpha) * this factor; lines stay opaque.
     _FILL_ALPHA_SCALE: float = 0.4
@@ -107,10 +117,10 @@ class IsoDoseOverlay:
         self._state = state
         self._on_artists_changed = on_artists_changed
 
-        self._fill: dict[str, AxesImage | None] = {axis: None for axis in AXES}
-        self._lines: dict[str, LineCollection | None] = {axis: None for axis in AXES}
+        self._fill: dict[str, AxesImage | None] = dict.fromkeys(AXES)
+        self._lines: dict[str, LineCollection | None] = dict.fromkeys(AXES)
         # Same-slice early-exit marker; None forces the next update() to render.
-        self._rendered_index: dict[str, int | None] = {axis: None for axis in AXES}
+        self._rendered_index: dict[str, int | None] = dict.fromkeys(AXES)
 
         # None = use _DEFAULT_LEVELS_PCT; empty list = hide all isodose display.
         self._custom_levels_gy: list[tuple[float, str]] | None = None
@@ -193,9 +203,9 @@ class IsoDoseOverlay:
         Call this after ``ax.clear()`` / figure rebuild; the artists are
         already gone from the Axes, so only the references are released.
         """
-        self._fill = {axis: None for axis in AXES}
-        self._lines = {axis: None for axis in AXES}
-        self._rendered_index = {axis: None for axis in AXES}
+        self._fill = dict.fromkeys(AXES)
+        self._lines = dict.fromkeys(AXES)
+        self._rendered_index = dict.fromkeys(AXES)
 
     def clear(self, axis: str) -> None:
         """Hide the isodose artists for *axis* and force the next re-render."""
@@ -258,7 +268,11 @@ class IsoDoseOverlay:
             self._rendered_index[axis] = current_index
             return
 
-        step = self._DOWNSAMPLE_STEP
+        step = (
+            self._DOWNSAMPLE_STEP
+            if min(full.shape) >= self._DOWNSAMPLE_MIN_EXTENT
+            else 1
+        )
         raw = full[::step, ::step]
 
         # Physical sample-centre coordinates of the strided grid. Stride

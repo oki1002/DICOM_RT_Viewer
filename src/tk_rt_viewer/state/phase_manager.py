@@ -59,7 +59,7 @@ class PhaseManager:
         self._current_phase: str | None = None
         # Resampled volumes keyed by phase name, ordered most-recently-used
         # last so the least-recently-used entry is evicted first.
-        self._resampled: "OrderedDict[str, sitk.Image]" = OrderedDict()
+        self._resampled: OrderedDict[str, sitk.Image] = OrderedDict()
 
     @property
     def all_phases(self) -> Mapping[str, Mapping[str, Any]]:

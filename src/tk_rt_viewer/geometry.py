@@ -85,7 +85,7 @@ def slice_along_axis(arr: np.ndarray, axis: str, index: int) -> np.ndarray:
 
 
 def compute_extent(image: sitk.Image, axis: str) -> tuple[float, float, float, float]:
-    """Return ``(left, right, bottom, top)`` for *image* along *axis* in physical coordinates.
+    """Return ``(left, right, bottom, top)`` for *image* along *axis*, in mm.
 
     Pixel-center convention: the returned edges sit half a voxel outside
     the first / last pixel centers, i.e. ``[origin - 0.5 * spacing,

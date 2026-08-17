@@ -15,9 +15,11 @@ import SimpleITK as sitk
 from matplotlib.patches import Circle
 from scipy.ndimage import binary_fill_holes
 
+from ..protocols import ViewerHost
+from ..state.viewer_state import SliceViewerState
+
 if TYPE_CHECKING:
-    from ..state.viewer_state import SliceViewerState
-    from ..viewer import DicomViewer
+    from .viewer_events import ViewerEventHandler
 
 # Matplotlib mouse-button numbers the brush responds to. Any other button
 # is ignored entirely rather than being treated as an erase.
@@ -28,9 +30,22 @@ _ERASE_BUTTON = 3
 class BrushEventHandler:
     """Handle brush-tool mouse events for RT-STRUCT contour editing."""
 
-    def __init__(self, state: "SliceViewerState", viewer: "DicomViewer") -> None:
+    def __init__(
+        self,
+        state: SliceViewerState,
+        viewer: ViewerHost,
+        hover: "ViewerEventHandler",
+    ) -> None:
+        """Initialise the handler.
+
+        Args:
+            state: The shared viewer state.
+            viewer: The host viewer, seen through :class:`ViewerHost`.
+            hover: The dispatcher that tracks which view the pointer is in.
+        """
         self.state = state
         self.viewer = viewer
+        self._hover = hover
 
         self.is_active: bool = False
         self.brush_circle: Circle | None = None
@@ -49,10 +64,10 @@ class BrushEventHandler:
         self._cached_mask_volume: np.ndarray | None = None
         self._cached_roi_number: int | None = None
 
-        # The cursor circle is shown only after the first real mouse-move inside
-        # a view, preventing a stale circle from appearing at activation time.
+        # The cursor circle is shown only after the first mouse-move that
+        # carries data coordinates, preventing a stale circle from appearing at
+        # activation time.
         self._cursor_ready: bool = False
-        self._cursor_last_axis: str = ""
 
     # ------------------------------------------------------------------
     # Activation
@@ -61,15 +76,13 @@ class BrushEventHandler:
         """Enable the brush tool."""
         self.is_active = True
         self._cursor_ready = False
-        self._cursor_last_axis = ""
 
     def deactivate(self) -> None:
         """Disable the brush tool and remove the cursor circle."""
         self.is_active = False
         self._cursor_ready = False
-        self._cursor_last_axis = ""
         self._remove_brush_cursor()
-        self.viewer.canvas.draw_idle()
+        self.viewer.refresh_canvas()
 
     def reset(self) -> None:
         """Drop the cursor artist reference after the owning Axes were cleared.
@@ -105,7 +118,7 @@ class BrushEventHandler:
         # margin): current_axis is "" there and event.xdata/ydata are None,
         # so falling through would slice with an empty axis name and raise
         # KeyError from state.indices[""] a few lines below.
-        axis = self.state.current_axis
+        axis = self._hover.current_axis
         if not axis or event.xdata is None or event.ydata is None:
             return
 
@@ -144,18 +157,25 @@ class BrushEventHandler:
 
     def handle_motion(self, event) -> None:
         """Continue the stroke or update the brush cursor position."""
-        if not self.is_active or not self.state.current_axis:
+        if not self.is_active or not self._hover.current_axis:
             if self.brush_circle:
                 self._remove_brush_cursor()
             return
 
-        # Reset cursor readiness when the pointer enters a different axis
-        # or when xdata/ydata is not yet valid (spurious event at activation).
-        current = self.state.current_axis
+        # The cursor is drawn only once a motion event carries valid data
+        # coordinates. That is what suppresses the spurious event Matplotlib
+        # can deliver at activation time, before the pointer has moved inside
+        # a view: such an event has no data coordinates, so it cannot place a
+        # circle anywhere meaningful.
+        #
+        # A previous version also tracked the last hovered view here and
+        # cleared the flag when it changed — on the line immediately before an
+        # unconditional re-set of the same flag, so the clear could never be
+        # observed by anything. The tracking existed only to feed that dead
+        # branch, and both are gone: a move into a different view carries valid
+        # coordinates for that view, so there is nothing to wait for.
+        current = self._hover.current_axis
         if event.xdata is not None and event.ydata is not None:
-            if current != self._cursor_last_axis:
-                self._cursor_ready = False
-                self._cursor_last_axis = current
             self._cursor_ready = True
 
         if self._cursor_ready:
@@ -235,7 +255,7 @@ class BrushEventHandler:
 
     def handle_scroll(self, event) -> None:
         """Adjust the brush size by 1 mm per scroll step."""
-        if not self.state.current_axis or not self.is_active:
+        if not self._hover.current_axis or not self.is_active:
             return
         new_size = self.state.brush_size_mm + 1.0 * np.sign(event.step)
         self.state.set_brush_size_mm(max(1.0, new_size))
@@ -246,16 +266,19 @@ class BrushEventHandler:
     # ------------------------------------------------------------------
     def _update_brush_cursor(self, event) -> None:
         """Create or reposition the circular brush cursor at the event location."""
-        if self.viewer.toolbar.mode not in ("", None):
+        if self.viewer.toolbar_mode:
             self._remove_brush_cursor()
             return
 
-        axis = self.state.current_axis
+        axis = self._hover.current_axis
         if not (axis and event.xdata is not None and event.ydata is not None):
             self._remove_brush_cursor()
             return
 
-        if not self.brush_circle or self.brush_circle.axes != self.viewer.axs[axis]:
+        if (
+            not self.brush_circle
+            or self.brush_circle.axes != self.viewer.axes_map[axis]
+        ):
             self._remove_brush_cursor()
             roi_number = self.state.selected_roi_number
             color = (
@@ -270,12 +293,12 @@ class BrushEventHandler:
                 facecolor="none",
                 linewidth=0.8,
             )
-            self.viewer.axs[axis].add_patch(self.brush_circle)
+            self.viewer.add_axes_artist(axis, self.brush_circle)
         else:
             self.brush_circle.set_center((event.xdata, event.ydata))
             self.brush_circle.set_radius(self.state.brush_size_mm)
 
-        self.viewer.drawing_manager.add_request(axis)
+        self.viewer.request_redraw(axis)
 
     def remove_cursor(self) -> None:
         """Remove the brush cursor circle from the canvas.
@@ -293,7 +316,7 @@ class BrushEventHandler:
         axis_name = next(
             (
                 name
-                for name, ax in self.viewer.axs.items()
+                for name, ax in self.viewer.axes_map.items()
                 if ax == self.brush_circle.axes
             ),
             None,
@@ -301,7 +324,7 @@ class BrushEventHandler:
         self.brush_circle.remove()
         self.brush_circle = None
         if axis_name:
-            self.viewer.drawing_manager.add_request(axis_name)
+            self.viewer.request_redraw(axis_name)
 
     # ------------------------------------------------------------------
     # Painting logic
@@ -327,7 +350,7 @@ class BrushEventHandler:
                 computes it itself — used by ``handle_press``, which has
                 no prior conversion to reuse.
         """
-        axis = self.state.current_axis
+        axis = self._hover.current_axis
         if not (axis and event.xdata is not None and event.ydata is not None):
             return
 
@@ -346,7 +369,7 @@ class BrushEventHandler:
         # Render the contour from the cached slice so the outline reflects the
         # latest paint state without a sitk round-trip or a State notification.
         self._draw_axis_contours_from_cache(axis)
-        self.viewer.drawing_manager.add_request(axis)
+        self.viewer.request_redraw(axis)
 
     def _interpolate_and_draw_stroke(
         self, axis: str, start_px: tuple[int, int], end_px: tuple[int, int]
@@ -419,14 +442,14 @@ class BrushEventHandler:
         updates in real time without a sitk round-trip or a State notification.
         """
         if self._cached_mask_volume is None or self._cached_roi_number is None:
-            self.viewer.draw_axis_contours_with_override(axis, override_mask=None)
+            self.viewer.draw_contours_with_override(axis, override_mask=None)
             return
 
         roi_number = self._cached_roi_number
         slobj = self._make_slobj(axis)
         cached_slice = self._cached_mask_volume[slobj]
 
-        self.viewer.draw_axis_contours_with_override(
+        self.viewer.draw_contours_with_override(
             axis, override_mask={roi_number: cached_slice}
         )
 

@@ -4,6 +4,188 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.0.0] — 2026
+
+A correctness release. Three of the fixes below change the *numerical* output
+of ROI operations and of oblique-series loading, so results produced with
+1.1.x are not reproducible with this version — which is the point: the old
+results were wrong. The API changes are grouped here rather than shipped
+piecemeal.
+
+### Changed (breaking)
+
+- **`apply_margin` now produces a spherical margin.** The previous
+  implementation applied a one-dimensional morphological filter along each
+  axis in turn. Composing three 1-D dilations is a dilation by a *box*, not a
+  ball: a uniform 5 mm margin reached 5 mm along the axes but
+  `sqrt(3) * 5 ~ 8.7` mm diagonally, so any PTV grown with it was
+  systematically too large off-axis. The margin is now the Minkowski sum /
+  difference with an ellipsoid whose semi-axes are the requested values,
+  evaluated in millimetres through a signed Euclidean distance field.
+  Anisotropic margins use the corresponding ellipsoid, and an asymmetric pair
+  of opposing directions is realised as that ellipsoid centred off the origin
+  — a symmetric margin of the mean extent plus a sub-voxel translation of half
+  the difference. Existing margin structures must be regenerated.
+
+- **`MarginConfig` rejects mixed signs and is frozen.** Every value must now
+  share one sign (zeros are compatible with both); a configuration that both
+  expands and contracts raises `ValueError` at construction. No single
+  structuring element grows one face while shrinking another, and the previous
+  sequential application made the result depend on the order the six
+  directions happened to be applied in, with a contraction applied after an
+  expansion not undoing it. Split such an operation into two explicit
+  `apply_margin` calls. The class is `frozen=True` so a validated
+  configuration cannot be mutated into an invalid one afterwards.
+
+- **`interpolate_contour` now interpolates.** It previously averaged the two
+  bounding binary slices and thresholded at 0.5, which with values restricted
+  to 0 and 1 reduces to the nearer neighbour on each side of the gap: the
+  "interpolated" slices were verbatim copies with one discontinuous jump in
+  the middle. Gaps are now filled by blending the two slices' signed distance
+  fields, each first translated onto the interpolated centroid, so the contour
+  changes shape continuously and travels across the gap.
+
+- **Oblique series keep their full field of view.** `io._orient_to_lps` sized
+  its resample output from the source grid, which describes an axis-aligned
+  box of the same dimensions as the rotated volume — a box that does not
+  contain it. For a gantry-tilted CT the corners of the volume fell outside
+  the output and were discarded, the more so the larger the tilt. The output
+  grid is now the axis-aligned bounding box of the source's eight corners.
+  The resample also fills out-of-volume voxels with air-equivalent HU
+  (`-1024`) instead of the implicit `0`, which read as water; RT-DOSE uses
+  `0.0` Gy. Loaded oblique volumes therefore differ in size, origin and edge
+  values from 1.1.x.
+
+- **`state.secondary_clim` is replaced by `state.secondary_window_level`,**
+  and the `"secondary_clim_changed"` event by
+  `"secondary_window_level_changed"`. The overlay is now described in
+  window/level like every other image rather than in raw bounds, so one
+  representation covers both images. Use `viewer.set_secondary_window(vmin,
+  vmax)` if you prefer to think in bounds.
+
+- **`current_axis` moved from `SliceViewerState` to `ViewerEventHandler.`**
+  "Which view is the pointer over" is transient input state: nothing listens
+  for it, it is not observable, and it has no meaning to a headless consumer
+  of the state. Keeping it on the state also meant the event handlers wrote
+  to the state directly, which the viewer's own documentation said never
+  happened. Read `viewer.event_handler.current_axis`.
+
+- **`state.structure_set` is a read-only property** and is no longer a
+  constructor argument. It is owned by the new `RoiManager` and replaced
+  wholesale when the primary image changes; every mutation must go through
+  the state's ROI methods so the caches and notifications stay in step.
+  Reading it is unchanged.
+
+- **`add_rt_struct_rois` raises instead of returning an empty list** when no
+  primary image is loaded (`RuntimeError`). An empty return was
+  indistinguishable at the call site from an RT-STRUCT that legitimately
+  contained no ROIs, so a caller loading a structure set before its CT saw a
+  silent no-op instead of a fixable ordering mistake.
+
+- **Event-handler and `DrawingManager` constructor signatures changed.** The
+  three sub-handlers now take `(state, viewer, hover)`, and `DrawingManager`
+  takes four callables (`redraw`, `is_known_axis`, `schedule_idle`, `cancel`)
+  instead of the `DicomViewer` instance. Both previously reached into the
+  viewer's private methods, which made the dependency mutual and the classes
+  untestable without a live Tk widget. Only relevant to code constructing
+  these directly.
+
+### Added
+
+- **Independent window / level for the secondary image.**
+  `state.secondary_window_level` holds the overlay's own window, or `None`
+  (the default) to follow the primary. A 4DCT phase or MAR reconstruction
+  shares the primary's intensity scale and needs no setup; a PET, MR, or dose
+  overlay does not, and can now be windowed without disturbing the CT beneath
+  it. `state.effective_secondary_window_level()` resolves the two in one
+  place, so no caller reimplements the fallback.
+- `state.window_level_target` (`"primary"` / `"secondary"`) selects which
+  image the right-click drag adjusts, with a matching
+  `"window_level_target_changed"` event, plus
+  `state.apply_window_level_delta(target, window, level)` so the drag does not
+  branch on it. Holding **Shift** during a drag targets the other image for
+  that drag alone; the target is resolved once at press time so it cannot
+  switch mid-drag.
+- `viewer.set_secondary_window(vmin, vmax)` — the counterpart of
+  `set_window`, accepting `None` to clear the override.
+- `rendering.render.window_level_to_clim` / `clim_to_window_level`, so the
+  two representations are converted in exactly one place.
+- `tk_rt_viewer.protocols.ViewerHost` — the narrow protocol the event
+  controllers depend on instead of `DicomViewer`, which breaks the cycle
+  between the two and lets every handler be exercised headless.
+- `state/roi_manager.py` (`RoiManager`) and `state/dose_manager.py`
+  (`DoseManager`), splitting ROI lifecycle and RT-DOSE geometry out of
+  `SliceViewerState`, which keeps only its observable surface.
+- `rendering/blit_compositor.py` (`BlitCompositor`) and
+  `rendering/image_layer.py` (`ImageLayer`), taking the background-bitmap /
+  blit bookkeeping and the base-image artists out of `viewer.py`, which drops
+  from ~1270 to ~950 lines and holds no rendering algorithm of its own.
+- `py.typed` is now actually shipped. It was advertised in the README,
+  `pyproject.toml` classifiers, and the 1.0.0 changelog entry but the file did
+  not exist, so no downstream type checker ever saw the inline annotations.
+  The three sub-packages gained `__init__.py` files for the same reason: PEP
+  561 only applies the marker to regular sub-packages.
+
+### Fixed
+
+- `set_brush_size_mm` clamps to a positive minimum. The brush divides by its
+  pixel radius when interpolating between motion events, so a radius of zero
+  raised `ZeroDivisionError` from inside the stroke rather than simply
+  painting nothing.
+- `validate_dicom_files` returns `False` instead of propagating exceptions. A
+  file that passes `is_dicom` can still fail to parse or lack the tags it
+  reads — a validator that raises on exactly the malformed input it exists to
+  detect is unusable at its own call sites.
+- `ContourPathCache` is now internally locked. The background contour build
+  and the UI thread genuinely do write the same ROI concurrently (the overlay
+  stores the paths for any slice it renders before the build reaches it), and
+  `setdefault` followed by an item assignment is not atomic. The previous
+  docstring asserted the opposite of what the code did.
+- The isodose overlay no longer strides slices unconditionally. Dose grids are
+  routinely exported at 2-3 mm, leaving slices well under a hundred samples
+  across; halving those in each direction displaced every isodose line by up
+  to one dose voxel for a saving that does not matter at that size.
+  Downsampling now applies only from 128 samples per side.
+- `load_all_series` skips RT-STRUCT, RT-PLAN, REG and RT-DOSE series before
+  reading their pixel data, instead of pulling them through the CT path and
+  producing bogus entries — and, for RT-DOSE, one without `DoseGridScaling`
+  applied.
+- Display windows derived from image statistics sample at most ~2M voxels
+  instead of running `np.percentile` over the whole volume.
+- The DVH crops each mask to its bounding box before extracting dose voxels,
+  rather than boolean-indexing the whole volume once per active ROI on every
+  update (a brush stroke triggers one on release).
+- `isodose_levels.to_gy_pairs` sorts on the dose alone. Sorting the
+  `(gy, colour)` tuples fell back to comparing colour strings whenever two
+  levels resolved to the same dose.
+- Window/level drag sensitivity scales with the window in effect when the drag
+  starts, so a drag feels the same on a 400 HU soft-tissue window and a 4 Gy
+  dose window; the magic numbers behind it are now named constants, and the
+  window can no longer be driven to zero width.
+- Direct assignment to `state.window_level` rejects a `str` or `bytes` value.
+  `tuple("ab")` has length two, so a stray string passed the shape check and
+  failed much later inside `float()`.
+- Firing an event with no listeners no longer grows the listener registry with
+  an empty entry.
+- Removed a dead branch in the brush cursor that cleared its readiness flag on
+  the line immediately before an unconditional re-set of the same flag, along
+  with the tracking that existed only to feed it.
+- `bbox_handler` uses `is None` rather than truthiness to test for a missing
+  Axes, and no longer discards the return value of its own press handler.
+- Removed `DicomViewer._update_dose_display`, which had become unreachable.
+
+### Development
+
+- Tooling moved from Black + isort to **Ruff** for both formatting and
+  linting (`ruff format`, `ruff check`); the `[dev]` extra and CI follow.
+- Test count roughly doubles, adding coverage for the previously untested
+  modules — the layout builder, redraw coalescing, blit compositing, the image
+  layer, contour overlay, isodose, DVH, all four state collaborators, and
+  every event controller — plus the numerical fixes and the new window/level
+  API. The suite still runs headless.
+- `pyproject.toml` no longer misattributes the `tk-rt-viewer` rename to 2.0.0;
+  it happened in 1.1.0.
+
 ## [1.1.2] — 2026
 
 ### Fixed

@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-# Distribution name: "tk-rt-viewer" (renamed from "dicom-rt-viewer" in 2.0.0;
+# Distribution name: "tk-rt-viewer" (renamed from "dicom-rt-viewer" in 1.1.0;
 # see CHANGELOG). "dicom-rt-viewer" said what file formats this library reads
 # but not what makes it embeddable as-is: it is a Tkinter widget, not a
 # standalone application or another framework's plugin, and the old name was
@@ -69,8 +69,9 @@ Changelog = "https://github.com/oki1002/DICOM_RT_Viewer/blob/main/CHANGELOG.md"
 dev = [
     "pytest>=7",
     "mypy>=1.0",
-    "black>=24",
-    "isort>=5.13",
+    # Ruff replaces black + isort + flake8: one tool, one config, and it
+    # formats and lints the same source in a single pass.
+    "ruff>=0.6",
 ]
 
 [tool.hatch.version]
@@ -97,11 +98,19 @@ warn_return_any = true
 no_implicit_optional = true
 ignore_missing_imports = true
 
-[tool.black]
-target-version = ["py312"]
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+src = ["src", "tests"]
 
-[tool.isort]
-profile = "black"
+[tool.ruff.lint]
+# pycodestyle, pyflakes, isort, pyupgrade, bugbear, comprehensions, simplify.
+select = ["E", "F", "I", "UP", "B", "C4", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests reach into private attributes to pin optimisations that have no
+# public surface (buffer reuse, cache identity); that is the point of them.
+"tests/*" = ["SLF001"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

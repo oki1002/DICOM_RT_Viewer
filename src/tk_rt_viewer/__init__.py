@@ -10,10 +10,10 @@ DicomViewer
     blending and 4DCT phase overlay via a built-in blend slider.
 
 SliceViewerState
-    Observable state container.  Holds all mutable state: images, indices,
-    window/level, ROI masks, brush settings, bounding boxes, crosshair
-    positions, and 4DCT phase data. Change events are declared as constants
-    in :mod:`tk_rt_viewer.events`.
+    Observable state container. Holds all mutable state: images, indices,
+    the primary and secondary display windows, ROI masks, brush settings,
+    bounding boxes, crosshair positions, and 4DCT phase data. Change events
+    are declared as constants in :mod:`tk_rt_viewer.events`.
 
 StructureSet / RoiEntry
     ROI mask container keyed by integer ROI number, and the typed entry it
@@ -38,7 +38,10 @@ Submodule API (import from the submodule)
 
 ``tk_rt_viewer.roi_operations``
     interpolate_contour, apply_margin, smooth_contour,
-    boolean_operation, thin_slices
+    boolean_operation, thin_slices, MarginConfig, BooleanOp
+
+``tk_rt_viewer.protocols``
+    ViewerHost — the narrow view of the viewer its event controllers use.
 
 ``tk_rt_viewer.events``
     Event-name constants for ``SliceViewerState.add_listener``.
@@ -73,7 +76,7 @@ __all__ = [
     "StructureSet",
     "to_gy_pairs",
 ]
-__version__ = "1.1.2"
+__version__ = "2.0.0"
 
 
 def __getattr__(name: str) -> Any:
