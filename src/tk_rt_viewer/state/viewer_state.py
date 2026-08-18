@@ -53,7 +53,7 @@ Collaborators:
 import logging
 import pathlib
 from collections import defaultdict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -199,7 +199,6 @@ class SliceViewerState:
     window_level_target: str = "primary"
 
     # --- ROI display flags ---
-    active_contours: set[int] = field(default_factory=set)  # set of ROI numbers
     overlay_contours: bool = True
     selected_roi_number: int | None = None
 
@@ -230,6 +229,16 @@ class SliceViewerState:
     _bounding_boxes: dict[str, tuple[float, float, float, float] | None] = field(
         init=False, repr=False, default_factory=lambda: dict.fromkeys(AXES)
     )
+    #: Which ROIs are displayed, as a set of ROI numbers. Private and
+    #: published as a read-only ``frozenset`` (see the ``active_contours``
+    #: property below) for the same reason as ``_indices`` /
+    #: ``_crosshair_pos`` / ``_bounding_boxes``: handing out the live set
+    #: would let a caller mutate it in place and desynchronise this state
+    #: from its listeners without a notification (see
+    #: :meth:`set_active_contours`), and would let ``ContourOverlay.draw`` /
+    #: ``DvhPanel.update`` raise ``RuntimeError`` by iterating a set that
+    #: mutates underneath them mid-render.
+    _active_contours: set[int] = field(init=False, repr=False, default_factory=set)
 
     # --- Observer ---
     # Values are unused; a dict is used as an insertion-ordered set so that
@@ -286,7 +295,10 @@ class SliceViewerState:
         "window_level": "set_window_level",
         "crosshair_visible": "set_crosshair_visible",
         "bbox_visible": "set_bbox_visible",
-        "active_contours": "set_active_contours",
+        # "active_contours" intentionally absent: it is now a read-only
+        # property (see below), not an assignable field. Assigning
+        # state.active_contours = ... raises AttributeError from the
+        # property itself; call set_active_contours() instead.
         "selected_roi_number": "set_selected_roi",
         "overlay_contours": "set_overlay_contours",
         "brush_tool_active": "set_brush_tool_active",
@@ -408,6 +420,20 @@ class SliceViewerState:
         caches and notifications stay in step.
         """
         return self._rois.structure_set
+
+    @property
+    def active_contours(self) -> frozenset[int]:
+        """Which ROIs are currently displayed, as a set of ROI numbers.
+
+        Read-only, and a ``frozenset`` rather than the internal mutable set:
+        callers that iterate this (``ContourOverlay.draw``, ``DvhPanel.
+        update``) would otherwise risk a ``RuntimeError`` if a listener
+        mutated it mid-render, and a caller that mutated it directly would
+        silently desynchronise this state from its listeners, since no
+        setter here would ever run to fire the notification. Change with
+        :meth:`set_active_contours`.
+        """
+        return frozenset(self._active_contours)
 
     def close(self) -> None:
         """Shut down the background contour-build thread pool permanently.
@@ -666,10 +692,12 @@ class SliceViewerState:
         """Set the primary CT image and reset all derived state.
 
         Event firing order:
-            1. ``secondary_image_data_changed`` (None)
-            2. ``rt_dose_changed`` (None)
-            3. ``primary_image_data_changed`` (image)
-            Listeners for events 1 and 2 may read the new primary image
+            1. ``all_contours_changed`` (empty StructureSet)
+            2. ``active_contours_changed`` (empty frozenset)
+            3. ``secondary_image_data_changed`` (None)
+            4. ``rt_dose_changed`` (None)
+            5. ``primary_image_data_changed`` (image)
+            Listeners for events 3 and 4 may read the new primary image
             because it is assigned before any notification is fired.
 
         Args:
@@ -683,10 +711,11 @@ class SliceViewerState:
         # listeners always see a consistent state. The fields written with
         # object.__setattr__ below are observable (see _OBSERVABLE_SETTERS);
         # this is a coordinated multi-field reset that must not fire a
-        # per-field notification storm mid-reset (the 3 notifications below
-        # already cover it), so each bypasses its individual set_* method.
+        # per-field notification storm mid-reset (the 5 notifications in
+        # this method already cover it), so each bypasses its individual
+        # set_* method.
         self._rois.reset()
-        object.__setattr__(self, "active_contours", set())
+        self._active_contours = set()
         object.__setattr__(self, "selected_roi_number", None)
         self._bounding_boxes = dict.fromkeys(AXES)
         self.secondary_image = None
@@ -695,6 +724,13 @@ class SliceViewerState:
         self._phases.clear()
         self._dose.clear()
         object.__setattr__(self, "prescription_dose", None)
+
+        # A host application mirroring the ROI list off these two events (a
+        # listbox, a legend) would otherwise keep showing the previous
+        # image's ROIs after this reset: none of the 3 notifications later
+        # in this method names either one.
+        self._notify(ALL_CONTOURS_CHANGED, self.structure_set)
+        self._notify(ACTIVE_CONTOURS_CHANGED, frozenset())
 
         # Discard every performance cache and cancel in-flight background builds.
         self._cache.clear_all()
@@ -1239,10 +1275,14 @@ class SliceViewerState:
     # =========================================================
     # ROI / contour management (delegates to RoiManager + notifies)
     # =========================================================
-    def set_active_contours(self, active_roi_numbers: set[int]) -> None:
+    def set_active_contours(self, active_roi_numbers: Iterable[int]) -> None:
         """Set which ROIs are displayed.
 
-        *active_roi_numbers* is copied into a new ``set`` before being stored.
+        *active_roi_numbers* is copied into a new ``set`` before being stored
+        (accepting any iterable, not just ``set[int]``, is what lets
+        :attr:`active_contours` — a ``frozenset`` — be combined with a plain
+        set via ``|`` / ``-`` and passed straight back in, as
+        :meth:`add_rt_struct_rois` / :meth:`delete_contour` do).
         Without this, a caller that kept its own reference to the set it passed
         in (and later mutated it in place instead of calling this method again)
         would silently desynchronise this state from its listeners: the next
@@ -1256,8 +1296,8 @@ class SliceViewerState:
         active-ROI set change underneath it with no notification.
         """
         active_roi_numbers = set(active_roi_numbers)
-        if self.active_contours != active_roi_numbers:
-            object.__setattr__(self, "active_contours", active_roi_numbers)
+        if self._active_contours != active_roi_numbers:
+            self._active_contours = active_roi_numbers
             self._notify(ACTIVE_CONTOURS_CHANGED, frozenset(active_roi_numbers))
 
     def set_selected_roi(self, roi_number: int | None) -> None:

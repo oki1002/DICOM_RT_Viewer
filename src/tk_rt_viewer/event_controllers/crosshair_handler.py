@@ -61,6 +61,20 @@ class CrosshairEventHandler:
         """``True`` while a crosshair drag is in progress."""
         return self._is_dragging
 
+    def cancel(self) -> None:
+        """Abandon an in-progress crosshair drag without applying it.
+
+        Call this when another interaction mode (e.g. the brush tool) is
+        activated while a crosshair drag is in progress. Without this, the
+        drag flags stay set and ``handle_motion`` keeps moving the crosshair
+        on later mouse events that have nothing to do with the drag that was
+        interrupted, since ``on_release`` only routes to this handler when
+        no other mode has claimed the mouse.
+        """
+        self._is_dragging = False
+        self._active_axis = None
+        self._drag_target = None
+
     def handle_press(self, event) -> bool:
         """Detect a click on the crosshair and begin a drag.
 

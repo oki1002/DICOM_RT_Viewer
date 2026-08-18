@@ -259,8 +259,19 @@ class ViewerCacheManager:
         self.mask_slice_cache = MaskSliceCache()
 
         self._contour_executor: ThreadPoolExecutor | None = None
-        # In-flight background build futures keyed by roi_number.
+        # In-flight background build futures keyed by roi_number. Written
+        # from both the pool thread (schedule_contour_build's _on_done
+        # callback) and the UI thread (cancel_contour_build,
+        # cancel_all_contour_builds, clear_all), so every access is
+        # guarded by _futures_lock. This mirrors the locking already
+        # applied to ContourPathCache; see that class's docstring for the
+        # concurrent-writer argument, which applies here identically.
         self._contour_futures: dict[int, Future] = {}
+        self._futures_lock = threading.Lock()
+        # Set by close(); guards against schedule_contour_build silently
+        # recreating a new executor (and leaking a thread pool that is
+        # never closed) after the manager has been torn down.
+        self._closed: bool = False
         # Incremented on every clear_all() to prevent an in-flight
         # background task from writing into a stale generation's cache
         # after an image switch.
@@ -419,10 +430,13 @@ class ViewerCacheManager:
 
         Call this exactly once, when the owning ``SliceViewerState`` (and its
         viewer) is being torn down permanently. After this call the manager
-        must not be used again; :meth:`schedule_contour_build` would recreate
-        a new executor and leak a thread pool that is never closed.
+        must not be used again: :meth:`schedule_contour_build` checks
+        :attr:`_closed` and raises instead of silently recreating a new
+        executor, which would otherwise leak a thread pool that is never
+        closed.
         """
         self.cancel_all_contour_builds()
+        self._closed = True
         if self._contour_executor is not None:
             self._contour_executor.shutdown(wait=False, cancel_futures=True)
             self._contour_executor = None
@@ -431,7 +445,17 @@ class ViewerCacheManager:
     # Background contour-path build
     # ------------------------------------------------------------------
     def _get_executor(self) -> ThreadPoolExecutor:
-        """Return the thread pool used for contour path builds (created lazily)."""
+        """Return the thread pool used for contour path builds (created lazily).
+
+        Raises:
+            RuntimeError: If called after :meth:`close`. See that method's
+                docstring for why this is not simply a no-op.
+        """
+        if self._closed:
+            raise RuntimeError(
+                "ViewerCacheManager.close() was already called; this "
+                "manager must not be used again."
+            )
         if self._contour_executor is None:
             self._contour_executor = ThreadPoolExecutor(
                 max_workers=self._max_workers, thread_name_prefix="contour_cache"
@@ -456,7 +480,8 @@ class ViewerCacheManager:
         future = executor.submit(
             self.build_contour_paths_for_roi, roi_number, primary_image, generation
         )
-        self._contour_futures[roi_number] = future
+        with self._futures_lock:
+            self._contour_futures[roi_number] = future
 
         def _on_done(f: Future) -> None:
             # Ignore this as a stale completion notification if the future
@@ -464,9 +489,10 @@ class ViewerCacheManager:
             # was replaced by a re-invocation of schedule_contour_build, or
             # by cancel_contour_build). Checking cancelled() alone would not
             # catch a task that was replaced while still running.
-            if self._contour_futures.get(roi_number) is not f:
-                return
-            del self._contour_futures[roi_number]
+            with self._futures_lock:
+                if self._contour_futures.get(roi_number) is not f:
+                    return
+                del self._contour_futures[roi_number]
             if f.cancelled():
                 return
             exc = f.exception()
@@ -486,15 +512,18 @@ class ViewerCacheManager:
         callback will not emit a notification because ``cancelled()`` returns
         ``False`` and the Future is no longer tracked.
         """
-        future = self._contour_futures.pop(roi_number, None)
+        with self._futures_lock:
+            future = self._contour_futures.pop(roi_number, None)
         if future is not None:
             future.cancel()
 
     def cancel_all_contour_builds(self) -> None:
         """Cancel all pending build tasks and clear the tracking dict."""
-        for future in self._contour_futures.values():
+        with self._futures_lock:
+            futures = list(self._contour_futures.values())
+            self._contour_futures.clear()
+        for future in futures:
             future.cancel()
-        self._contour_futures.clear()
 
     def build_contour_paths_for_roi(
         self, roi_number: int, primary_image: sitk.Image | None, generation: int

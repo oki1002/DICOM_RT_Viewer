@@ -4,6 +4,81 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.0.1] — 2026
+
+A patch release: no public API changes. All fixes were found in a follow-up
+review of the 2.0.0 codebase.
+
+### Fixed
+
+- **A stroke abandoned mid-drag could resume painting on a later, unrelated
+  hover.** If a host application set `brush_tool_active = False` while the
+  mouse button was still held (e.g. leaving the edit tab mid-stroke),
+  `BrushEventHandler.deactivate()` left `_is_dragging` and the cached mask
+  volume set, because `ViewerEventHandler.on_release` only routes to
+  `handle_release` while the brush is still active. Re-activating the brush
+  later then started painting into the ROI on the very next mouse motion,
+  with no button held at all. `deactivate()` now abandons any in-progress
+  stroke.
+- **Activating the brush tool no longer leaves a crosshair or bounding-box
+  drag half-finished.** Only the window/level drag was reset when the brush
+  activated; a crosshair or bbox drag in progress kept its `is_dragging` flag
+  set, so it resumed on a later unrelated motion event once that mode was
+  active again. `CrosshairEventHandler` and `BboxEventHandler` gained a
+  `cancel()` method, and `ViewerEventHandler` now calls both (alongside the
+  existing window/level reset) whenever the brush tool activates.
+- **`ViewerCacheManager._contour_futures` is now internally locked.** It is
+  written from both the background contour-build pool (`schedule_contour_
+  build`'s completion callback) and the UI thread (`cancel_contour_build`,
+  `cancel_all_contour_builds`, `clear_all`), the same concurrent-writer
+  situation `ContourPathCache` was already locked against; this dict was not.
+- **`ViewerCacheManager.close()` is now actually enforced as permanent.**
+  Its docstring already said the manager must not be used again, but nothing
+  checked that: `schedule_contour_build` would silently recreate a fresh
+  `ThreadPoolExecutor` and leak a thread pool that is never closed. It now
+  raises `RuntimeError` instead.
+- **`RoiManager.update()` on an unknown or already-removed ROI is now a
+  no-op.** `StructureSet.update()` already ignored an unknown `roi_number`,
+  but `RoiManager.update()` ran the mask-volume registration and background
+  contour-build scheduling regardless, leaving cache entries for an ROI the
+  structure set had no record of.
+- **`state.active_contours` is now a read-only `frozenset` property**, not a
+  plain mutable `set` field. `state.active_contours.add(n)` previously
+  bypassed `set_active_contours()` entirely — no notification, no listener
+  kept in sync — and `ContourOverlay.draw()` / `DvhPanel.update()` iterated
+  the live set directly, risking a `RuntimeError` if a listener mutated it
+  mid-render. `set_active_contours()`'s parameter type widened from
+  `set[int]` to `Iterable[int]` to keep `active_contours | ...` /
+  `active_contours - ...` call sites working unchanged.
+- **`set_primary_image_data` now fires `all_contours_changed` /
+  `active_contours_changed` as part of its reset.** The structure set and
+  active-ROI set are cleared on every primary-image switch, but no event
+  named either change; a host application mirroring the ROI list off those
+  events (a listbox, a legend) kept showing the previous image's ROIs after
+  the switch.
+- **`BlitCompositor.on_draw` rebuilds the background bitmaps once per draw,
+  not once per axis whose limits changed.** Every axis' limits are checked
+  first, and the rebuild (if any) runs once after the full pass. Returning as
+  soon as the first changed axis was found — as before — meant the initial
+  load and every layout-mode switch, which change all axes' limits at once,
+  triggered one full-figure render per axis instead of one for the whole
+  draw.
+- **`load_rt_struct` no longer collapses same-named ROIs onto one mask.**
+  `rt_utils.get_roi_mask_by_name` matches the *first*
+  `StructureSetROISequence` entry with a given name, and two ROIs sharing a
+  name is not invalid DICOM — TPS exports do it. Every ROI in such a group
+  previously received whichever mask belonged to the first one. Each entry in
+  a duplicate-name group is now temporarily renamed to a name unique to its
+  `ROINumber` on rt-utils' own dataset before its mask is looked up; the
+  `RoiInfo` returned to the caller still carries the original (shared) name.
+- **`apply_margin`'s docstring no longer contradicts `_shift_field`.** It
+  claimed the off-centre ellipsoid translation was "quantised to whole
+  voxels", which is the opposite of what the (correct) implementation does
+  and why: rounding a one-sided sub-voxel margin to whole voxels rounds it to
+  zero. `_shift_field_2d` and `_shift_field`, which differed only in
+  dimensionality and had drifted into stating this contradiction in only one
+  of the two, are merged into one function.
+
 ## [2.0.0] — 2026
 
 A correctness release. Three of the fixes below change the *numerical* output

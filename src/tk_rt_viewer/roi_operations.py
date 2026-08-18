@@ -258,8 +258,8 @@ def interpolate_contour(mask_image: sitk.Image) -> sitk.Image:
         for z in range(prev_z + 1, next_z):
             t = (z - prev_z) / gap
             target = (1.0 - t) * centroid_prev + t * centroid_next
-            aligned_prev = _shift_field_2d(dist_prev, tuple(target - centroid_prev))
-            aligned_next = _shift_field_2d(dist_next, tuple(target - centroid_next))
+            aligned_prev = _shift_field(dist_prev, tuple(target - centroid_prev))
+            aligned_next = _shift_field(dist_next, tuple(target - centroid_next))
             filled = ((1.0 - t) * aligned_prev + t * aligned_next) <= 0.0
             result[z] = filled
             if filled.any():
@@ -347,52 +347,35 @@ def _signed_distance_3d(
     return np.asarray(outside, dtype=np.float32) - np.asarray(inside, dtype=np.float32)
 
 
-def _shift_field_2d(
-    field: np.ndarray, offset_pixels: tuple[float, float]
-) -> np.ndarray:
-    """Translate a 2-D distance *field* by a fractional number of pixels.
+def _shift_field(field: np.ndarray, offset: tuple[float, ...]) -> np.ndarray:
+    """Translate a distance *field* by a fractional number of pixels/voxels.
 
-    Used by :func:`interpolate_contour` to place each slice's field on the
-    interpolated centroid before blending. Samples pulled in from outside the
-    slice are treated as far outside the structure.
-    """
-    if not any(offset_pixels):
-        return field
-    return np.asarray(
-        ndshift(
-            field,
-            offset_pixels,
-            order=1,
-            mode="constant",
-            cval=_OUTSIDE_FIELD_DISTANCE,
-        )
-    )
-
-
-def _shift_field(
-    field: np.ndarray, offset_voxels: tuple[float, float, float]
-) -> np.ndarray:
-    """Translate a distance *field* by a fractional number of voxels.
+    Shared by :func:`interpolate_contour` (2-D, pixel offsets, to place each
+    slice's field on the interpolated centroid before blending) and
+    :func:`apply_margin` (3-D, voxel offsets in NumPy ``(z, y, x)`` order,
+    for an asymmetric margin's off-centre ellipsoid translation). Samples
+    pulled in from outside the field are treated as far outside the
+    structure.
 
     Translating the field and thresholding it afterwards is equivalent to
-    thresholding the field and translating the resulting set, but it does not
-    round the translation to whole voxels first. That distinction is the
-    difference between a correct one-sided margin and no margin at all: an
-    asymmetric margin is realised as a symmetric operation of the mean extent
-    plus a translation of half the difference (see :meth:`MarginConfig.radii_mm`),
-    so a one-sided 1 mm margin on a 1 mm grid decomposes into 0.5 mm of each —
+    thresholding the field and translating the resulting set, but it does
+    not round the translation to whole pixels/voxels first. For
+    :func:`apply_margin` that distinction is the difference between a
+    correct one-sided margin and no margin at all: an asymmetric margin is
+    realised as a symmetric operation of the mean extent plus a translation
+    of half the difference (see :meth:`MarginConfig.radii_mm`), so a
+    one-sided 1 mm margin on a 1 mm grid decomposes into 0.5 mm of each —
     and rounding both to whole voxels rounds both to zero.
 
-    *offset_voxels* is in NumPy ``(z, y, x)`` order. Linear interpolation is
-    used, which is appropriate for a field that is locally linear around the
-    boundary the threshold sits on.
+    Linear interpolation is used, which is appropriate for a field that is
+    locally linear around the boundary the threshold sits on.
     """
-    if not any(offset_voxels):
+    if not any(offset):
         return field
     return np.asarray(
         ndshift(
             field,
-            offset_voxels,
+            offset,
             order=1,
             mode="constant",
             cval=_OUTSIDE_FIELD_DISTANCE,
@@ -421,8 +404,10 @@ def apply_margin(mask_image: sitk.Image, config: MarginConfig) -> sitk.Image:
     margin of the mean extent, followed by a translation of half the
     difference. Dilation translates by ``+offset`` and erosion by
     ``-offset``, since eroding by a translated element is eroding by the
-    centred element and translating the opposite way. The translation is
-    quantised to whole voxels.
+    centred element and translating the opposite way. The translation is a
+    fractional number of voxels, not rounded to the nearest whole voxel —
+    see :func:`_shift_field` for why rounding it would zero out a one-sided
+    sub-voxel margin entirely.
 
     Distances are measured centre-to-centre between voxels, so a margin
     smaller than half a voxel along some axis may not move that face at all.

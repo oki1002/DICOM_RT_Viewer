@@ -420,3 +420,50 @@ class TestTeardown:
         # Toggling the brush tool must no longer reach the dead handler.
         state.set_brush_tool_active(True)
         assert handler.brush_handler.is_active is False
+
+
+class TestBrushActivationCancelsOtherDrags:
+    """Pins a 2.0.1 fix: activating the brush must cancel other in-progress drags.
+
+    Previously only the window/level drag was reset when the brush tool
+    activated. A crosshair or bounding-box drag left in progress kept its
+    ``is_dragging`` flag set, so a later unrelated mouse motion (once the
+    brush deactivated again) resumed moving the crosshair or resizing the
+    box on events that had nothing to do with the interrupted drag.
+    """
+
+    def test_activating_the_brush_cancels_a_crosshair_drag(self) -> None:
+        fig = Figure()
+        ax = fig.add_subplot(111)
+        ax.set_xlim(0, 16)
+        ax.set_ylim(0, 16)
+        state = loaded_state()
+        state.set_crosshair_visible(True)
+        state.refresh_crosshair()
+        handler, _viewer = handler_for(state, FakeViewer({"axial": ax}))
+        handler.on_enter_axes(Event(inaxes=ax))
+
+        cx, cy = state.crosshair_pos["axial"]
+        handler.crosshair_handler.handle_press(Event(xdata=cx, ydata=cy))
+        assert handler.crosshair_handler.is_dragging is True
+
+        state.set_brush_tool_active(True)
+
+        assert handler.crosshair_handler.is_dragging is False
+
+    def test_activating_the_brush_cancels_a_bbox_drag(self) -> None:
+        fig = Figure()
+        ax = fig.add_subplot(111)
+        ax.set_xlim(0, 16)
+        ax.set_ylim(0, 16)
+        state = loaded_state()
+        state.set_bbox_visible(True)
+        handler, _viewer = handler_for(state, FakeViewer({"axial": ax}))
+        handler.on_enter_axes(Event(inaxes=ax))
+
+        handler.bbox_handler.handle_press(Event(xdata=1.0, ydata=1.0))
+        assert handler.bbox_handler.is_dragging is True
+
+        state.set_brush_tool_active(True)
+
+        assert handler.bbox_handler.is_dragging is False

@@ -474,6 +474,67 @@ class TestPerAxisMappingsAreReadOnly:
         assert state.indices["axial"] == state.get_max_index("axial")
 
 
+class TestActiveContoursIsReadOnly:
+    """active_contours is a read-only frozenset property as of 2.0.1.
+
+    Previously it was a plain mutable ``set`` field: ``state.active_contours
+    .add(n)`` bypassed set_active_contours() entirely (no notification, no
+    listener kept in sync), and ContourOverlay.draw() / DvhPanel.update()
+    iterated the live set directly, risking a RuntimeError if a listener
+    mutated it mid-iteration.
+    """
+
+    @staticmethod
+    def _state_with_two_rois() -> tuple[SliceViewerState, int, int]:
+        state = SliceViewerState()
+        ct = sitk.GetImageFromArray(np.zeros((4, 6, 6), dtype=np.int16))
+        state.set_primary_image_data(ct)
+        mask = sitk.GetImageFromArray(np.zeros((4, 6, 6), dtype=np.uint8))
+        mask.CopyInformation(ct)
+        roi_a = state.add_contour("A", mask, "#ff0000")
+        roi_b = state.add_contour("B", mask, "#00ff00")
+        return state, roi_a, roi_b
+
+    def test_assignment_raises(self) -> None:
+        state, _a, _b = self._state_with_two_rois()
+        with pytest.raises(AttributeError):
+            state.active_contours = frozenset({1})  # type: ignore[misc]
+
+    def test_returned_object_is_a_frozenset(self) -> None:
+        state, roi_a, _b = self._state_with_two_rois()
+        state.set_active_contours({roi_a})
+        assert isinstance(state.active_contours, frozenset)
+
+    def test_mutating_the_returned_set_does_not_affect_the_state(self) -> None:
+        state, roi_a, roi_b = self._state_with_two_rois()
+        state.set_active_contours({roi_a})
+        snapshot = state.active_contours
+        with pytest.raises(AttributeError):
+            snapshot.add(roi_b)  # frozenset has no add(); confirms immutability
+
+    def test_new_primary_image_fires_contour_reset_events(self) -> None:
+        state, roi_a, _b = self._state_with_two_rois()
+        state.set_active_contours({roi_a})
+
+        all_contours_events: list = []
+        active_contours_events: list = []
+        state.add_listener(
+            events.ALL_CONTOURS_CHANGED, lambda ss: all_contours_events.append(ss)
+        )
+        state.add_listener(
+            events.ACTIVE_CONTOURS_CHANGED,
+            lambda active: active_contours_events.append(active),
+        )
+
+        new_ct = sitk.GetImageFromArray(np.zeros((4, 6, 6), dtype=np.int16))
+        state.set_primary_image_data(new_ct)
+
+        assert len(all_contours_events) == 1
+        assert len(all_contours_events[0]) == 0
+        assert active_contours_events == [frozenset()]
+        assert state.active_contours == frozenset()
+
+
 class TestSecondaryWindowLevel:
     """The secondary image carries its own display window.
 

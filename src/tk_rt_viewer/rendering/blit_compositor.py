@@ -245,14 +245,26 @@ class BlitCompositor:
         still fires a ``draw_event`` and so re-enters this callback
         synchronously; ``_rebuilding`` guards against that triggering a
         second, redundant rebuild.
+
+        Every axis' limits are checked before deciding whether to rebuild,
+        and the rebuild (if any) runs once after the full pass. Returning
+        as soon as the first changed axis was found — as a previous version
+        did — meant that whenever more than one axis' limits changed in the
+        same draw (every initial load and every layout-mode switch changes
+        all of them at once, since each axis starts with no prior entry in
+        ``_last_axis_limits``), each externally triggered ``draw_event``
+        caused one full-figure ``cache_backgrounds`` render per changed
+        axis instead of one for the whole draw.
         """
         if self._rebuilding:
             return
+        changed = False
         for axis, ax in self._axes_map().items():
             current = (ax.get_xlim(), ax.get_ylim())
             if current != self._last_axis_limits.get(axis):
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(f"Axis limits changed for '{axis}'; recaching.")
                 self._last_axis_limits[axis] = current
-                self.cache_backgrounds()
-                return
+                changed = True
+        if changed:
+            self.cache_backgrounds()

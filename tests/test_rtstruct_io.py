@@ -163,3 +163,76 @@ class TestSaveStructureSetResampling:
         )
 
         assert len(calls) == 1
+
+
+class TestLoadRtStructDuplicateNames:
+    """Pins a 2.0.1 fix: two ROIs sharing a name must not collapse onto one mask.
+
+    ``rt_utils.RTStruct.get_roi_mask_by_name`` matches the *first*
+    ``StructureSetROISequence`` entry with a given name, which is a real risk
+    for TPS exports (duplicate ROI names are not invalid DICOM). These tests
+    stub out ``RTStructBuilder.create_from`` and ``pydicom.dcmread`` with a
+    minimal fake object exposing only what ``load_rt_struct`` reads, so no
+    on-disk DICOM series is needed.
+    """
+
+    class _FakeRoi:
+        def __init__(self, number: int, name: str) -> None:
+            self.ROINumber = number
+            self.ROIName = name
+
+    class _FakeContour:
+        def __init__(self, referenced_number: int) -> None:
+            self.ReferencedROINumber = referenced_number
+            # No ROIDisplayColor attribute: _extract_roi_color falls back to
+            # a random colour, which is irrelevant to what this test checks.
+
+    class _FakeDs:
+        def __init__(self, rois: list, contours: list) -> None:
+            self.StructureSetROISequence = rois
+            self.ROIContourSequence = contours
+
+    class _FakeRTStruct:
+        def __init__(self, ds, masks_by_name: dict) -> None:
+            self.ds = ds
+            self._masks_by_name = masks_by_name
+
+        def get_roi_mask_by_name(self, name: str):
+            return self._masks_by_name[name]
+
+    def test_duplicate_names_resolve_to_distinct_masks(self, monkeypatch) -> None:
+        rois = [self._FakeRoi(1, "PTV"), self._FakeRoi(2, "PTV")]
+        contours = [self._FakeContour(1), self._FakeContour(2)]
+        ds = self._FakeDs(rois, contours)
+
+        mask_1 = np.zeros((4, 4, 2), dtype=bool)
+        mask_1[0, 0, 0] = True
+        mask_2 = np.zeros((4, 4, 2), dtype=bool)
+        mask_2[3, 3, 1] = True
+
+        # The fix renames each duplicate-name entry on rtstruct.ds to a name
+        # unique to its ROINumber before looking it up; the fake therefore
+        # only needs to serve those temporary names, not the shared "PTV".
+        rtstruct = self._FakeRTStruct(
+            ds,
+            {
+                "__tk_rt_viewer_load_tmp_1__": mask_1,
+                "__tk_rt_viewer_load_tmp_2__": mask_2,
+            },
+        )
+
+        monkeypatch.setattr(
+            rtstruct_io.RTStructBuilder, "create_from", lambda **kw: rtstruct
+        )
+        monkeypatch.setattr(rtstruct_io.pydicom, "dcmread", lambda *a, **kw: ds)
+
+        result = rtstruct_io.load_rt_struct(ct_dir="/ct", rtstruct_path="/rs.dcm")
+
+        assert set(result.keys()) == {1, 2}
+        # Both keep the original (shared) display name...
+        assert result[1]["name"] == "PTV"
+        assert result[2]["name"] == "PTV"
+        # ...but each gets its own mask instead of both getting ROI 1's.
+        assert np.array_equal(result[1]["mask"], np.transpose(mask_1, (2, 0, 1)))
+        assert np.array_equal(result[2]["mask"], np.transpose(mask_2, (2, 0, 1)))
+        assert not np.array_equal(result[1]["mask"], result[2]["mask"])

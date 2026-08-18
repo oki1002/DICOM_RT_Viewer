@@ -61,6 +61,23 @@ class BboxEventHandler:
         """``True`` while a bounding-box interaction is in progress."""
         return self._is_dragging
 
+    def cancel(self) -> None:
+        """Abandon an in-progress bounding-box interaction without applying it.
+
+        Call this when another interaction mode (e.g. the brush tool) is
+        activated while a create/move/resize drag is in progress. Without
+        this, the drag flags stay set and ``handle_motion`` keeps resizing
+        or moving the box on later mouse events that have nothing to do
+        with the drag that was interrupted, since ``on_release`` only
+        routes to this handler when no other mode has claimed the mouse.
+        """
+        self._is_dragging = False
+        self._interaction_mode = None
+        self._resize_handle = None
+        self._active_axis = None
+        self._drag_start_pos_data = None
+        self._original_pos = None
+
     # ------------------------------------------------------------------
     # Event handlers
     # ------------------------------------------------------------------

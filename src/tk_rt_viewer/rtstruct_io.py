@@ -27,6 +27,7 @@ random_hex_color() -> str
 
 import logging
 import pathlib
+from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, Any, TypedDict
@@ -263,12 +264,40 @@ def load_rt_struct(
         logger.info("RTSTRUCT contains no ROI entries.")
         return structures
 
+    # rt-utils resolves a mask by name (get_roi_mask_by_name), matching the
+    # *first* StructureSetROISequence entry with that name. Two ROIs sharing
+    # a name is not invalid DICOM — TPS exports do it — so without this,
+    # every ROI in a same-named group would silently receive whichever mask
+    # belongs to the first one, for as many ROIs as share the name.
+    #
+    # This resolves the ambiguity by temporarily renaming each ROI in a
+    # duplicate-name group to a name unique to its ROINumber on rtstruct's
+    # own dataset (the same ``rtstruct.ds`` instance get_roi_mask_by_name
+    # reads), and looking each one up by that unique name instead of the
+    # shared one. The public RoiInfo the caller receives still carries the
+    # original (shared) name; only the internal lookup key changes.
+    name_counts = Counter(name for _, name, _ in roi_tasks)
+    duplicate_names = {name for name, count in name_counts.items() if count > 1}
+    lookup_name_by_number: dict[int, str] = {}
+    if duplicate_names:
+        logger.warning(
+            f"RTSTRUCT '{rtstruct_path.name}' has duplicate ROI name(s) "
+            f"{sorted(duplicate_names)}; resolving each by ROINumber instead "
+            "of name to avoid every same-named ROI receiving the same mask."
+        )
+        for roi in rtstruct.ds.StructureSetROISequence:
+            if roi.ROIName in duplicate_names:
+                unique_name = f"__tk_rt_viewer_load_tmp_{roi.ROINumber}__"
+                lookup_name_by_number[int(roi.ROINumber)] = unique_name
+                roi.ROIName = unique_name
+
     def _load_single_roi(
         roi_number: int, roi_name: str, color_hex: str
     ) -> tuple[int, RoiInfo] | None:
         """Fetch the mask for one ROI; return None on failure."""
+        lookup_name = lookup_name_by_number.get(roi_number, roi_name)
         try:
-            mask = rtstruct.get_roi_mask_by_name(roi_name).astype(bool, copy=False)
+            mask = rtstruct.get_roi_mask_by_name(lookup_name).astype(bool, copy=False)
             mask = np.transpose(mask, (2, 0, 1))
         except Exception as exc:
             logger.warning(

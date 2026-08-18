@@ -171,6 +171,41 @@ class TestRoiManager:
         assert roi not in cache.mask_slice_cache
         cache.close()
 
+    def test_update_on_an_unknown_roi_is_a_no_op(self) -> None:
+        """Pins a 2.0.1 fix: update() for a removed/unknown ROI must not
+        leave cache entries behind.
+
+        StructureSet.update() already no-ops on an unknown roi_number;
+        before the fix, RoiManager.update() ran the mask-volume registration
+        and background contour-build scheduling regardless, creating cache
+        state for an ROI the structure set has no record of.
+        """
+        cache = ViewerCacheManager(on_contour_built=lambda _roi: None)
+        manager = RoiManager(cache, lambda: make_image())
+        unknown_roi = 999
+
+        manager.update(unknown_roi, {"mask": make_mask()})
+
+        assert unknown_roi not in cache.mask_slice_cache
+        assert unknown_roi not in manager.structure_set
+        cache.close()
+
+
+class TestViewerCacheManagerClose:
+    """Pins a 2.0.1 fix: close() must actually be a permanent shutdown.
+
+    Previously ``close()``'s docstring promised the manager "must not be
+    used again", but nothing enforced it: schedule_contour_build() would
+    silently recreate a fresh ThreadPoolExecutor, leaking a thread pool that
+    is never closed.
+    """
+
+    def test_scheduling_after_close_raises(self) -> None:
+        cache = ViewerCacheManager(on_contour_built=lambda _roi: None)
+        cache.close()
+        with pytest.raises(RuntimeError):
+            cache.schedule_contour_build(1, make_image())
+
 
 class TestDoseManager:
     @staticmethod

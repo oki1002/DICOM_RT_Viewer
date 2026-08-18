@@ -177,6 +177,13 @@ class RoiManager:
     # ------------------------------------------------------------------
     def update(self, roi_number: int, props: dict[str, Any]) -> None:
         """Update properties (``name``, ``mask``, ``color``) for *roi_number*."""
+        if roi_number not in self._structure_set:
+            # StructureSet.update() is a no-op for an unknown roi_number, so
+            # without this guard the cache work below would run for an ROI
+            # that was never added (or was already removed), leaving a
+            # mask-volume cache entry and a scheduled background build for
+            # an ROI number the structure set has no record of.
+            return
         self._structure_set.update(roi_number, props)
         if "mask" in props:
             # On mask change, invalidate the contour paths, refresh the mask

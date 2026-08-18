@@ -108,8 +108,14 @@ class ViewerEventHandler:
     def _on_brush_tool_active_changed(self, is_active: bool) -> None:
         if is_active:
             self.brush_handler.activate()
-            # Cancel any in-progress W/L drag immediately.
+            # Cancel any in-progress drag from another interaction mode
+            # immediately. Each of these otherwise keeps its drag flags set
+            # after the brush claims the mouse, so the abandoned drag would
+            # resume on the next unrelated motion event once that mode is
+            # active again (see each handler's cancel() docstring).
             self._reset_wl_drag()
+            self.crosshair_handler.cancel()
+            self.bbox_handler.cancel()
         else:
             self.brush_handler.deactivate()
 

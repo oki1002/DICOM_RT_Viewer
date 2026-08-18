@@ -78,9 +78,24 @@ class BrushEventHandler:
         self._cursor_ready = False
 
     def deactivate(self) -> None:
-        """Disable the brush tool and remove the cursor circle."""
+        """Disable the brush tool, remove the cursor, and abandon any stroke.
+
+        A stroke in progress must be abandoned here, not merely left for
+        ``handle_release`` to clean up: the host application can flip
+        ``brush_tool_active`` off while the mouse button is still held
+        (e.g. leaving the edit tab mid-drag), and ``ViewerEventHandler.
+        on_release`` only routes to ``handle_release`` while the brush is
+        still active. Without this, ``_is_dragging`` stays ``True`` and the
+        cached mask volume stays allocated; re-activating the brush later
+        then finds ``_is_dragging`` still set and starts painting on the
+        very next mouse hover, with no button held at all.
+        """
         self.is_active = False
         self._cursor_ready = False
+        if self._is_dragging:
+            self._is_dragging = False
+            self._active_axis = None
+            self._reset_stroke()
         self._remove_brush_cursor()
         self.viewer.refresh_canvas()
 

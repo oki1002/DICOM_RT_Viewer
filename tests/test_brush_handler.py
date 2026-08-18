@@ -291,3 +291,61 @@ class TestResetAfterAxesCleared:
             assert handler.brush_circle is not None
         finally:
             plt.close(fig)
+
+
+class TestDeactivateAbandonsInProgressStroke:
+    """Pins a 2.0.1 fix: deactivate() must not leave a stroke half-finished.
+
+    A host application can flip ``brush_tool_active`` off while the mouse
+    button is still held (e.g. leaving the edit tab mid-drag).
+    ``ViewerEventHandler.on_release`` only routes to
+    ``BrushEventHandler.handle_release`` while the brush is still active, so
+    without an explicit abandon in ``deactivate()``, ``_is_dragging`` stayed
+    ``True`` forever and a later re-activation started painting on the very
+    next mouse hover with no button held at all.
+    """
+
+    def test_dragging_flag_cleared_on_deactivate(self) -> None:
+        state, _ = _make_state_with_roi()
+        hover = _FakeHover()
+        hover.current_axis = "axial"
+        handler = BrushEventHandler(state, _FakeViewer(), hover)
+        handler.activate()
+
+        x_min, x_max, y_min, y_max = state.get_extent("axial")
+        cx, cy = (x_min + x_max) / 2, (y_min + y_max) / 2
+        handler.handle_press(_Event(xdata=cx, ydata=cy))
+        assert handler._is_dragging is True
+
+        handler.deactivate()
+
+        assert handler._is_dragging is False
+        assert handler._cached_mask_volume is None
+        assert handler._stroke_mask is None
+
+    def test_reactivating_does_not_paint_on_hover_alone(self) -> None:
+        fig, ax = plt.subplots()
+        try:
+            fake_viewer = _FakeViewer()
+            fake_viewer.axs = {"axial": ax}
+            state, _ = _make_state_with_roi()
+            hover = _FakeHover()
+            hover.current_axis = "axial"
+            handler = BrushEventHandler(state, fake_viewer, hover)
+            handler.activate()
+
+            x_min, x_max, y_min, y_max = state.get_extent("axial")
+            cx, cy = (x_min + x_max) / 2, (y_min + y_max) / 2
+            handler.handle_press(_Event(xdata=cx, ydata=cy))
+
+            # Button still held; host application deactivates the tool.
+            handler.deactivate()
+            # ... and later re-activates it for a fresh stroke.
+            handler.activate()
+
+            # A plain hover, with no button ever pressed after reactivation,
+            # must not resume painting the abandoned stroke.
+            handler.handle_motion(_Event(xdata=cx + (x_max - x_min) * 0.25, ydata=cy))
+            assert handler._stroke_mask is None
+        finally:
+            plt.close(fig)
