@@ -279,7 +279,25 @@ class ViewerEventHandler:
     # Mouse motion
     # ------------------------------------------------------------------
     def on_motion(self, event) -> None:
-        """Route mouse-motion events while a drag is in progress."""
+        """Route mouse-motion events while a drag is in progress.
+
+        Every motion event fired while a mouse button is held carries that
+        button number in ``event.button``; it is ``None`` once no button is
+        down. If a drag flag here is still set but the incoming motion has
+        no button, the ``button_release_event`` that should have ended that
+        drag was lost somewhere upstream — released outside the canvas, a
+        window focus change, or the toolbar grabbing the mouse — and never
+        reached :meth:`on_release`. Recovering here is what actually closes
+        that hole: cancelling only in :meth:`_on_brush_tool_active_changed`
+        / ``BrushEventHandler.deactivate`` only handles a lost release that
+        happens to coincide with the brush tool being toggled off; every
+        other cause of a lost release left the drag flag set, so the very
+        next ordinary hover (no button held at all) would resume it.
+        """
+        if event.button is None and self._any_drag_in_progress():
+            self._recover_lost_drag(event)
+            return
+
         # Priority 1: brush tool (exclusive).
         if self.state.brush_tool_active:
             self.brush_handler.handle_motion(event)
@@ -298,6 +316,44 @@ class ViewerEventHandler:
         # Priority 4: bounding box.
         if self.bbox_handler.is_dragging:
             self.bbox_handler.handle_motion(event)
+
+    def _any_drag_in_progress(self) -> bool:
+        """``True`` if any sub-handler (or the W/L drag) is mid-drag."""
+        return (
+            self.brush_handler.is_dragging
+            or self.crosshair_handler.is_dragging
+            or self._dragging_wl
+            or self.bbox_handler.is_dragging
+        )
+
+    def _recover_lost_drag(self, event) -> None:
+        """End whichever drag is in progress after its release event was lost.
+
+        The brush stroke is committed rather than discarded: unlike the
+        crosshair / W-L / bbox drags, whose target state is already fully
+        up to date from the motion events already applied, an in-progress
+        brush stroke only exists as an unsaved buffer
+        (``BrushEventHandler._cached_mask_volume``) until a release commits
+        it — discarding that here would silently drop paint strokes the
+        user watched land on screen. ``handle_release`` reads no field of
+        *event* other than the drag state already recorded on the handler,
+        so passing this button-less motion event through is safe.
+        Crosshair / bbox only need their drag flags cleared — the state
+        they touch (``state.indices`` / ``state.bounding_boxes``) was
+        already kept current by every motion event processed before this
+        one, so ``cancel()`` (which does not touch that state, only the
+        flags) is enough; committing one more position update from this
+        recovery event's coordinates would risk applying a stale point if
+        several motion events coalesced before the lost release.
+        """
+        if self.brush_handler.is_dragging:
+            self.brush_handler.handle_release(event)
+        if self.crosshair_handler.is_dragging:
+            self.crosshair_handler.cancel()
+        if self.bbox_handler.is_dragging:
+            self.bbox_handler.cancel()
+        if self._dragging_wl:
+            self._reset_wl_drag()
 
     def _apply_wl_drag(self, event) -> None:
         """Translate a right-drag into a window/level change.

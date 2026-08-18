@@ -467,3 +467,125 @@ class TestBrushActivationCancelsOtherDrags:
         state.set_brush_tool_active(True)
 
         assert handler.bbox_handler.is_dragging is False
+
+
+class TestLostReleaseRecovery:
+    """Pins a 2.0.2 fix: a lost button_release_event must not leave a drag stuck.
+
+    A drag flag (``is_dragging`` on the brush / crosshair / bbox handlers, or
+    ``_dragging_wl``) was previously cleared only by the matching
+    ``handle_release`` — or, for the brush, also by ``deactivate()``. Any
+    other way of losing the ``button_release_event`` (released off-canvas, a
+    window focus change, the toolbar grabbing the mouse) left the flag set,
+    so the very next ordinary hover — with no button held, i.e.
+    ``event.button is None`` — resumed the drag. ``on_motion`` now detects
+    exactly that combination (a drag flag set, but the incoming motion has
+    no button) and ends the drag itself.
+    """
+
+    @staticmethod
+    def _state_with_roi() -> tuple[SliceViewerState, int]:
+        state = loaded_state()
+        mask = sitk.GetImageFromArray(
+            np.zeros(sitk.GetArrayFromImage(state.primary_image).shape, dtype=np.uint8)
+        )
+        mask.CopyInformation(state.primary_image)
+        roi_number = state.add_contour("PTV", mask, "#ff0000")
+        state.set_selected_roi(roi_number)
+        return state, roi_number
+
+    def test_a_lost_release_ends_an_in_progress_brush_stroke(self) -> None:
+        fig = Figure()
+        ax = fig.add_subplot(111)
+        ax.set_xlim(0, 16)
+        ax.set_ylim(0, 16)
+        state, _roi = self._state_with_roi()
+        handler, _viewer = handler_for(state, FakeViewer({"axial": ax}))
+        handler.on_enter_axes(Event(inaxes=ax))
+        state.set_brush_tool_active(True)
+
+        x0, x1, y0, y1 = state.get_extent("axial")
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        handler.on_press(Event(button=1, xdata=cx, ydata=cy))
+        assert handler.brush_handler.is_dragging is True
+
+        # The release never arrives; a plain hover (no button) follows.
+        handler.on_motion(Event(button=None, xdata=cx + 1, ydata=cy))
+
+        assert handler.brush_handler.is_dragging is False
+        assert handler.brush_handler._cached_mask_volume is None
+
+    def test_a_lost_release_does_not_let_the_next_hover_resume_painting(self) -> None:
+        fig = Figure()
+        ax = fig.add_subplot(111)
+        ax.set_xlim(0, 16)
+        ax.set_ylim(0, 16)
+        state, _roi = self._state_with_roi()
+        handler, _viewer = handler_for(state, FakeViewer({"axial": ax}))
+        handler.on_enter_axes(Event(inaxes=ax))
+        state.set_brush_tool_active(True)
+
+        x0, x1, y0, y1 = state.get_extent("axial")
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        handler.on_press(Event(button=1, xdata=cx, ydata=cy))
+        handler.on_motion(
+            Event(button=None, xdata=cx + 1, ydata=cy)
+        )  # lost-release recovery
+
+        handler.brush_handler._stroke_mask = None
+        handler.on_motion(Event(button=None, xdata=cx + 2, ydata=cy))
+
+        assert handler.brush_handler._stroke_mask is None
+
+    def test_a_lost_release_ends_an_in_progress_crosshair_drag(self) -> None:
+        fig = Figure()
+        ax = fig.add_subplot(111)
+        ax.set_xlim(0, 16)
+        ax.set_ylim(0, 16)
+        state = loaded_state()
+        state.set_crosshair_visible(True)
+        state.refresh_crosshair()
+        handler, _viewer = handler_for(state, FakeViewer({"axial": ax}))
+        handler.on_enter_axes(Event(inaxes=ax))
+
+        cx, cy = state.crosshair_pos["axial"]
+        handler.crosshair_handler.handle_press(Event(xdata=cx, ydata=cy))
+        assert handler.crosshair_handler.is_dragging is True
+
+        handler.on_motion(Event(button=None, xdata=cx + 3, ydata=cy + 3))
+
+        assert handler.crosshair_handler.is_dragging is False
+
+    def test_a_lost_release_ends_an_in_progress_bbox_drag(self) -> None:
+        fig = Figure()
+        ax = fig.add_subplot(111)
+        ax.set_xlim(0, 16)
+        ax.set_ylim(0, 16)
+        state = loaded_state()
+        state.set_bbox_visible(True)
+        handler, _viewer = handler_for(state, FakeViewer({"axial": ax}))
+        handler.on_enter_axes(Event(inaxes=ax))
+
+        handler.bbox_handler.handle_press(Event(xdata=2.0, ydata=2.0))
+        assert handler.bbox_handler.is_dragging is True
+
+        handler.on_motion(Event(button=None, xdata=5.0, ydata=5.0))
+
+        assert handler.bbox_handler.is_dragging is False
+
+    def test_a_lost_release_ends_an_in_progress_wl_drag(self) -> None:
+        state = loaded_state()
+        handler, _viewer = handler_for(state)
+        handler.on_press(Event(button=3, x=100, y=100))
+        assert handler._dragging_wl is True
+
+        handler.on_motion(Event(button=None, x=150, y=100))
+
+        assert handler._dragging_wl is False
+
+    def test_an_ordinary_hover_with_nothing_dragging_is_unaffected(self) -> None:
+        """The recovery path must not fire when there is no drag to recover."""
+        state = loaded_state()
+        handler, viewer = handler_for(state)
+        handler.on_motion(Event(button=None, x=10, y=10))
+        assert viewer.redraw_requests == []

@@ -72,6 +72,16 @@ class BrushEventHandler:
     # ------------------------------------------------------------------
     # Activation
     # ------------------------------------------------------------------
+    @property
+    def is_dragging(self) -> bool:
+        """``True`` while a paint/erase stroke is in progress.
+
+        Mirrors ``CrosshairEventHandler.is_dragging`` /
+        ``BboxEventHandler.is_dragging`` so ``ViewerEventHandler`` can check
+        all three drag flags uniformly (see ``_any_drag_in_progress``).
+        """
+        return self._is_dragging
+
     def activate(self) -> None:
         """Enable the brush tool."""
         self.is_active = True
@@ -92,12 +102,25 @@ class BrushEventHandler:
         """
         self.is_active = False
         self._cursor_ready = False
-        if self._is_dragging:
-            self._is_dragging = False
-            self._active_axis = None
-            self._reset_stroke()
+        self._abandon_stroke()
         self._remove_brush_cursor()
         self.viewer.refresh_canvas()
+
+    def _abandon_stroke(self) -> None:
+        """Clear the in-progress-drag flags and discard any painted stroke.
+
+        Shared by :meth:`deactivate` and the lost-release recovery in
+        ``ViewerEventHandler.on_motion``. Both need the exact same three
+        things cleared (``_is_dragging``, ``_active_axis``, then everything
+        ``_reset_stroke`` covers) — keeping that list in one place means a
+        state added to one abandonment path later cannot be missed in the
+        other, the way it would be if each call site set the flags directly.
+        """
+        if not self._is_dragging:
+            return
+        self._is_dragging = False
+        self._active_axis = None
+        self._reset_stroke()
 
     def reset(self) -> None:
         """Drop the cursor artist reference after the owning Axes were cleared.

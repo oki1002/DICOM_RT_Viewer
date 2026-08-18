@@ -77,6 +77,17 @@ class ContourOverlay:
         on every call (transient brush-dragging state must not be
         persisted).
 
+        ROIs are visited in ``roi_number`` order rather than
+        ``state.active_contours``' own iteration order: that attribute is a
+        ``frozenset``, whose iteration order is a function of hash-table
+        size and is therefore not stable across a change to *which* ROIs
+        are active (adding or removing an unrelated ROI can resize the
+        table and reorder every other member). Since later entries here are
+        drawn on top, an unstable order means the stacking of overlapping
+        filled contours would shuffle itself on every unrelated ROI
+        activation/deactivation. Sorting fixes the paint order to ROI
+        number regardless of activation history.
+
         Args:
             axis: One of ``"axial"``, ``"coronal"``, or ``"sagittal"``.
             ax: Target Axes to render into.
@@ -95,7 +106,7 @@ class ContourOverlay:
         edge_colors: list = []
         face_colors: list = []
 
-        for roi_number in state.active_contours:
+        for roi_number in sorted(state.active_contours):
             using_override = roi_number in effective_override
 
             # Paths are never cached for override data (transient brush state).

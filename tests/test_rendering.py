@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 import SimpleITK as sitk
 from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.colors import to_rgba
 from matplotlib.figure import Figure
 
 from tk_rt_viewer.rendering.blit_compositor import BlitCompositor
@@ -372,6 +373,52 @@ class TestContourOverlay:
         overlay.reset()
         assert overlay.collection("axial") is None
 
+    def test_active_rois_are_drawn_in_roi_number_order(self) -> None:
+        """Pins a 2.0.2 fix: paint order must not depend on frozenset iteration.
+
+        ``active_contours`` is a ``frozenset``, whose iteration order is a
+        function of hash-table size and so is not stable across a change to
+        *which* ROIs are active. Since later entries in the PathCollection
+        are drawn on top, an unstable order meant overlapping filled
+        contours could reshuffle their stacking whenever an unrelated ROI
+        was activated or deactivated. ``draw`` must iterate in ascending
+        ``roi_number`` order regardless of activation history.
+        """
+        state = _loaded_state()
+        arr = np.zeros((4, 8, 8), dtype=np.uint8)
+        arr[1:3, 2:6, 2:6] = 1
+        mask = sitk.GetImageFromArray(arr)
+        mask.CopyInformation(state.primary_image)
+        # Add and activate out of numeric order; activation order must not
+        # leak into paint order.
+        roi_c = state.add_contour("C", mask, "#0000ff")
+        roi_a = state.add_contour("A", mask, "#ff0000")
+        roi_b = state.add_contour("B", mask, "#00ff00")
+        state.set_active_contours({roi_c, roi_a, roi_b})
+        state.set_index("axial", 1)
+
+        overlay = ContourOverlay(state, on_artists_changed=lambda _axis: None)
+        ax = Figure().add_subplot(111)
+        overlay.draw("axial", ax)
+
+        collection = overlay.collection("axial")
+        colors_in_order = [tuple(c) for c in collection.get_edgecolors()]
+        expected_order = sorted([roi_a, roi_b, roi_c])
+        expected_colors = {
+            roi_a: to_rgba("#ff0000"),
+            roi_b: to_rgba("#00ff00"),
+            roi_c: to_rgba("#0000ff"),
+        }
+        # Every path for a given ROI shares its color; just check the first
+        # color encountered for each ROI-number block appears in ascending
+        # roi_number order.
+        seen_order = []
+        for color in colors_in_order:
+            roi_for_color = next(r for r, c in expected_colors.items() if c == color)
+            if not seen_order or seen_order[-1] != roi_for_color:
+                seen_order.append(roi_for_color)
+        assert seen_order == expected_order
+
 
 # ---------------------------------------------------------------------------
 # IsoDoseOverlay
@@ -431,3 +478,46 @@ class TestDvhVoxelExtraction:
         dose = np.ones((4, 4, 4), dtype=np.float32)
         mask = np.ones((4, 4, 4), dtype=np.uint8)
         assert DvhPanel._dose_voxels_in_roi(dose, mask).size == dose.size
+
+
+class TestDvhPanelLegendOrder:
+    """Pins a 2.0.2 fix: DVH curves must plot in a stable, ROI-number order.
+
+    ``active_contours`` is a ``frozenset``; iterating it directly (as
+    ``DvhPanel.update`` used to) is not stable across a change to which
+    ROIs are active, so the legend and plotted curves could reorder
+    themselves on an unrelated ROI activation/deactivation. ``update`` must
+    now iterate in ascending ``roi_number`` order regardless.
+    """
+
+    def test_legend_entries_are_in_roi_number_order(self) -> None:
+        state = SliceViewerState()
+        ct = sitk.GetImageFromArray(np.zeros((4, 8, 8), dtype=np.int16))
+        ct.SetSpacing((1.0, 1.0, 1.0))
+        state.set_primary_image_data(ct)
+        dose = sitk.GetImageFromArray(np.full((4, 8, 8), 50.0, dtype=np.float32))
+        dose.CopyInformation(ct)
+        state.set_rt_dose_image(dose)
+        state.set_prescription_dose(60.0)
+
+        mask = sitk.GetImageFromArray(np.ones((4, 8, 8), dtype=np.uint8))
+        mask.CopyInformation(ct)
+        # roi_number is assigned in add_contour call order, not by name, so
+        # adding "C" first deliberately makes name order and roi_number
+        # order diverge (C=1, A=2, B=3) -- otherwise a bug that iterated by
+        # name instead of by roi_number could pass this test by accident.
+        roi_c = state.add_contour("C", mask, "#0000ff")
+        roi_a = state.add_contour("A", mask, "#ff0000")
+        roi_b = state.add_contour("B", mask, "#00ff00")
+        # Activate out of roi_number order too; activation order must not
+        # leak into legend / plot order either.
+        state.set_active_contours({roi_b, roi_c, roi_a})
+
+        panel = DvhPanel(state)
+        ax = Figure().add_subplot(111)
+        panel.update(ax)
+
+        legend_labels = [line.get_label() for line in ax.get_lines()]
+        expected_names = {roi_c: "C", roi_a: "A", roi_b: "B"}
+        expected_order = [expected_names[n] for n in sorted([roi_a, roi_b, roi_c])]
+        assert legend_labels == expected_order

@@ -4,6 +4,49 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.0.2] — 2026
+
+A patch release: no public API changes. All fixes were found in a follow-up
+review of the 2.0.1 codebase — including two cases where a 2.0.1 fix closed
+only part of the hole it targeted.
+
+### Fixed
+
+- **A lost `button_release_event` could leave a drag stuck indefinitely,
+  not just when the brush tool was toggled off.** 2.0.1 fixed this only for
+  the case where the host application deactivated the brush tool mid-drag;
+  every other way of losing the release — released outside the canvas, a
+  window focus change, the toolbar grabbing the mouse — left
+  `is_dragging` set on whichever handler was mid-drag (brush, crosshair,
+  bbox) or left `_dragging_wl` set, so the very next ordinary hover (no
+  button held) resumed that drag. `ViewerEventHandler.on_motion` now
+  detects the actual signal for a lost release directly — a drag flag
+  still set, but the incoming motion event carries no button — and ends
+  whichever drag is in progress itself: the brush stroke is committed
+  (`handle_release`, since its paint only exists as an unsaved buffer
+  until committed), while crosshair / bbox / W-L just have their flags
+  cleared (`cancel`, since their target state was already kept current by
+  every motion event applied before the lost release).
+- **Overlapping filled contours, and the DVH panel's plotted curves and
+  legend, could reorder themselves on an unrelated ROI activation or
+  deactivation.** `ContourOverlay.draw` and `DvhPanel.update` iterated
+  `state.active_contours` (a `frozenset`) directly; `frozenset` iteration
+  order depends on hash-table size, which changes with the *number* of
+  active ROIs, so activating or deactivating one ROI could silently
+  reorder the paint stacking of every other active ROI's overlapping fill,
+  or the DVH legend order, with no ROI added or removed from view. Both
+  now iterate `sorted(state.active_contours)`, fixing the order to
+  ascending ROI number regardless of activation history.
+
+### Changed
+
+- `BrushEventHandler` gained a public `is_dragging` property, mirroring
+  `CrosshairEventHandler.is_dragging` / `BboxEventHandler.is_dragging`, so
+  `ViewerEventHandler` can check all three drag flags uniformly.
+  `deactivate()`'s stroke-abandonment sequence was factored into a private
+  `_abandon_stroke()` shared with the new lost-release recovery path, so a
+  state added to one abandonment path later cannot be missed in the other.
+
 ## [2.0.1] — 2026
 
 A patch release: no public API changes. All fixes were found in a follow-up

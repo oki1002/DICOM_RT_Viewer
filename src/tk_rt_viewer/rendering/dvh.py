@@ -92,7 +92,14 @@ class DvhPanel:
         ax.figure.canvas.draw_idle()
 
     def update(self, ax: Axes) -> None:
-        """Render the DVH for all active contours into *ax*."""
+        """Render the DVH for all active contours into *ax*.
+
+        ROIs are visited in ``roi_number`` order (see ``ContourOverlay.draw``
+        for why iterating the ``active_contours`` frozenset directly is not
+        stable): here that keeps the legend entries and plotted curves in a
+        consistent order across redraws, instead of reshuffling whenever an
+        unrelated ROI is activated or deactivated.
+        """
         ax.clear()
         self.style_axes(ax)
         ax.set_xlabel("Dose (Gy)", fontsize=8)
@@ -118,7 +125,7 @@ class DvhPanel:
             dose_arr = sitk.GetArrayFromImage(dose).astype(np.float32)
 
         plotted = False
-        for roi_number in active:
+        for roi_number in sorted(active):
             name = self._state.structure_set.get_name(roi_number) or str(roi_number)
             color = self._state.structure_set.get_color(roi_number) or "white"
             # Prefer the uint8 volume already held by the mask cache; fall
