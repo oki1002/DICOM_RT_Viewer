@@ -8,8 +8,11 @@ handed to ``mask2rtstruct`` is captured and inspected instead.
 """
 
 import numpy as np
+import pydicom
 import pytest
 import SimpleITK as sitk
+from pydicom.dataset import FileDataset, FileMetaDataset
+from pydicom.uid import CTImageStorage, ExplicitVRLittleEndian, generate_uid
 
 from tk_rt_viewer import rtstruct_io
 from tk_rt_viewer.state.viewer_state import StructureSet
@@ -165,6 +168,98 @@ class TestSaveStructureSetResampling:
         assert len(calls) == 1
 
 
+def _write_minimal_ct_series(directory, n_slices: int = 4) -> None:
+    """Write a minimal on-disk CT series that RTStructBuilder can reference."""
+    study, series, for_ref = generate_uid(), generate_uid(), generate_uid()
+    for i in range(n_slices):
+        file_meta = FileMetaDataset()
+        file_meta.MediaStorageSOPClassUID = CTImageStorage
+        sop_uid = generate_uid()
+        file_meta.MediaStorageSOPInstanceUID = sop_uid
+        file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+
+        path = directory / f"{i}.dcm"
+        ds = FileDataset(str(path), {}, file_meta=file_meta, preamble=b"\0" * 128)
+        ds.SOPClassUID = CTImageStorage
+        ds.SOPInstanceUID = sop_uid
+        ds.StudyInstanceUID = study
+        ds.SeriesInstanceUID = series
+        ds.FrameOfReferenceUID = for_ref
+        ds.PatientName = "Test"
+        ds.PatientID = "Test"
+        ds.Modality = "CT"
+        ds.StudyDate = "20260101"
+        ds.StudyTime = "120000"
+        ds.SeriesDate = "20260101"
+        ds.SeriesTime = "120000"
+        ds.StudyID = "1"
+        ds.SeriesNumber = 1
+        ds.AccessionNumber = ""
+        ds.StudyDescription = ""
+        ds.SeriesDescription = "CT"
+        ds.PatientBirthDate = ""
+        ds.PatientSex = ""
+        ds.Rows = 8
+        ds.Columns = 8
+        ds.BitsAllocated = 16
+        ds.BitsStored = 16
+        ds.HighBit = 15
+        ds.PixelRepresentation = 1
+        ds.SamplesPerPixel = 1
+        ds.PhotometricInterpretation = "MONOCHROME2"
+        ds.PixelSpacing = [1.0, 1.0]
+        ds.SliceThickness = 1.0
+        ds.ImagePositionPatient = [0.0, 0.0, float(i)]
+        ds.ImageOrientationPatient = [1, 0, 0, 0, 1, 0]
+        ds.InstanceNumber = i + 1
+        ds.RescaleIntercept = 0
+        ds.RescaleSlope = 1
+        ds.PixelData = np.zeros((8, 8), dtype=np.int16).tobytes()
+        ds.save_as(str(path), enforce_file_format=True)
+
+
+class TestMask2RtStructReplaceExisting:
+    """Pins the 2.0.3 fix: saving to an existing path must not duplicate ROIs.
+
+    ``RTStructBuilder.create_from`` + ``add_roi`` only appends to the
+    existing ``ROIContourSequence`` / ``StructureSetROISequence``; without
+    ``replace_existing`` (the new default), every ROI would be duplicated
+    on a second save to the same path.
+    """
+
+    @staticmethod
+    def _structures() -> dict:
+        mask = np.zeros((4, 8, 8), dtype=bool)
+        mask[1:3, 2:6, 2:6] = True
+        return {1: {"name": "PTV", "mask": mask, "color": "#ff0000"}}
+
+    def test_saving_twice_does_not_duplicate_the_roi(self, tmp_path) -> None:
+        ct_dir = tmp_path / "ct"
+        ct_dir.mkdir()
+        _write_minimal_ct_series(ct_dir)
+        rtss_path = tmp_path / "rs.dcm"
+
+        rtstruct_io.mask2rtstruct(ct_dir, rtss_path, self._structures())
+        rtstruct_io.mask2rtstruct(ct_dir, rtss_path, self._structures())
+
+        saved = pydicom.dcmread(str(rtss_path))
+        assert [r.ROIName for r in saved.StructureSetROISequence] == ["PTV"]
+
+    def test_replace_existing_false_still_appends(self, tmp_path) -> None:
+        ct_dir = tmp_path / "ct"
+        ct_dir.mkdir()
+        _write_minimal_ct_series(ct_dir)
+        rtss_path = tmp_path / "rs.dcm"
+
+        rtstruct_io.mask2rtstruct(ct_dir, rtss_path, self._structures())
+        rtstruct_io.mask2rtstruct(
+            ct_dir, rtss_path, self._structures(), replace_existing=False
+        )
+
+        saved = pydicom.dcmread(str(rtss_path))
+        assert [r.ROIName for r in saved.StructureSetROISequence] == ["PTV", "PTV"]
+
+
 class TestLoadRtStructDuplicateNames:
     """Pins a 2.0.1 fix: two ROIs sharing a name must not collapse onto one mask.
 
@@ -236,3 +331,34 @@ class TestLoadRtStructDuplicateNames:
         assert np.array_equal(result[1]["mask"], np.transpose(mask_1, (2, 0, 1)))
         assert np.array_equal(result[2]["mask"], np.transpose(mask_2, (2, 0, 1)))
         assert not np.array_equal(result[1]["mask"], result[2]["mask"])
+
+    def test_temporary_rename_is_restored_after_loading(self, monkeypatch) -> None:
+        """Pins a 2.0.3 fix: the temporary unique names must not leak.
+
+        rtstruct.ds is the same dataset object RTStructBuilder.create_from
+        returned; leaving the temporary ``__tk_rt_viewer_load_tmp_N__``
+        names on it after load_rt_struct returns would let them leak into
+        anything that later reads ROIName off that dataset.
+        """
+        rois = [self._FakeRoi(1, "PTV"), self._FakeRoi(2, "PTV")]
+        contours = [self._FakeContour(1), self._FakeContour(2)]
+        ds = self._FakeDs(rois, contours)
+
+        mask_1 = np.zeros((4, 4, 2), dtype=bool)
+        mask_2 = np.zeros((4, 4, 2), dtype=bool)
+        rtstruct = self._FakeRTStruct(
+            ds,
+            {
+                "__tk_rt_viewer_load_tmp_1__": mask_1,
+                "__tk_rt_viewer_load_tmp_2__": mask_2,
+            },
+        )
+
+        monkeypatch.setattr(
+            rtstruct_io.RTStructBuilder, "create_from", lambda **kw: rtstruct
+        )
+        monkeypatch.setattr(rtstruct_io.pydicom, "dcmread", lambda *a, **kw: ds)
+
+        rtstruct_io.load_rt_struct(ct_dir="/ct", rtstruct_path="/rs.dcm")
+
+        assert [roi.ROIName for roi in ds.StructureSetROISequence] == ["PTV", "PTV"]

@@ -4,6 +4,77 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.0.3] — 2026
+
+A patch release: one small, backward-compatible API addition
+(`mask2rtstruct`'s new `replace_existing` keyword), otherwise no public API
+changes. All fixes were found in a follow-up review of the 2.0.2 codebase.
+
+### Fixed
+
+- **A window/canvas resize left the blit background stale, corrupting the
+  display on the next unrelated redraw.** `BlitCompositor.on_draw` decided
+  whether to rebuild the cached background bitmap by comparing each axis'
+  `get_xlim()` / `get_ylim()` only. Every base image in this package is
+  drawn with `aspect="equal", adjustable="box"`, under which a resize
+  changes `ax.bbox` (the pixel box the Axes occupies) but leaves the data
+  limits untouched — so a resize was never detected. The resize's own
+  `canvas.draw()` still painted correctly, but the *next* blit-only redraw
+  (a crosshair drag, a brush stroke, a scroll) restored the old-sized
+  background bitmap over the newly laid-out canvas. `on_draw` now includes
+  `ax.bbox.bounds` in its change-detection key alongside the data limits.
+- **Saving a structure set to an existing RT-STRUCT path duplicated every
+  ROI.** `mask2rtstruct` loaded an existing file with
+  `RTStructBuilder.create_from` and called `add_roi` for each structure;
+  rt-utils' `add_roi` only appends to `ROIContourSequence` /
+  `StructureSetROISequence`, so a second save to the same path (a normal
+  "edit, then save over the same file" workflow) left every ROI present
+  twice, a third save three times, and so on. `mask2rtstruct` now defaults
+  to rebuilding the file from scratch (`replace_existing=True`) so it ends
+  up containing exactly the structures passed in; pass
+  `replace_existing=False` to keep the previous append-only behaviour.
+- **`load_dcm_series` could silently return the wrong series.** Its "exactly
+  one series" check compared `len(series_dict)`, but `load_all_series`
+  collapses same-`SeriesDescription` series into one dict entry (the last
+  one loaded wins). A folder holding two distinctly-identified series that
+  happen to share a `SeriesDescription` therefore passed the check and
+  returned one of them instead of raising. The check now compares the true
+  number of series loaded, tracked separately from the description-keyed
+  mapping.
+- **`RoiManager.add()` / `add_many()` accepted a mask whose size did not
+  match the primary image.** `add_from_rt_struct` already validated a
+  NumPy mask's shape before wrapping it; the `sitk.Image`-mask path did
+  not, so a mismatched mask was registered into the mask-volume and
+  contour-path caches and then silently produced slices at the wrong
+  physical scale for that ROI on every redraw. `add_many` now validates
+  every mask's `GetSize()` against the primary image before adding any of
+  them, matching `add_from_rt_struct`'s all-or-nothing behaviour.
+- **`load_rt_struct`'s temporary ROI-name rename (for duplicate-name
+  resolution) was never restored.** The workaround temporarily renames
+  same-named ROIs on `rtstruct.ds` — the same dataset object
+  `RTStructBuilder.create_from` returned — to look each one up
+  unambiguously, but left the placeholder names in place afterwards. The
+  rename is now undone in a `finally` block once loading finishes.
+- **A lost window/level-drag release could still hijack the very next drag
+  a fresh press started**, not just the next bare hover. 2.0.2 fixed
+  `on_motion`'s recovery for a lost `button_release_event`, but that only
+  fires when a later motion event arrives with no button held; a *new*
+  press landing in the gap before that (e.g. a right-drag release lost,
+  then an immediate left-click to start a bounding box) still saw
+  `_dragging_wl` set, so the next motion event resumed adjusting the
+  window/level instead of dragging the box the press had just started.
+  `on_press` now runs the same stale-drag recovery `on_motion` does before
+  dispatching to a handler.
+
+### Changed
+
+- `DicomViewer.destroy()` now disconnects every `mpl_connect` callback it
+  registered in `_bind_events`, mirroring the existing state-listener
+  cleanup. No observable behaviour change (the canvas is destroyed
+  immediately after), but it stops those callbacks' closures — and
+  therefore the viewer and its collaborators — from staying reachable
+  through the canvas for as long as anything else keeps it alive.
+
 ## [2.0.2] — 2026
 
 A patch release: no public API changes. All fixes were found in a follow-up

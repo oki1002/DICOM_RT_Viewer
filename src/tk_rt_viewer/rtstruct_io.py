@@ -115,7 +115,9 @@ def save_structure_set(
             ``get_roi_numbers`` / ``get_name`` / ``get_mask`` / ``get_color``
             are used.
         ct_dir: Directory of the reference CT series.
-        rtss_path: Destination path. An existing file is updated in place.
+        rtss_path: Destination path. An existing file is fully rebuilt so it
+            ends up containing exactly *structure_set*'s ROIs and nothing
+            else (see :func:`mask2rtstruct`'s ``replace_existing``).
         lps_image: The LPS-aligned CT the masks share their geometry with —
             i.e. ``SliceViewerState.primary_image``.
         original_image: The CT as loaded before LPS alignment
@@ -279,6 +281,14 @@ def load_rt_struct(
     name_counts = Counter(name for _, name, _ in roi_tasks)
     duplicate_names = {name for name, count in name_counts.items() if count > 1}
     lookup_name_by_number: dict[int, str] = {}
+    # Original ROIName values for every entry renamed below, so they can be
+    # restored once loading finishes. rtstruct.ds is the same dataset object
+    # RTStructBuilder.create_from returned and that this function's caller
+    # may still hold a reference to (or that a future change here might pass
+    # on to a save path); leaving the temporary names in place after this
+    # function returns would let them leak into anything that reads
+    # ROIName off that dataset afterwards.
+    renamed_original: dict[int, str] = {}
     if duplicate_names:
         logger.warning(
             f"RTSTRUCT '{rtstruct_path.name}' has duplicate ROI name(s) "
@@ -289,6 +299,7 @@ def load_rt_struct(
             if roi.ROIName in duplicate_names:
                 unique_name = f"__tk_rt_viewer_load_tmp_{roi.ROINumber}__"
                 lookup_name_by_number[int(roi.ROINumber)] = unique_name
+                renamed_original[int(roi.ROINumber)] = roi.ROIName
                 roi.ROIName = unique_name
 
     def _load_single_roi(
@@ -310,15 +321,22 @@ def load_rt_struct(
     total_rois = len(roi_tasks)
     n_workers = min(max_workers, total_rois)
     completed = 0
-    with ThreadPoolExecutor(max_workers=n_workers) as executor:
-        futures = [executor.submit(_load_single_roi, *task) for task in roi_tasks]
-        for future in as_completed(futures):
-            result = future.result()
-            if result is not None:
-                structures[result[0]] = result[1]
-            completed += 1
-            if progress_callback is not None:
-                progress_callback(completed, total_rois)
+    try:
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            futures = [executor.submit(_load_single_roi, *task) for task in roi_tasks]
+            for future in as_completed(futures):
+                result = future.result()
+                if result is not None:
+                    structures[result[0]] = result[1]
+                completed += 1
+                if progress_callback is not None:
+                    progress_callback(completed, total_rois)
+    finally:
+        if renamed_original:
+            for roi in rtstruct.ds.StructureSetROISequence:
+                original = renamed_original.get(int(roi.ROINumber))
+                if original is not None:
+                    roi.ROIName = original
 
     logger.info(f"RTSTRUCT loaded: {len(structures)} ROIs.")
     return structures
@@ -359,13 +377,13 @@ def mask2rtstruct(
     ct_dir: str | pathlib.Path,
     rtss_path: str | pathlib.Path | None,
     structures: dict[int, dict[str, Any]],
+    *,
+    replace_existing: bool = True,
 ) -> None:
     """Write mask arrays to an RT-STRUCT DICOM file.
 
-    When *rtss_path* already exists the file is updated in place;
-    otherwise a new RT-STRUCT is created. Mask arrays must have shape
-    ``(D, H, W)`` and are transposed to rt-utils' expected ``(H, W, D)``
-    convention internally.
+    Mask arrays must have shape ``(D, H, W)`` and are transposed to
+    rt-utils' expected ``(H, W, D)`` convention internally.
 
     Note:
         *rtss_path* must not be ``None``. Callers are responsible for
@@ -376,6 +394,17 @@ def mask2rtstruct(
         rtss_path: Destination path for the RT-STRUCT file.
         structures: ``{roi_number: {"name": str, "mask": np.ndarray,
             "color": list | str}}`` mapping.
+        replace_existing: When ``True`` (the default) and *rtss_path*
+            already exists, the file is rebuilt from scratch so it ends up
+            containing exactly *structures* and nothing else. rt-utils'
+            ``add_roi`` only appends to ``ROIContourSequence`` /
+            ``StructureSetROISequence``; loading the existing file with
+            :meth:`RTStructBuilder.create_from` and adding *structures* to
+            it (the previous, and still available, behaviour) does not
+            remove what was already there, so every ROI in *structures*
+            would be duplicated on a second save to the same path. Pass
+            ``False`` to opt into that append-only behaviour when adding
+            ROIs to a file this function did not itself just write.
 
     Raises:
         ValueError: If *rtss_path* is ``None``.
@@ -389,14 +418,17 @@ def mask2rtstruct(
 
     logger.info("Converting masks to RTSTRUCT.")
 
-    if rtss_path.exists():
+    if rtss_path.exists() and not replace_existing:
         logger.info(f"Updating existing RTSTRUCT: '{rtss_path}'.")
         rtstruct = RTStructBuilder.create_from(
             dicom_series_path=str(ct_dir),
             rt_struct_path=str(rtss_path),
         )
     else:
-        logger.info("Creating new RTSTRUCT.")
+        if rtss_path.exists():
+            logger.info(f"Rebuilding RTSTRUCT from scratch: '{rtss_path}'.")
+        else:
+            logger.info("Creating new RTSTRUCT.")
         rtstruct = RTStructBuilder.create_new(dicom_series_path=str(ct_dir))
 
     for roi_data in structures.values():

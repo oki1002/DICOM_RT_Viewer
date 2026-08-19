@@ -540,6 +540,62 @@ def _build_series_info(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+def _load_all_series_impl(
+    dcm_root_dir: str | pathlib.Path,
+) -> tuple[dict[str, SeriesInfo], int]:
+    """Shared implementation for :func:`load_all_series` / :func:`load_dcm_series`.
+
+    Returns both the SeriesDescription-keyed mapping :func:`load_all_series`
+    exposes and the true count of image series actually loaded. The two can
+    differ: :func:`load_all_series` collapses same-SeriesDescription series
+    into one dict entry (the last one loaded wins), so ``len(series_dict)``
+    alone cannot tell :func:`load_dcm_series` whether the directory truly
+    held one series or silently dropped a duplicate-described one.
+
+    Returns:
+        ``(series_dict, loaded_count)``.
+
+    Raises:
+        FileNotFoundError: If no readable DICOM image series is found.
+    """
+    dcm_root_dir = pathlib.Path(dcm_root_dir)
+    reader = sitk.ImageSeriesReader()
+    series_dict: dict[str, SeriesInfo] = {}
+    loaded_count = 0
+
+    logger.info(f"Searching for DICOM series in '{dcm_root_dir}'.")
+    # Walk the directory tree once, gathering directories that contain DICOM
+    # files, the REG matrices, each file's SOPInstanceUID, and each series'
+    # Modality (previously find_reg_matrices and _dir_has_dicom each walked
+    # the whole tree independently, dcmread-ing the same file twice, and
+    # _build_series_info dcmread-ing a series' first file a third time).
+    scan = _scan_dicom_tree(dcm_root_dir)
+
+    for dcm_dir in sorted(scan.dirs_with_dicom):
+        for sid in reader.GetGDCMSeriesIDs(str(dcm_dir)):
+            modality = scan.modality_by_series.get(sid, "")
+            if modality.upper() in _NON_IMAGE_MODALITIES:
+                logger.info(f"Skipping {modality} series '{sid}' (not an image).")
+                continue
+            raw_image, file_names = _read_series(reader, dcm_dir, sid)
+            description, info = _build_series_info(
+                reader, raw_image, file_names, scan, sid
+            )
+            loaded_count += 1
+
+            if description in series_dict:
+                logger.warning(
+                    f"Duplicate SeriesDescription '{description}'; overwriting."
+                )
+            series_dict[description] = info
+
+    if not series_dict:
+        raise FileNotFoundError(f"No DICOM image series found in '{dcm_root_dir}'.")
+
+    logger.info(f"{loaded_count} series loaded from '{dcm_root_dir}'.")
+    return series_dict, loaded_count
+
+
 def load_all_series(dcm_root_dir: str | pathlib.Path) -> dict[str, SeriesInfo]:
     """Load every DICOM image series found under *dcm_root_dir*.
 
@@ -563,39 +619,7 @@ def load_all_series(dcm_root_dir: str | pathlib.Path) -> dict[str, SeriesInfo]:
     Raises:
         FileNotFoundError: If no readable DICOM image series is found.
     """
-    dcm_root_dir = pathlib.Path(dcm_root_dir)
-    reader = sitk.ImageSeriesReader()
-    series_dict: dict[str, SeriesInfo] = {}
-
-    logger.info(f"Searching for DICOM series in '{dcm_root_dir}'.")
-    # Walk the directory tree once, gathering directories that contain DICOM
-    # files, the REG matrices, each file's SOPInstanceUID, and each series'
-    # Modality (previously find_reg_matrices and _dir_has_dicom each walked
-    # the whole tree independently, dcmread-ing the same file twice, and
-    # _build_series_info dcmread-ing a series' first file a third time).
-    scan = _scan_dicom_tree(dcm_root_dir)
-
-    for dcm_dir in sorted(scan.dirs_with_dicom):
-        for sid in reader.GetGDCMSeriesIDs(str(dcm_dir)):
-            modality = scan.modality_by_series.get(sid, "")
-            if modality.upper() in _NON_IMAGE_MODALITIES:
-                logger.info(f"Skipping {modality} series '{sid}' (not an image).")
-                continue
-            raw_image, file_names = _read_series(reader, dcm_dir, sid)
-            description, info = _build_series_info(
-                reader, raw_image, file_names, scan, sid
-            )
-
-            if description in series_dict:
-                logger.warning(
-                    f"Duplicate SeriesDescription '{description}'; overwriting."
-                )
-            series_dict[description] = info
-
-    if not series_dict:
-        raise FileNotFoundError(f"No DICOM image series found in '{dcm_root_dir}'.")
-
-    logger.info(f"{len(series_dict)} series loaded from '{dcm_root_dir}'.")
+    series_dict, _ = _load_all_series_impl(dcm_root_dir)
     return series_dict
 
 
@@ -687,11 +711,15 @@ def load_dcm_series(dcm_dir: str | pathlib.Path) -> SeriesInfo:
         FileNotFoundError: If no DICOM series is found in the directory.
         ValueError: If more than one series is found in the directory.
     """
-    series_dict = load_all_series(dcm_dir)
-    if len(series_dict) != 1:
+    # The true series count (loaded_count), not len(series_dict): two series
+    # sharing a SeriesDescription collapse into one dict entry (see
+    # _load_all_series_impl), which previously let a duplicate-described
+    # second series slip through this check silently instead of raising.
+    series_dict, loaded_count = _load_all_series_impl(dcm_dir)
+    if loaded_count != 1:
         raise ValueError(
             f"Expected exactly one DICOM series in '{dcm_dir}', "
-            f"but found {len(series_dict)}."
+            f"but found {loaded_count}."
         )
     # next(iter(...)) makes the "one element" intent explicit vs. popitem().
     return next(iter(series_dict.values()))

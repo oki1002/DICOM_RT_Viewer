@@ -257,14 +257,19 @@ class DicomViewer(ttk.Frame):
     def _bind_events(self) -> None:
         """Connect canvas events and subscribe to the state."""
         eh = self.event_handler
-        self.canvas.mpl_connect("axes_enter_event", eh.on_enter_axes)
-        self.canvas.mpl_connect("axes_leave_event", eh.on_leave_axes)
-        self.canvas.mpl_connect("scroll_event", eh.on_scroll)
-        self.canvas.mpl_connect("button_press_event", eh.on_press)
-        self.canvas.mpl_connect("motion_notify_event", eh.on_motion)
-        self.canvas.mpl_connect("button_release_event", eh.on_release)
-        self.canvas.mpl_connect("key_press_event", eh.on_key_press)
-        self.canvas.mpl_connect("draw_event", self._compositor.on_draw)
+        # Connection ids are kept so destroy() can mpl_disconnect them all;
+        # see the comment on self._state_listeners below for why leaving
+        # a subscription live past teardown matters for an injected state.
+        self._mpl_cids: list[int] = [
+            self.canvas.mpl_connect("axes_enter_event", eh.on_enter_axes),
+            self.canvas.mpl_connect("axes_leave_event", eh.on_leave_axes),
+            self.canvas.mpl_connect("scroll_event", eh.on_scroll),
+            self.canvas.mpl_connect("button_press_event", eh.on_press),
+            self.canvas.mpl_connect("motion_notify_event", eh.on_motion),
+            self.canvas.mpl_connect("button_release_event", eh.on_release),
+            self.canvas.mpl_connect("key_press_event", eh.on_key_press),
+            self.canvas.mpl_connect("draw_event", self._compositor.on_draw),
+        ]
 
         # Tk only delivers key events to the widget that currently holds
         # keyboard focus. Without this, "key_press_event" (arrow-key slice
@@ -933,6 +938,18 @@ class DicomViewer(ttk.Frame):
         self.drawing_manager.cancel()
         self._compositor.cancel_pending()
         self.event_handler.cancel_pending()
+        # Disconnect every canvas callback registered in _bind_events. The
+        # Tk widget is about to be destroyed by super().destroy() below, but
+        # the FigureCanvasTkAgg / mpl connection registry is a separate
+        # object from it and does not know that; leaving these connected
+        # has no functional effect once the canvas itself is gone (nothing
+        # fires matplotlib events into a destroyed widget), but it does keep
+        # every connected callback's closure (and therefore this viewer and
+        # its collaborators) reachable from the canvas for as long as
+        # anything else keeps that canvas alive.
+        for cid in self._mpl_cids:
+            self.canvas.mpl_disconnect(cid)
+        self._mpl_cids.clear()
         # Unsubscribe from the state before anything else: after this point no
         # state change can reach this (now dying) widget. Essential for
         # injected states, which outlive the viewer.

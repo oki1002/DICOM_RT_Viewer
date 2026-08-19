@@ -76,12 +76,41 @@ class RoiManager:
         """Add several ROIs at once.
 
         Args:
-            rois: ``(name, mask, color)`` tuples.
+            rois: ``(name, mask, color)`` tuples. Each mask's size must match
+                the primary image's.
 
         Returns:
             ROI numbers in the same order as *rois*.
+
+        Raises:
+            RuntimeError: If no primary image is loaded.
+            ValueError: If any mask's size does not match the primary
+                image's. Every mask is checked before any ROI is added, so a
+                mismatch leaves the structure set untouched rather than
+                half-populated. Unlike :meth:`add_from_rt_struct` (which
+                validates NumPy array shape before wrapping it into a
+                ``sitk.Image``), the masks here already arrive as
+                ``sitk.Image``, so ``GetSize()`` is compared directly rather
+                than reversing a ``(D, H, W)`` array shape into ``(x, y, z)``.
+                A mismatch previously went uncaught here: the mask still got
+                registered into the mask-volume / contour-path caches, which
+                then silently returned slices at the wrong physical scale
+                for that ROI on every subsequent redraw.
         """
         primary_image = self._primary_image()
+        if primary_image is None:
+            raise RuntimeError(
+                "Cannot add ROI(s): no primary image is loaded, so the "
+                "masks have no geometry to be validated against."
+            )
+        expected_size = primary_image.GetSize()
+        for name, mask, _color in rois:
+            if mask.GetSize() != expected_size:
+                raise ValueError(
+                    f"ROI '{name}' has mask size {mask.GetSize()}, but the "
+                    f"primary image is {expected_size}."
+                )
+
         roi_numbers: list[int] = []
         for name, mask, color in rois:
             roi_number = self._structure_set.add(name, mask, color)

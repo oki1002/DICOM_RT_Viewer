@@ -239,12 +239,24 @@ class BlitCompositor:
         self.cache_backgrounds(axes_filter)
 
     def on_draw(self, event: Any = None) -> None:
-        """Rebuild the backgrounds when the axis limits change (zoom / pan).
+        """Rebuild the backgrounds when an axis' limits or on-screen box change.
 
         ``cache_backgrounds`` renders via ``FigureCanvasAgg.draw``, which
         still fires a ``draw_event`` and so re-enters this callback
         synchronously; ``_rebuilding`` guards against that triggering a
         second, redundant rebuild.
+
+        The comparison key includes ``ax.bbox.bounds`` alongside the data
+        limits. A window/canvas resize with ``aspect=\"equal\",
+        adjustable=\"box\"`` (every base image here uses that) leaves
+        ``get_xlim()`` / ``get_ylim()`` unchanged — only the pixel box the
+        Axes occupies moves and resizes — so limits alone missed every
+        resize: the background bitmap cached by :meth:`cache_backgrounds`
+        stays the old size and position, and the next unrelated blit
+        (a crosshair drag, a brush stroke, a scroll) restores that
+        stale-sized region over the newly laid-out canvas, corrupting the
+        display until something else happens to trigger a full
+        ``canvas.draw()``.
 
         Every axis' limits are checked before deciding whether to rebuild,
         and the rebuild (if any) runs once after the full pass. Returning
@@ -260,10 +272,10 @@ class BlitCompositor:
             return
         changed = False
         for axis, ax in self._axes_map().items():
-            current = (ax.get_xlim(), ax.get_ylim())
+            current = (ax.get_xlim(), ax.get_ylim(), ax.bbox.bounds)
             if current != self._last_axis_limits.get(axis):
                 if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(f"Axis limits changed for '{axis}'; recaching.")
+                    logger.debug(f"Axis limits or box changed for '{axis}'; recaching.")
                 self._last_axis_limits[axis] = current
                 changed = True
         if changed:

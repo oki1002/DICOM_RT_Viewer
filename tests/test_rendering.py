@@ -211,6 +211,46 @@ class TestBlitCompositor:
         compositor.redraw_axis("axial")
         assert calls == []
 
+    def test_a_canvas_resize_rebuilds_the_background_even_with_unchanged_limits(
+        self,
+    ) -> None:
+        """Pins the 2.0.3 fix: on_draw must key off ax.bbox, not just xlim/ylim.
+
+        With aspect="equal", adjustable="box" (every base image in this
+        package uses that), a figure resize changes ax.bbox but leaves
+        get_xlim()/get_ylim() untouched. Comparing limits alone therefore
+        missed every resize, leaving the background bitmap the old size and
+        position until some unrelated event happened to trigger a full
+        canvas.draw().
+        """
+        fig = Figure(figsize=(4, 3))
+        canvas = FigureCanvasAgg(fig)
+        ax = fig.add_subplot(111)
+        ax.imshow(np.zeros((8, 8)))
+        ax.set_aspect("equal", adjustable="box")
+        scheduler = _FakeScheduler()
+        compositor = BlitCompositor(
+            canvas=canvas,
+            axes_map=lambda: {"axial": ax},
+            blit_artists=lambda _axis: [],
+            overlay_artists=lambda _axis: [],
+            transient_artists=lambda _axis: [],
+            schedule=scheduler.schedule,
+            cancel=scheduler.cancel,
+        )
+        canvas.draw()
+        compositor.on_draw()
+        background_before = compositor._backgrounds["axial"]
+        xlim_before, ylim_before = ax.get_xlim(), ax.get_ylim()
+
+        fig.set_size_inches(8, 6)
+        canvas.draw()
+        compositor.on_draw()
+
+        assert ax.get_xlim() == xlim_before
+        assert ax.get_ylim() == ylim_before
+        assert compositor._backgrounds["axial"] is not background_before
+
     def test_a_burst_of_rebuild_requests_leaves_one_pending_callback(self) -> None:
         compositor, _calls, scheduler, _ax = self._compositor()
         compositor.schedule_rebuild()

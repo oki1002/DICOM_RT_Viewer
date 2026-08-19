@@ -227,10 +227,29 @@ class ViewerEventHandler:
     # Mouse press
     # ------------------------------------------------------------------
     def on_press(self, event) -> None:
-        """Dispatch a mouse-press event to the appropriate handler."""
+        """Dispatch a mouse-press event to the appropriate handler.
+
+        A button-down transition is, under ordinary single-pointer desktop
+        interaction, only ever preceded by button-up: a drag flag still set
+        when a *new* press arrives is therefore the same signal
+        :meth:`on_motion` already recovers from (a lost
+        ``button_release_event``), just observed one event earlier. Without
+        this check here, only the button-less-motion recovery in
+        :meth:`on_motion` existed, which left a window between the lost
+        release and the next motion event: a press landing in that window
+        (e.g. a right-drag W/L release lost, then an immediate left-click to
+        start a bbox) still saw ``_dragging_wl`` set, and the *next* motion
+        event resumed adjusting the window/level instead of dragging the
+        bbox this press just started — priority 3 runs ahead of priority 4
+        in :meth:`on_motion`. Recovering here closes that window the same
+        way :meth:`on_motion` closes its own.
+        """
         # Ignore while the toolbar zoom/pan mode is active.
         if self.viewer.toolbar_mode:
             return
+
+        if self._any_drag_in_progress():
+            self._recover_lost_drag(event)
 
         # Priority 1: brush tool (exclusive; blocks crosshair, W/L, bbox).
         if self.state.brush_tool_active:

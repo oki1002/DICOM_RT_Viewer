@@ -162,6 +162,26 @@ class TestRoiManager:
             )
         assert len(manager.structure_set) == 0
 
+    def test_add_rejects_a_mask_size_mismatch(self) -> None:
+        """Pins the 2.0.3 fix: add()/add_many() must validate mask size.
+
+        add_from_rt_struct already validated a NumPy mask's shape against
+        the primary image before this fix; add()/add_many() (which take a
+        sitk.Image mask directly) did not, so a mismatched mask was
+        registered into the mask-volume / contour-path caches, which then
+        silently returned slices at the wrong physical scale for that ROI.
+        """
+        manager = self._manager(make_image())  # (4, 8, 8)
+        mismatched = make_mask(shape=(4, 4, 4))
+        with pytest.raises(ValueError, match="mask size"):
+            manager.add("Bad", mismatched, "#f00")
+        assert len(manager.structure_set) == 0
+
+    def test_add_without_a_primary_image_raises(self) -> None:
+        manager = self._manager(None)
+        with pytest.raises(RuntimeError, match="no primary image"):
+            manager.add("PTV", make_mask(), "#f00")
+
     def test_removal_drops_the_cached_mask_volume(self) -> None:
         cache = ViewerCacheManager(on_contour_built=lambda _roi: None)
         manager = RoiManager(cache, lambda: make_image())
