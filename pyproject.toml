@@ -48,7 +48,11 @@ classifiers = [
 dependencies = [
     "SimpleITK>=2.3",
     "contourpy>=1.2",
-    "matplotlib>=3.7",
+    # 3.10 added MouseEvent.buttons (plural), which the lost-drag-release
+    # recovery in event_controllers.viewer_events relies on to tell whether
+    # a mouse button is currently held; see that module for why the older
+    # singular `button` attribute cannot be used for this check.
+    "matplotlib>=3.10",
     # 1.26 is the first release supporting Python 3.12, which this
     # package requires; anything lower could never be installed here.
     "numpy>=1.26",

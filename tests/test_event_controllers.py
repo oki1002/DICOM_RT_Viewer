@@ -589,3 +589,74 @@ class TestLostReleaseRecovery:
         handler, viewer = handler_for(state)
         handler.on_motion(Event(button=None, x=10, y=10))
         assert viewer.redraw_requests == []
+
+
+class TestLostReleaseRecoveryViaRealMplEvents:
+    """Pins the 2.0.4 fix using Matplotlib's real event pipeline.
+
+    Every test above hand-builds its ``Event`` stand-in with
+    ``button=None``, which is exactly the assumption the 2.0.4 fix found to
+    be wrong: on a real canvas, Matplotlib's own default callback
+    (``backend_bases._mouse_handler``) dead-reckons a motion event's
+    singular ``button`` from the last press/release the canvas actually
+    saw, so a *lost* release leaves it stuck non-``None`` rather than
+    clearing it. These tests drive events through ``MouseEvent(...).
+    _process()`` on a real (Agg) canvas via ``mpl_connect``, so that
+    dead-reckoning runs exactly as it would in the live application, and
+    confirm the recovery still fires under it.
+    """
+
+    @staticmethod
+    def _wire(handler: ViewerEventHandler, fig) -> None:
+        fig.canvas.mpl_connect("button_press_event", handler.on_press)
+        fig.canvas.mpl_connect("motion_notify_event", handler.on_motion)
+        fig.canvas.mpl_connect("button_release_event", handler.on_release)
+
+    def test_a_lost_wl_release_does_not_let_the_next_hover_resume_it(self) -> None:
+        from matplotlib.backend_bases import MouseButton, MouseEvent
+
+        state = loaded_state()
+        handler, _viewer = handler_for(state)
+        fig = Figure()
+        self._wire(handler, fig)
+
+        MouseEvent(
+            "button_press_event", fig.canvas, 100, 100, MouseButton.RIGHT
+        )._process()
+        assert handler._dragging_wl is True
+
+        MouseEvent(
+            "motion_notify_event",
+            fig.canvas,
+            120,
+            100,
+            buttons=frozenset({MouseButton.RIGHT}),
+        )._process()
+        window_level_mid_drag = state.window_level
+
+        # The release is lost: no button_release_event ever reaches the
+        # canvas. A later bare hover follows, with no button held.
+        MouseEvent(
+            "motion_notify_event", fig.canvas, 300, 100, buttons=frozenset()
+        )._process()
+
+        assert handler._dragging_wl is False
+        assert state.window_level == window_level_mid_drag
+
+    def test_a_genuine_release_still_ends_the_wl_drag(self) -> None:
+        """The fix must not disable the ordinary (non-lost) release path."""
+        from matplotlib.backend_bases import MouseButton, MouseEvent
+
+        state = loaded_state()
+        handler, _viewer = handler_for(state)
+        fig = Figure()
+        self._wire(handler, fig)
+
+        MouseEvent(
+            "button_press_event", fig.canvas, 100, 100, MouseButton.RIGHT
+        )._process()
+        MouseEvent(
+            "button_release_event", fig.canvas, 100, 100, MouseButton.RIGHT
+        )._process()
+
+        assert handler._dragging_wl is False

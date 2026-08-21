@@ -300,20 +300,20 @@ class ViewerEventHandler:
     def on_motion(self, event) -> None:
         """Route mouse-motion events while a drag is in progress.
 
-        Every motion event fired while a mouse button is held carries that
-        button number in ``event.button``; it is ``None`` once no button is
-        down. If a drag flag here is still set but the incoming motion has
-        no button, the ``button_release_event`` that should have ended that
-        drag was lost somewhere upstream — released outside the canvas, a
-        window focus change, or the toolbar grabbing the mouse — and never
-        reached :meth:`on_release`. Recovering here is what actually closes
-        that hole: cancelling only in :meth:`_on_brush_tool_active_changed`
-        / ``BrushEventHandler.deactivate`` only handles a lost release that
-        happens to coincide with the brush tool being toggled off; every
-        other cause of a lost release left the drag flag set, so the very
-        next ordinary hover (no button held at all) would resume it.
+        If a drag flag here is still set but :meth:`_no_button_held` reports
+        no button currently down, the ``button_release_event`` that should
+        have ended that drag was lost somewhere upstream — released outside
+        the canvas, a window focus change, or the toolbar grabbing the mouse
+        — and never reached :meth:`on_release`. Recovering here is what
+        actually closes that hole: cancelling only in
+        :meth:`_on_brush_tool_active_changed` / ``BrushEventHandler.deactivate``
+        only handles a lost release that happens to coincide with the brush
+        tool being toggled off; every other cause of a lost release left the
+        drag flag set, so the very next ordinary hover would otherwise resume
+        it. See :meth:`_no_button_held` for why this cannot simply check
+        ``event.button is None``.
         """
-        if event.button is None and self._any_drag_in_progress():
+        if self._no_button_held(event) and self._any_drag_in_progress():
             self._recover_lost_drag(event)
             return
 
@@ -335,6 +335,38 @@ class ViewerEventHandler:
         # Priority 4: bounding box.
         if self.bbox_handler.is_dragging:
             self.bbox_handler.handle_motion(event)
+
+    @staticmethod
+    def _no_button_held(event) -> bool:
+        """Return whether *event* carries no currently-held mouse button.
+
+        Prefers ``event.buttons`` (plural, added in Matplotlib 3.10): the
+        backend builds this directly from the event's own button-state mask,
+        so it reflects the physical state at the moment of *this* event.
+
+        The singular ``event.button`` cannot be used for this check.
+        ``backend_bases._mouse_handler`` (the default callback every backend
+        registers) dead-reckons a motion event's ``button`` from the last
+        ``button_press_event`` / ``button_release_event`` that reached the
+        canvas::
+
+            elif event.name == "motion_notify_event" and event.button is None:
+                event.button = event.canvas._button
+
+        ``canvas._button`` is only cleared by a ``button_release_event``.
+        When that release is exactly what got lost — the scenario this
+        recovery exists to handle — ``event.button`` stays stuck on the
+        button that was pressed, so a check against ``event.button is None``
+        never fires for the one case it is supposed to catch.
+
+        Falls back to ``event.button is None`` on Matplotlib < 3.10, where
+        ``buttons`` does not exist; that version cannot detect a lost
+        release this way, but at least preserves prior behaviour.
+        """
+        buttons = getattr(event, "buttons", None)
+        if buttons is not None:
+            return not buttons
+        return event.button is None
 
     def _any_drag_in_progress(self) -> bool:
         """``True`` if any sub-handler (or the W/L drag) is mid-drag."""

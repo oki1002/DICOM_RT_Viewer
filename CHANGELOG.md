@@ -4,6 +4,35 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.0.4] — 2026
+
+A patch release with one behavioural fix and one dependency bump. Found in a
+follow-up review of the 2.0.3 codebase.
+
+### Fixed
+
+- **A lost window/level-, crosshair-, bbox-, or brush-drag release could
+  still be resumed by the very next ordinary hover.** 2.0.2 added a recovery
+  in `ViewerEventHandler.on_motion` / `on_press` for exactly this case, but
+  it checked `event.button is None`, and Matplotlib's own default event
+  callback (`backend_bases._mouse_handler`) dead-reckons a motion event's
+  singular `button` from the last `button_press_event` /
+  `button_release_event` that reached the canvas — clearing it only on a
+  `button_release_event`. When that release is the one that got lost, the
+  dead-reckoned `button` stays stuck on the pressed button, so the check
+  never fired for the one case it existed to catch (confirmed against a live
+  `ViewerEventHandler` on an Agg canvas: a lost right-drag release let a
+  bare hover keep adjusting the window/level). The check now prefers
+  `MouseEvent.buttons` (plural, added in Matplotlib 3.10), which the backend
+  builds directly from the event's own button-state mask rather than from
+  press/release history, and falls back to the old `button is None` check
+  on older Matplotlib where `buttons` does not exist.
+
+### Changed
+
+- Raised the minimum supported Matplotlib version from 3.7 to 3.10, since
+  the fix above depends on `MouseEvent.buttons`.
+
 ## [2.0.3] — 2026
 
 A patch release: one small, backward-compatible API addition
