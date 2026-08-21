@@ -197,6 +197,22 @@ class BlitCompositor:
         for axis in axes:
             self.redraw_axis(axis)
 
+        # Record the limits/bbox this render actually used. cache_backgrounds
+        # is also called directly (not only via on_draw) — from __init__, a
+        # primary image load, and a layout rebuild. FigureCanvasAgg.draw
+        # above does re-enter on_draw synchronously, but on_draw's own
+        # bookkeeping is skipped there by the _rebuilding guard, so without
+        # recording it here _last_axis_limits would stay however it was
+        # before this call. The very next externally triggered draw_event
+        # would then see every axis as "changed" and trigger a second,
+        # redundant full-figure rebuild immediately after this one.
+        for axis, ax in axes.items():
+            self._last_axis_limits[axis] = (
+                ax.get_xlim(),
+                ax.get_ylim(),
+                ax.bbox.bounds,
+            )
+
     def schedule_rebuild(self, axis: str | None = None) -> None:
         """Defer a background rebuild until interaction stops.
 

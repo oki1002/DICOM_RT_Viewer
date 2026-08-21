@@ -110,6 +110,22 @@ class MaskSliceCache:
     Call :meth:`invalidate_roi` when a mask is updated.
     Call :meth:`clear` when the entire structure set is replaced.
 
+    Thread safety:
+        Locked for the same reason as :class:`ContourPathCache`: the
+        background contour-build pool reads a registered volume
+        (:meth:`get_volume`, via
+        :meth:`ViewerCacheManager.build_contour_paths_for_roi`) while the UI
+        thread can concurrently register a new one
+        (:meth:`ViewerCacheManager.register_mask_volume`, called from
+        :meth:`~tk_rt_viewer.state.roi_manager.RoiManager.update` on every
+        brush-stroke commit) or invalidate/clear the cache outright. Every
+        access here touches two dicts (``_volumes`` and ``_backers``)
+        rather than one; without a lock, a reader could observe one updated
+        and the other still stale (e.g. a new volume registered but its
+        backer not yet set), where the whole-cache invariant this class
+        keeps — every volume has a matching backer reference, or none at
+        all — briefly does not hold from another thread's point of view.
+
     Example::
 
         cache = MaskSliceCache()
@@ -136,6 +152,7 @@ class MaskSliceCache:
         # image as immutable and go through invalidate_roi/set_volume with
         # a fresh image instead of mutating the one already cached.
         self._backers: dict[int, object] = {}
+        self._lock = threading.Lock()
 
     def set_volume(
         self, roi_number: int, arr: np.ndarray, backer: object | None = None
@@ -150,15 +167,17 @@ class MaskSliceCache:
                 A strong reference is kept so the view stays valid; pass
                 ``None`` for arrays that own their own data.
         """
-        self._volumes[roi_number] = arr
-        if backer is not None:
-            self._backers[roi_number] = backer
-        else:
-            self._backers.pop(roi_number, None)
+        with self._lock:
+            self._volumes[roi_number] = arr
+            if backer is not None:
+                self._backers[roi_number] = backer
+            else:
+                self._backers.pop(roi_number, None)
 
     def get_volume(self, roi_number: int) -> np.ndarray | None:
         """Return the cached volume for *roi_number*, or ``None`` if absent."""
-        return self._volumes.get(roi_number)
+        with self._lock:
+            return self._volumes.get(roi_number)
 
     def get_slice(self, roi_number: int, axis: str, index: int) -> np.ndarray | None:
         """Return the 2-D slice at *index* along *axis*, or ``None`` if not cached.
@@ -172,7 +191,8 @@ class MaskSliceCache:
             2-D NumPy array, or None when the entry is absent or *index* is
             out of range.
         """
-        arr = self._volumes.get(roi_number)
+        with self._lock:
+            arr = self._volumes.get(roi_number)
         if arr is None:
             return None
         # NumPy allows negative indices (wrap-around), so an explicit range
@@ -185,16 +205,19 @@ class MaskSliceCache:
 
     def invalidate_roi(self, roi_number: int) -> None:
         """Remove the cached entry for *roi_number*."""
-        self._volumes.pop(roi_number, None)
-        self._backers.pop(roi_number, None)
+        with self._lock:
+            self._volumes.pop(roi_number, None)
+            self._backers.pop(roi_number, None)
 
     def clear(self) -> None:
         """Remove all cached entries."""
-        self._volumes.clear()
-        self._backers.clear()
+        with self._lock:
+            self._volumes.clear()
+            self._backers.clear()
 
     def __contains__(self, roi_number: int) -> bool:
-        return roi_number in self._volumes
+        with self._lock:
+            return roi_number in self._volumes
 
 
 # ---------------------------------------------------------------------------

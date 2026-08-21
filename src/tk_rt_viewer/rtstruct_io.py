@@ -8,9 +8,10 @@ load_rt_struct(ct_dir, rtstruct_path, progress_callback=None, max_workers=1)
     and display metadata. Raises RtStructLoadError if the file itself
     cannot be parsed.
 
-mask2rtstruct(ct_dir, rtss_path, structures) -> None
+mask2rtstruct(ct_dir, rtss_path, structures) -> pathlib.Path
     Convert NumPy mask arrays to an RT-STRUCT DICOM file, creating or
-    updating as appropriate.
+    updating as appropriate. Returns the path actually written to (rt-utils
+    appends ".dcm" to a path that lacks it).
 
 save_structure_set(structure_set, ct_dir, rtss_path, lps_image,
                    original_image=None) -> int
@@ -70,6 +71,37 @@ _DEFAULT_ROI_LOAD_MAX_WORKERS: int = 1
 # RNG per ROI (as the previous implementation did) has noticeable overhead
 # for structures with many ROIs.
 _COLOR_RNG: np.random.Generator = np.random.default_rng()
+
+#: rt-utils' ``RTStruct.save()`` silently appends this suffix to any path
+#: that does not already end with it. Every call site here that checks
+#: whether a path exists, logs it, or reports it back to a caller has to
+#: agree with rt-utils on the path it will actually end up writing —
+#: otherwise ``exists()`` checks the wrong file, a log line names a file
+#: that was never created, and a caller reading the path back afterwards
+#: gets ``FileNotFoundError``. See :func:`_resolved_rtss_path`.
+_RTSTRUCT_SUFFIX = ".dcm"
+
+
+def _resolved_rtss_path(rtss_path: pathlib.Path) -> pathlib.Path:
+    """Return the path rt-utils will actually write *rtss_path* to.
+
+    ``rt_utils.RTStruct.save`` appends ``".dcm"`` to any path that does not
+    already end with it, with no way to opt out. Every caller here that
+    needs to know whether the destination file exists, or wants to log or
+    report the path it wrote, must resolve against this first — comparing
+    against the path as given would silently diverge from reality for any
+    caller that passed one without the suffix.
+
+    Args:
+        rtss_path: The path as supplied by the caller.
+
+    Returns:
+        *rtss_path* unchanged if it already ends with ``.dcm``
+        (case-insensitively), otherwise *rtss_path* with ``.dcm`` appended.
+    """
+    if rtss_path.suffix.lower() == _RTSTRUCT_SUFFIX:
+        return rtss_path
+    return rtss_path.with_name(rtss_path.name + _RTSTRUCT_SUFFIX)
 
 
 class RoiInfo(TypedDict):
@@ -161,8 +193,8 @@ def save_structure_set(
     if not structures:
         raise ValueError("Structure set contains no ROI with a mask to save.")
 
-    mask2rtstruct(ct_dir, rtss_path, structures)
-    logger.info(f"Structure set saved to '{rtss_path}' ({len(structures)} ROIs).")
+    written_path = mask2rtstruct(ct_dir, rtss_path, structures)
+    logger.info(f"Structure set saved to '{written_path}' ({len(structures)} ROIs).")
     return len(structures)
 
 
@@ -379,7 +411,7 @@ def mask2rtstruct(
     structures: dict[int, dict[str, Any]],
     *,
     replace_existing: bool = True,
-) -> None:
+) -> pathlib.Path:
     """Write mask arrays to an RT-STRUCT DICOM file.
 
     Mask arrays must have shape ``(D, H, W)`` and are transposed to
@@ -391,7 +423,10 @@ def mask2rtstruct(
 
     Args:
         ct_dir: Directory of the reference CT series.
-        rtss_path: Destination path for the RT-STRUCT file.
+        rtss_path: Destination path for the RT-STRUCT file. Resolved
+            through :func:`_resolved_rtss_path` before use, so a path
+            without a ``.dcm`` suffix is handled the same way rt-utils
+            itself handles it internally, rather than diverging from it.
         structures: ``{roi_number: {"name": str, "mask": np.ndarray,
             "color": list | str}}`` mapping.
         replace_existing: When ``True`` (the default) and *rtss_path*
@@ -406,6 +441,10 @@ def mask2rtstruct(
             ``False`` to opt into that append-only behaviour when adding
             ROIs to a file this function did not itself just write.
 
+    Returns:
+        The path the RT-STRUCT was actually written to (*rtss_path* with
+        a ``.dcm`` suffix appended, if it did not already have one).
+
     Raises:
         ValueError: If *rtss_path* is ``None``.
         RuntimeError: If any ROI cannot be added to the RT-STRUCT builder.
@@ -414,7 +453,10 @@ def mask2rtstruct(
         raise ValueError("rtss_path must not be None; provide a concrete output path.")
 
     ct_dir = pathlib.Path(ct_dir)
-    rtss_path = pathlib.Path(rtss_path)
+    # Resolved once, up front, so every exists()/log/return below agrees
+    # with the path rt-utils' own save() will end up writing to (see
+    # _resolved_rtss_path).
+    rtss_path = _resolved_rtss_path(pathlib.Path(rtss_path))
 
     logger.info("Converting masks to RTSTRUCT.")
 
@@ -445,3 +487,4 @@ def mask2rtstruct(
 
     rtstruct.save(str(rtss_path))
     logger.info(f"RTSTRUCT saved to '{rtss_path}'.")
+    return rtss_path

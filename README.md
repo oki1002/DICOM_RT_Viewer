@@ -266,6 +266,16 @@ written = save_structure_set(
 )
 ```
 
+`rt_utils.RTStruct.save` silently appends `.dcm` to a path that does not
+already end with it, with no way to opt out; `mask2rtstruct` resolves
+against that internally so its `exists()` check, its log messages, and its
+return value (the path actually written) all agree with rt-utils rather
+than with the path as given — pass a bare name without `.dcm` and this is
+where it gets added. Separately, rt-utils' `save()` also writes a
+`print("Writing file to", ...)` directly to stdout on every call; this
+package cannot suppress it, so a host application capturing subprocess
+output should expect that line.
+
 ## ROI operations
 
 `tk_rt_viewer.roi_operations` provides pure-function utilities that take and

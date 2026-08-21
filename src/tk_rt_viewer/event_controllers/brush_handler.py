@@ -109,12 +109,13 @@ class BrushEventHandler:
     def _abandon_stroke(self) -> None:
         """Clear the in-progress-drag flags and discard any painted stroke.
 
-        Shared by :meth:`deactivate` and the lost-release recovery in
-        ``ViewerEventHandler.on_motion``. Both need the exact same three
-        things cleared (``_is_dragging``, ``_active_axis``, then everything
-        ``_reset_stroke`` covers) — keeping that list in one place means a
-        state added to one abandonment path later cannot be missed in the
-        other, the way it would be if each call site set the flags directly.
+        Called from :meth:`deactivate` only. This *discards* the
+        in-progress stroke, which is why it is not shared with the
+        lost-release recovery in ``ViewerEventHandler._recover_lost_drag``:
+        that path calls :meth:`handle_release` instead, which *commits* the
+        stroke — losing paint the user watched land on screen would be
+        worse than the (harmless) commit of an in-progress edit. The two
+        paths differ in outcome on purpose; do not merge them.
         """
         if not self._is_dragging:
             return

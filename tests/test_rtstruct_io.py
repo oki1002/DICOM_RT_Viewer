@@ -7,6 +7,8 @@ resampling, array conversion and colour passthrough — so the structures dict
 handed to ``mask2rtstruct`` is captured and inspected instead.
 """
 
+import pathlib
+
 import numpy as np
 import pydicom
 import pytest
@@ -20,13 +22,17 @@ from tk_rt_viewer.state.viewer_state import StructureSet
 
 @pytest.fixture()
 def captured_structures(monkeypatch) -> dict:
-    """Capture the structures dict passed to mask2rtstruct."""
+    """Capture the structures dict (and replace_existing) passed to mask2rtstruct."""
     captured: dict = {}
 
-    def fake_mask2rtstruct(ct_dir, rtss_path, structures) -> None:
+    def fake_mask2rtstruct(
+        ct_dir, rtss_path, structures, *, replace_existing=True
+    ) -> pathlib.Path:
         captured["ct_dir"] = ct_dir
         captured["rtss_path"] = rtss_path
         captured["structures"] = structures
+        captured["replace_existing"] = replace_existing
+        return pathlib.Path(rtss_path)
 
     monkeypatch.setattr(rtstruct_io, "mask2rtstruct", fake_mask2rtstruct)
     return captured
@@ -116,6 +122,25 @@ class TestSaveStructureSet:
                 StructureSet(), "/ct", "/out/rs.dcm", lps_image=_image()
             )
         assert "structures" not in captured_structures
+
+    def test_uses_the_rebuild_from_scratch_default(self, captured_structures) -> None:
+        """save_structure_set must not silently opt into append-only saves.
+
+        mask2rtstruct defaults to replace_existing=True (rebuild from
+        scratch) precisely so a second save to the same path cannot
+        duplicate every ROI; save_structure_set must reach that same
+        default, not some other value, since it is the entry point most
+        callers actually use for "save the structure set I'm editing".
+        """
+        lps = _image()
+        structure_set = StructureSet()
+        structure_set.add("PTV", _mask(lps), "#ff0000")
+
+        rtstruct_io.save_structure_set(
+            structure_set, "/ct", "/out/rs.dcm", lps_image=lps
+        )
+
+        assert captured_structures["replace_existing"] is True
 
 
 class TestSaveStructureSetResampling:
@@ -258,6 +283,65 @@ class TestMask2RtStructReplaceExisting:
 
         saved = pydicom.dcmread(str(rtss_path))
         assert [r.ROIName for r in saved.StructureSetROISequence] == ["PTV", "PTV"]
+
+
+class TestMask2RtStructImplicitDcmSuffix:
+    """Pins the 2.0.5 fix: a path without a ``.dcm`` suffix must not diverge
+    from the file rt-utils actually writes.
+
+    ``rt_utils.RTStruct.save`` silently appends ``.dcm`` to a path lacking
+    it. Before this fix, ``mask2rtstruct``'s own ``exists()`` check, its
+    log messages, and (via ``save_structure_set``) its caller-visible
+    result all used the path as given, so a caller saving to a bare name
+    could never see its own file exist, and the ``replace_existing=False``
+    append contract could never be reached for such a path.
+    """
+
+    @staticmethod
+    def _structures() -> dict:
+        mask = np.zeros((4, 8, 8), dtype=bool)
+        mask[1:3, 2:6, 2:6] = True
+        return {1: {"name": "PTV", "mask": mask, "color": "#ff0000"}}
+
+    def test_a_bare_name_ends_up_with_a_dcm_suffix_on_disk(self, tmp_path) -> None:
+        ct_dir = tmp_path / "ct"
+        ct_dir.mkdir()
+        _write_minimal_ct_series(ct_dir)
+
+        written = rtstruct_io.mask2rtstruct(
+            ct_dir, tmp_path / "RS_edited", self._structures()
+        )
+
+        assert written == tmp_path / "RS_edited.dcm"
+        assert written.exists()
+        assert [p.name for p in tmp_path.iterdir() if p.is_file()] == ["RS_edited.dcm"]
+
+    def test_replace_existing_false_is_reachable_for_a_bare_name(
+        self, tmp_path
+    ) -> None:
+        """The append contract must apply to the file that actually exists."""
+        ct_dir = tmp_path / "ct"
+        ct_dir.mkdir()
+        _write_minimal_ct_series(ct_dir)
+        out = tmp_path / "RS_edited"
+
+        rtstruct_io.mask2rtstruct(ct_dir, out, self._structures())
+        rtstruct_io.mask2rtstruct(
+            ct_dir, out, self._structures(), replace_existing=False
+        )
+
+        saved = pydicom.dcmread(str(tmp_path / "RS_edited.dcm"))
+        assert [r.ROIName for r in saved.StructureSetROISequence] == ["PTV", "PTV"]
+
+    def test_a_path_that_already_ends_in_dcm_is_unaffected(self, tmp_path) -> None:
+        ct_dir = tmp_path / "ct"
+        ct_dir.mkdir()
+        _write_minimal_ct_series(ct_dir)
+        out = tmp_path / "rs.dcm"
+
+        written = rtstruct_io.mask2rtstruct(ct_dir, out, self._structures())
+
+        assert written == out
 
 
 class TestLoadRtStructDuplicateNames:

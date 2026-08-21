@@ -4,6 +4,73 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.0.5] — 2026
+
+A patch release with no public API changes beyond `mask2rtstruct` now
+returning the path it actually wrote to (previously `None`). All fixes were
+found in the same follow-up review as 2.0.4.
+
+### Fixed
+
+- **Saving an RT-STRUCT to a path without a `.dcm` suffix silently diverged
+  from the file rt-utils actually wrote.** `rt_utils.RTStruct.save` appends
+  `.dcm` to a path that lacks it, with no way to opt out; `mask2rtstruct`'s
+  own `exists()` check, its log messages, and (via `save_structure_set`) the
+  path it reported back to the caller all used the path exactly as given.
+  For a bare-name path this meant the existence check could never see the
+  file the previous call had just written, so the `replace_existing=False`
+  append contract added in 2.0.3 was unreachable for such a path, and a
+  caller reading the file back afterwards at the path it passed in got
+  `FileNotFoundError`. `mask2rtstruct` now resolves the path once, up
+  front, and both the `exists()` check and every log message use that
+  resolved path; it also now returns that path so callers (and
+  `save_structure_set`'s own log line) can see where the file actually
+  landed.
+- **`BlitCompositor` scheduled a redundant full-figure rebuild after every
+  layout switch.** `_rebuild_layout` discarded the cached backgrounds via
+  `_compositor.reset()` but never cancelled a background rebuild that had
+  been scheduled (via `schedule_rebuild`) just before the switch — e.g. by
+  a scroll or window/level drag that had just ended. That deferred rebuild
+  still fired afterwards, harmlessly (its `axes_filter` named axes from the
+  layout that had just been replaced, so `cache_backgrounds` matched
+  nothing), but as a wasted full-figure render on every layout change.
+  `_rebuild_layout` now cancels any pending rebuild before tearing down the
+  old layout.
+- **A background rebuild triggered directly (not through `on_draw`) left
+  `BlitCompositor`'s change-detection state stale, forcing an extra
+  redundant rebuild on the very next redraw.** `cache_backgrounds` is also
+  called directly from `__init__`, a primary-image load, and a layout
+  rebuild — not only from `on_draw`. Because `FigureCanvasAgg.draw` inside
+  it does re-enter `on_draw` synchronously, but that reentrant call skips
+  its own bookkeeping under the `_rebuilding` guard, `_last_axis_limits`
+  stayed at whatever it was before the direct call. The next *externally*
+  triggered `draw_event` then saw every axis as "changed" and re-rendered
+  the whole figure again immediately. `cache_backgrounds` now records the
+  post-render limits/bbox itself.
+
+### Changed
+
+- `mask2rtstruct` now returns the `pathlib.Path` it actually wrote to,
+  instead of `None`.
+- `MaskSliceCache` (the per-ROI mask-volume cache) is now internally locked,
+  matching `ContourPathCache`. The background contour-build pool reads a
+  registered volume while the UI thread can concurrently register a new one
+  (on every brush-stroke commit) or clear the cache outright; each access
+  touches two dicts (the volume and its GC-keepalive backer) rather than
+  one, so a lock-free reader could previously observe one updated and the
+  other still stale.
+
+### Fixed (tests)
+
+- `tests/test_rtstruct_io.py`'s `captured_structures` fixture stub for
+  `mask2rtstruct` did not accept a `replace_existing` keyword, so
+  `save_structure_set`'s own default for that argument was never actually
+  exercised by the tests using it. The stub now matches `mask2rtstruct`'s
+  real signature and captures the value; a new test pins that
+  `save_structure_set` reaches the rebuild-from-scratch default. New tests
+  also cover the implicit-`.dcm`-suffix fix above against real files on
+  disk.
+
 ## [2.0.4] — 2026
 
 A patch release with one behavioural fix and one dependency bump. Found in a

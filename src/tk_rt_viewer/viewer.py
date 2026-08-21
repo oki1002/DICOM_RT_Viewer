@@ -769,6 +769,15 @@ class DicomViewer(ttk.Frame):
         if self._layout_mode == mode:
             return
 
+        # A rebuild scheduled just before this call (e.g. a scroll or W/L
+        # drag that just ended) would otherwise fire after _reset_artists
+        # below with an axes_filter naming the *old* layout's axis names.
+        # cache_backgrounds tolerates that silently (the names simply match
+        # nothing in the new self.axs), so nothing breaks, but it is a
+        # redundant full-figure render on every layout switch that a
+        # cancel here avoids.
+        self._compositor.cancel_pending()
+
         self.fig.clear()
         self._layout_mode = mode
         self.axs, self._dvh_ax = self.layout.build(mode)
