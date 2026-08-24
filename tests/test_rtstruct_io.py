@@ -105,7 +105,7 @@ class TestSaveStructureSet:
         structure_set = StructureSet()
         structure_set.add("PTV", _mask(lps), "#ff0000")
         orphan = structure_set.add("Broken", _mask(lps), "#00ff00")
-        structure_set._data[orphan].mask = None  # type: ignore[assignment]
+        structure_set.update(orphan, {"mask": None})  # type: ignore[dict-item]
 
         written = rtstruct_io.save_structure_set(
             structure_set, "/ct", "/out/rs.dcm", lps_image=lps

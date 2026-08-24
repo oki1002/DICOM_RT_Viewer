@@ -134,9 +134,21 @@ class DvhPanel:
             if mask_arr is None:
                 mask_sitk = self._state.structure_set.get_mask(roi_number)
                 if mask_sitk is None:
+                    # A structure the user asked to see in the DVH is
+                    # missing from it entirely; logging why is the only way
+                    # to distinguish that from "the ROI simply has no dose
+                    # coverage" (the voxels.size == 0 case below).
+                    logger.warning(
+                        f"ROI {roi_number} ('{name}') skipped in DVH: no mask."
+                    )
                     continue
                 mask_arr = sitk.GetArrayViewFromImage(mask_sitk)
             if mask_arr.shape != dose_arr.shape:
+                logger.warning(
+                    f"ROI {roi_number} ('{name}') skipped in DVH: mask shape "
+                    f"{mask_arr.shape} does not match the dose grid "
+                    f"{dose_arr.shape}."
+                )
                 continue
             voxels = self._dose_voxels_in_roi(dose_arr, mask_arr)
             if voxels.size == 0:

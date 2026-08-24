@@ -495,6 +495,48 @@ class TestIsoDoseDownsampling:
         assert overlay.reference_dose() == pytest.approx(50.0)
 
 
+class TestDoseSliceCachedStaysOnTheCtGrid:
+    """Pins a fix: get_dose_slice_cached must never fall back to a slice on
+    the dose's own (different) grid.
+
+    ``get_dose_slice_cached`` pairs with ``get_extent`` (the CT grid);
+    ``get_dose_slice`` pairs with ``get_dose_extent`` (the dose's own grid).
+    A previous version fell back from the former to the latter whenever the
+    array cache was empty, which — had that path ever been reached with a
+    dose on a different grid than the CT — would have handed the isodose
+    overlay a differently-shaped, differently-scaled array while it kept
+    drawing against ``get_extent``, stretching the raw dose grid across the
+    CT's extent.
+    """
+
+    def test_cached_slice_shape_matches_the_ct_extent_grid(self) -> None:
+        ct = sitk.GetImageFromArray(np.zeros((8, 16, 16), dtype=np.int16))
+        ct.SetSpacing((1.0, 1.0, 1.0))
+        state = SliceViewerState()
+        state.set_primary_image_data(ct)
+
+        # Dose on a coarser grid with a different offset than the CT.
+        dose = sitk.GetImageFromArray(
+            np.random.default_rng(0).random((4, 6, 6)).astype(np.float32)
+        )
+        dose.SetSpacing((3.0, 3.0, 3.0))
+        dose.SetOrigin((4.0, 4.0, 2.0))
+        state.set_rt_dose_image(dose)
+
+        cached = state.get_dose_slice_cached("axial")
+        x0, x1, y0, y1 = state.get_extent("axial")
+
+        # The cached slice must match the CT slice shape (16, 16), the same
+        # grid get_extent describes — not the dose's own (6, 6) grid.
+        assert cached.shape == (16, 16)
+        assert (x1 - x0, y1 - y0) == (16.0, 16.0)
+
+    def test_no_dose_loaded_returns_an_empty_array(self) -> None:
+        state = _loaded_state()
+        cached = state.get_dose_slice_cached("axial")
+        assert cached.size == 0
+
+
 # ---------------------------------------------------------------------------
 # DvhPanel
 # ---------------------------------------------------------------------------
@@ -561,3 +603,67 @@ class TestDvhPanelLegendOrder:
         expected_names = {roi_c: "C", roi_a: "A", roi_b: "B"}
         expected_order = [expected_names[n] for n in sorted([roi_a, roi_b, roi_c])]
         assert legend_labels == expected_order
+
+
+class TestDvhPanelSkipLogging:
+    """Pins a fix: an ROI silently omitted from the DVH must be logged.
+
+    Without a log line, a structure the user asked to see missing from the
+    DVH's legend is indistinguishable from "this ROI simply has no dose
+    coverage" — there is no way to tell the two apart from the plot alone.
+    """
+
+    @staticmethod
+    def _state_with_dose(shape=(4, 8, 8)) -> SliceViewerState:
+        state = SliceViewerState()
+        ct = sitk.GetImageFromArray(np.zeros(shape, dtype=np.int16))
+        ct.SetSpacing((1.0, 1.0, 1.0))
+        state.set_primary_image_data(ct)
+        dose = sitk.GetImageFromArray(np.full(shape, 50.0, dtype=np.float32))
+        dose.CopyInformation(ct)
+        state.set_rt_dose_image(dose)
+        state.set_prescription_dose(60.0)
+        return state
+
+    def test_a_shape_mismatched_roi_is_logged(self, caplog) -> None:
+        state = self._state_with_dose(shape=(4, 8, 8))
+        # A mask on a different grid than the dose/CT (e.g. an RT-STRUCT
+        # imported from a different series). Added directly through
+        # StructureSet rather than state.add_contour(), which validates
+        # mask size against the primary image and would reject this mask
+        # before it ever reached DvhPanel.
+        mismatched = sitk.GetImageFromArray(np.ones((4, 4, 4), dtype=np.uint8))
+        mismatched.SetSpacing((1.0, 1.0, 1.0))
+        roi = state.structure_set.add("Other series ROI", mismatched, "#ff0000")
+        state.set_active_contours({roi})
+
+        panel = DvhPanel(state)
+        ax = Figure().add_subplot(111)
+        with caplog.at_level("WARNING"):
+            panel.update(ax)
+
+        assert len(ax.get_lines()) == 0
+        assert "skipped in DVH" in caplog.text
+        assert "Other series ROI" in caplog.text
+
+    def test_a_roi_with_no_mask_is_logged(self, caplog) -> None:
+        state = self._state_with_dose()
+        mask = sitk.GetImageFromArray(np.ones((4, 8, 8), dtype=np.uint8))
+        mask.SetSpacing((1.0, 1.0, 1.0))
+        # Added directly through StructureSet (as in the shape-mismatch test
+        # above) so the mask-volume cache is never populated for this ROI;
+        # otherwise DvhPanel would keep reading the cached array and never
+        # reach structure_set.get_mask(), regardless of what update() below
+        # sets the entry's mask to.
+        roi = state.structure_set.add("Broken", mask, "#ff0000")
+        state.structure_set.update(roi, {"mask": None})  # type: ignore[dict-item]
+        state.set_active_contours({roi})
+
+        panel = DvhPanel(state)
+        ax = Figure().add_subplot(111)
+        with caplog.at_level("WARNING"):
+            panel.update(ax)
+
+        assert len(ax.get_lines()) == 0
+        assert "skipped in DVH" in caplog.text
+        assert "Broken" in caplog.text

@@ -23,7 +23,7 @@ import SimpleITK as sitk
 logger = logging.getLogger(__name__)
 
 
-@dataclass
+@dataclass(frozen=True)
 class RoiEntry:
     """A single ROI's stored properties inside :class:`StructureSet`.
 
@@ -31,6 +31,16 @@ class RoiEntry:
     names and types (``name: str``, ``mask: sitk.Image``, ``color: str``)
     are checked statically instead of relying on string keys that a typo
     could silently miss.
+
+    Frozen so that a caller holding a reference obtained through
+    :meth:`StructureSet.get_all` cannot mutate a field in place. An
+    in-place mutation would change the mask :class:`StructureSet` returns
+    from :meth:`~StructureSet.get_mask` without going through
+    :meth:`StructureSet.update`, which is what
+    :class:`~tk_rt_viewer.state.viewer_state.SliceViewerState` relies on to
+    invalidate ``MaskSliceCache`` / ``ContourPathCache`` and to fire the
+    matching notification — silently leaving those caches serving the
+    previous mask.
     """
 
     name: str
@@ -98,8 +108,7 @@ class StructureSet:
                 f"Unknown RoiEntry field(s) {sorted(unknown)}; "
                 f"expected one of {sorted(valid_fields)}."
             )
-        for key, value in props.items():
-            setattr(entry, key, value)
+        self._data[roi_number] = dataclasses.replace(entry, **props)
 
     def get_name(self, roi_number: int) -> str | None:
         """Return the structure name for *roi_number*, or ``None``."""
@@ -159,8 +168,13 @@ class StructureSet:
 
         The copy is of the outer dict only; ``RoiEntry`` instances (and the
         ``sitk.Image`` masks they hold) are shared with the internal
-        storage, consistent with the rest of this class's shallow-copy
-        semantics elsewhere.
+        storage. This is safe because ``RoiEntry`` is frozen: a caller can
+        read a returned entry's mask, or pop/replace an entry in its own
+        copy of the outer dict, but cannot reassign a field on the shared
+        entry to swap out a mask behind :meth:`update`'s back (which is what
+        invalidates the mask/contour caches and fires the change
+        notification). Popping an entry from the returned dict likewise
+        cannot remove it here; use :meth:`remove` for that.
         """
         return dict(self._data)
 

@@ -6,6 +6,8 @@ collision resolution, RT-STRUCT batch import validation, and the dose
 geometry lookups. All are Tkinter-free, so they are exercised directly.
 """
 
+import dataclasses
+
 import numpy as np
 import pytest
 import SimpleITK as sitk
@@ -124,6 +126,18 @@ class TestStructureSet:
         copied = structure_set.get_all()
         copied.pop(roi)
         assert roi in structure_set
+
+    def test_get_all_entries_cannot_be_mutated_in_place(self) -> None:
+        """RoiEntry must be frozen: a caller holding get_all()'s entries
+        must not be able to swap out a mask without going through update(),
+        which is what invalidates the mask/contour caches and fires the
+        change notification.
+        """
+        structure_set = StructureSet()
+        roi = structure_set.add("PTV", make_mask(), "#f00")
+        entry = structure_set.get_all()[roi]
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            entry.mask = make_mask()  # type: ignore[misc]
 
 
 class TestRoiManager:

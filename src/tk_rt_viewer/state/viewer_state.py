@@ -1002,6 +1002,12 @@ class SliceViewerState:
     def get_dose_slice(self, axis: str) -> np.ndarray:
         """Extract the dose 2-D slice closest to the current CT slice position.
 
+        The slice lies on the dose volume's **own** grid (not the primary
+        CT grid), so it pairs with :meth:`get_dose_extent` — not with
+        :meth:`get_extent`. Use :meth:`get_dose_slice_cached` instead when
+        the slice has to line up with the CT grid (ROI masks, the isodose
+        overlay, DVH computation).
+
         Returns an empty array when the CT slice lies outside the dose volume.
         The returned array is a zero-copy view into the dose image, valid only
         as long as this state keeps that image alive; callers that need to
@@ -1043,9 +1049,23 @@ class SliceViewerState:
     def get_dose_slice_cached(self, axis: str) -> np.ndarray:
         """Return the dose 2-D slice for the current index along *axis*.
 
-        Uses the manager's dose array cache when available (avoids a ``sitk``
-        round-trip on every frame). Falls back to :meth:`get_dose_slice` when
-        the cache has not been populated.
+        The returned slice lies on the **primary CT grid** (the dose
+        resampled onto it via ``DoseManager._resampled``), so it pairs with
+        :meth:`get_extent` — not with :meth:`get_dose_extent`, which
+        describes the dose volume's own grid. Use :meth:`get_dose_slice`
+        instead when a slice on the dose's own grid is wanted.
+
+        Uses the manager's dose array cache when available (avoids a
+        ``sitk`` round-trip on every frame). Deliberately does **not** fall
+        back to :meth:`get_dose_slice` when the cache is empty: that method
+        returns a slice from a different grid (a different shape and a
+        different physical extent), and every caller of this method pairs
+        the result with :meth:`get_extent`. Substituting one for the other
+        would silently stretch the dose's own grid across the CT's extent.
+        This is safe because the cache is empty only when
+        ``rt_dose_resampled`` is ``None`` (both are cleared together by
+        ``DoseManager.set_image`` / ``clear_all``), a case every caller
+        already excludes before reaching here.
 
         Returns:
             A 2-D ``float32`` NumPy array, or an empty array when the dose
@@ -1053,7 +1073,7 @@ class SliceViewerState:
         """
         cached = self._cache.get_dose_slice(axis, self._indices[axis])
         if cached is None:
-            return self.get_dose_slice(axis)
+            return np.array([], dtype=np.float32)
         return cached
 
     def get_dose_volume_cached(self) -> np.ndarray | None:

@@ -4,6 +4,53 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.0.6] — 2026
+
+A patch release with no public API changes beyond `RoiEntry` becoming
+immutable (any code constructing one positionally is unaffected; code
+mutating a field in place after construction — which was never a supported
+way to change a stored ROI — will now raise `dataclasses.FrozenInstanceError`
+instead of silently desyncing the mask caches). Found in a follow-up review
+of the 2.0.5 codebase.
+
+### Fixed
+
+- **`SliceViewerState.get_dose_slice_cached` could fall back to a slice on
+  a different grid than the one every caller pairs it with.** The cached
+  path returns the dose resampled onto the primary CT grid, which pairs
+  with `get_extent`; the fallback path (`get_dose_slice`) returns a slice
+  on the dose's own grid, which pairs with `get_dose_extent` instead. Had
+  the fallback ever actually been reached with a dose on a different grid
+  than the CT, `IsoDoseOverlay.update` — which always draws against
+  `get_extent` — would have stretched the dose's own grid across the CT's
+  extent. Unreachable in practice today (the cache is empty only when
+  `rt_dose_resampled` is `None`, which every caller already excludes), but
+  the docstring described the fallback as a plain performance shortcut
+  rather than naming the grid mismatch a future caller could hit if that
+  invariant ever changed. The fallback was removed and the accessor now
+  returns an empty array in that case, matching what `IsoDoseOverlay`
+  already treats as "no dose" upstream of this call; `get_dose_slice`'s
+  docstring now says explicitly which extent method it pairs with.
+- **A DVH ROI with no mask, or a mask on a grid that doesn't match the dose
+  volume, was silently omitted from the plot.** A structure the user asked
+  to see missing from the DVH's legend was indistinguishable from "this ROI
+  simply has no dose coverage" — there was no way to tell the two apart
+  from the plot alone. Both cases now log a warning naming the ROI and the
+  reason it was skipped.
+
+### Changed
+
+- `StructureSet`'s `RoiEntry` is now a frozen dataclass, and
+  `StructureSet.update` rebuilds the entry via `dataclasses.replace` instead
+  of mutating fields in place. `StructureSet.get_all()` hands out `RoiEntry`
+  instances shared with internal storage (unchanged from 2.0.5), which
+  previously meant a caller could reassign `get_all()[roi].mask` directly
+  and swap out a stored mask without going through `StructureSet.update` —
+  the only path that invalidates `MaskSliceCache` / `ContourPathCache` and
+  fires the change notification. `PhaseManager.all_phases` already guarded
+  against the equivalent mistake by returning a `MappingProxyType`; this
+  brings `StructureSet` in line with it.
+
 ## [2.0.5] — 2026
 
 A patch release with no public API changes beyond `mask2rtstruct` now

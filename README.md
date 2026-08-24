@@ -34,7 +34,7 @@ The distribution name on PyPI is `tk-rt-viewer`; the import package is
 - Python ≥ 3.12
 - SimpleITK ≥ 2.3
 - contourpy ≥ 1.2
-- matplotlib ≥ 3.7
+- matplotlib ≥ 3.10
 - numpy ≥ 1.24
 - pydicom ≥ 2.4
 - rt-utils ≥ 1.2
