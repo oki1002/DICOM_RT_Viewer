@@ -113,10 +113,13 @@ class BboxEventHandler:
             self._begin_drag(axis, "move", (px, py), list(bbox))
             return True
 
-        # Click outside any existing box: clear and start creating a new one.
+        # Click outside any existing box: clear the old one and begin
+        # creating a new one. The new box is intentionally *not* written to
+        # state yet — see the "create" branch of ``_apply_drag`` for why a
+        # press with no movement after it must not leave a zero-area box
+        # behind.
         self.state.set_bounding_box(axis, None)
         self._begin_drag(axis, "create", (px, py), None)
-        self.state.set_bounding_box(axis, (px, py, 0, 0))
         return True
 
     def handle_motion(self, event) -> None:
@@ -170,9 +173,21 @@ class BboxEventHandler:
         if mode == "create":
             x_start, x_end = (x0, px) if x0 <= px else (px, x0)
             y_start, y_end = (y0, py) if y0 <= py else (py, y0)
-            self.state.set_bounding_box(
-                axis, (x_start, y_start, x_end - x_start, y_end - y_start)
-            )
+            width, height = x_end - x_start, y_end - y_start
+            if width == 0 and height == 0:
+                # A press with no movement yet (handle_motion's first call
+                # during a real drag) or a round-trip exactly back to the
+                # start (handle_release's final call after a press with no
+                # drag at all) has no box to show. Skip writing it rather
+                # than storing a zero-area box: state.bounding_boxes[axis]
+                # would then be non-None while nothing is visible on
+                # screen, which every consumer keying off "is a box set"
+                # (e.g. a bbox-based inference prompt) reads as "a box
+                # exists" and would act on the degenerate box in place of
+                # what the user actually drew — or, for a plain click,
+                # drew nothing at all.
+                return
+            self.state.set_bounding_box(axis, (x_start, y_start, width, height))
         elif mode == "move":
             if self._original_pos is None:
                 return

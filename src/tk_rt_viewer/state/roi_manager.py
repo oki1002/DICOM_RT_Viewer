@@ -205,7 +205,26 @@ class RoiManager:
     # Mutation / removal
     # ------------------------------------------------------------------
     def update(self, roi_number: int, props: dict[str, Any]) -> None:
-        """Update properties (``name``, ``mask``, ``color``) for *roi_number*."""
+        """Update properties (``name``, ``mask``, ``color``) for *roi_number*.
+
+        Raises:
+            ValueError: If *props* contains a ``mask`` whose size does not
+                match the primary image's. ``add_many`` /
+                ``add_from_rt_struct`` already reject a mismatched mask
+                before it reaches the caches (see their docstrings for the
+                silent-wrong-scale failure that guards against); this is
+                the far more frequently exercised path — every brush-stroke
+                commit and every contour-editing result flows through here
+                — so leaving it unguarded reopened the same failure mode
+                through the one entry point most likely to hit it. A
+                mismatched mask that reaches ``MaskSliceCache`` /
+                ``get_slice_data`` either returns slices at the wrong
+                physical scale or, once the current slice index falls
+                outside the mismatched mask's own extent, raises an
+                uncaught ``IndexError`` from a caller with no reason to
+                expect one (``get_slice_data`` has no bounds check of its
+                own; only the cache-backed internal render path does).
+        """
         if roi_number not in self._structure_set:
             # StructureSet.update() is a no-op for an unknown roi_number, so
             # without this guard the cache work below would run for an ROI
@@ -213,6 +232,17 @@ class RoiManager:
             # mask-volume cache entry and a scheduled background build for
             # an ROI number the structure set has no record of.
             return
+        if "mask" in props:
+            primary_image = self._primary_image()
+            new_mask = props["mask"]
+            if (
+                primary_image is not None
+                and new_mask.GetSize() != primary_image.GetSize()
+            ):
+                raise ValueError(
+                    f"New mask for ROI {roi_number} has size {new_mask.GetSize()}, "
+                    f"but the primary image is {primary_image.GetSize()}."
+                )
         self._structure_set.update(roi_number, props)
         if "mask" in props:
             # On mask change, invalidate the contour paths, refresh the mask

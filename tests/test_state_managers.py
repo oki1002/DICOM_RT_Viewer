@@ -205,6 +205,31 @@ class TestRoiManager:
         assert roi not in cache.mask_slice_cache
         cache.close()
 
+    def test_update_rejects_a_mask_size_mismatch(self) -> None:
+        """Pins the 2.0.7 fix: update() must validate mask size like add().
+
+        add()/add_many() already validate a new ROI's mask against the
+        primary image (test_add_rejects_a_mask_size_mismatch, 2.0.3); update()
+        — the path every brush-stroke commit and contour-editing result
+        actually goes through — carried no equivalent guard, so a
+        mismatched mask was silently registered into the mask-volume cache
+        and only surfaced once a later slice read (e.g. the public
+        get_slice_data, which has no bounds check of its own) hit an index
+        outside the mismatched mask's own extent.
+        """
+        cache = ViewerCacheManager(on_contour_built=lambda _roi: None)
+        manager = RoiManager(cache, lambda: make_image())  # (4, 8, 8)
+        roi = manager.add("PTV", make_mask(), "#f00")
+
+        mismatched = make_mask(shape=(4, 4, 4))
+        with pytest.raises(ValueError, match="has size"):
+            manager.update(roi, {"mask": mismatched})
+
+        # The rejected update must not have taken effect: the original,
+        # correctly-sized mask is still on record.
+        assert manager.structure_set.get_mask(roi).GetSize() == (8, 8, 4)
+        cache.close()
+
     def test_update_on_an_unknown_roi_is_a_no_op(self) -> None:
         """Pins a 2.0.1 fix: update() for a removed/unknown ROI must not
         leave cache entries behind.

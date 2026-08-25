@@ -4,6 +4,48 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.0.7] — 2026
+
+A patch release with no public API changes beyond two call sites now
+rejecting input they previously accepted silently: `SliceViewerState.
+update_contour_properties` / `RoiManager.update` raise `ValueError` for a
+mask whose size does not match the primary image (code that always passed a
+correctly-sized mask, which is every host application shown in this
+project's tree, is unaffected), and a plain click with no drag on the
+bounding-box tool no longer leaves a zero-area box in
+`state.bounding_boxes`. Found in a follow-up review of the 2.0.6 codebase.
+
+### Fixed
+
+- **A mask reaching `RoiManager.update` with a size that did not match the
+  primary image was accepted without any check.** `add_many` /
+  `add_from_rt_struct` already validate a new ROI's mask against the primary
+  image before registering it — added because an unvalidated mismatch got
+  registered into the mask-volume / contour-path caches and then silently
+  returned slices at the wrong physical scale on every redraw — but `update`
+  (the path every brush-stroke commit and every contour-editing result
+  actually goes through) carried no equivalent guard, reopening the same
+  failure mode through its most frequently exercised entry point. Confirmed
+  by reproduction: updating an ROI with a mask smaller than the primary
+  image was accepted without error, and the next `get_slice_data` call at
+  the current slice index raised an uncaught `IndexError` — `get_slice_data`
+  is a public accessor with no bounds check of its own; only the
+  cache-backed internal render path (`MaskSliceCache.get_slice`) happens to
+  have one. `update` now raises `ValueError` up front, matching `add_many`.
+- **A plain click with no drag on the bounding-box tool left a zero-area box
+  in `state.bounding_boxes` instead of nothing.** `BboxEventHandler.
+  handle_press`'s "create" branch wrote a `(px, py, 0, 0)` box to state
+  immediately on press, before any drag had happened; if the release
+  followed with no intervening motion, nothing ever replaced it.
+  `get_bbox_pixel_coords` returned `(x, y, 0, 0)` rather than raising, and
+  the box was invisible on screen (a zero-size `Rectangle` draws nothing),
+  so a host application checking only `state.bounding_boxes.get(axis) is
+  not None` to decide whether a box exists — as a bbox-based inference
+  prompt naturally does — would read a box the user never actually drew.
+  The "create" branch now skips writing a box in either of the two places
+  this could reach state (the initial press, and `_apply_drag`'s "create"
+  case) whenever the resulting width and height are both zero.
+
 ## [2.0.6] — 2026
 
 A patch release with no public API changes beyond `RoiEntry` becoming

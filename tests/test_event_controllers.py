@@ -393,6 +393,22 @@ class TestBboxHandler:
         assert state.bounding_boxes["coronal"] is None
         assert state.bounding_boxes["axial"] is not None
 
+    def test_a_click_with_no_drag_leaves_no_box(self) -> None:
+        """Pins the 2.0.7 fix: a press/release with no motion between them
+        must not leave a zero-area box in state.
+
+        Before the fix, handle_press wrote a (px, py, 0, 0) box to state
+        immediately on press; with no intervening motion, nothing ever
+        replaced it, so state.bounding_boxes[axis] stayed non-None (and
+        get_bbox_pixel_coords kept returning (x, y, 0, 0) rather than
+        raising) despite nothing being visible on screen — indistinguishable
+        to a host application from a real, deliberately drawn box.
+        """
+        handler, state = self._setup()
+        handler.bbox_handler.handle_press(Event(xdata=2.0, ydata=2.0))
+        handler.bbox_handler.handle_release(Event(button=1, xdata=2.0, ydata=2.0))
+        assert state.bounding_boxes["axial"] is None
+
     def test_the_drag_flag_clears_on_release(self) -> None:
         handler, _state = self._setup()
         handler.bbox_handler.handle_press(Event(xdata=2.0, ydata=2.0))
