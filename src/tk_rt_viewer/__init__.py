@@ -12,8 +12,16 @@ DicomViewer
 SliceViewerState
     Observable state container. Holds all mutable state: images, indices,
     the primary and secondary display windows, ROI masks, brush settings,
-    bounding boxes, crosshair positions, and 4DCT phase data. Change events
-    are declared as constants in :mod:`tk_rt_viewer.events`.
+    bounding boxes (per-view and volumetric), crosshair positions, and 4DCT
+    phase data. Change events are declared as constants in
+    :mod:`tk_rt_viewer.events`.
+
+Box3D
+    An axis-aligned box in physical coordinates, shared by all three views —
+    the volumetric counterpart to the per-view bounding box. Drawn and
+    dragged on any view when ``SliceViewerState.bbox_3d_visible`` is set, and
+    read back as physical bounds or voxel indices for a crop, a registration
+    region, or a 3-D prompt.
 
 StructureSet / RoiEntry
     ROI mask container keyed by integer ROI number, and the typed entry it
@@ -29,8 +37,9 @@ IsoDoseLevel / DEFAULT_ISODOSE_LEVELS / to_gy_pairs
 Submodule API (import from the submodule)
 -----------------------------------------
 ``tk_rt_viewer.io``
-    validate_dicom_files, find_reg_matrices,
-    load_all_series, load_dcm_series, normalize_phase_label
+    validate_dicom_files, find_reg_matrices, scan_dicom_series,
+    select_phase_series, load_all_series, load_dcm_series,
+    normalize_phase_label
 
 ``tk_rt_viewer.rtstruct_io``
     load_rt_struct, mask2rtstruct, save_structure_set,
@@ -39,6 +48,22 @@ Submodule API (import from the submodule)
 ``tk_rt_viewer.roi_operations``
     interpolate_contour, apply_margin, smooth_contour,
     boolean_operation, thin_slices, MarginConfig, BooleanOp
+
+``tk_rt_viewer.state.roi_editor``
+    RoiEditor, RoiOperationError — the same operations addressed by ROI
+    number against a structure set; reachable as
+    ``SliceViewerState.roi_editor``.
+
+``tk_rt_viewer.registration``
+    RegistrationSession, RigidParams, register_rigid,
+    match_template_translation, register_deformable — rigid, template-based
+    and deformable registration of a moving image onto a fixed one. Pure
+    SimpleITK, usable from a worker thread.
+
+``tk_rt_viewer.window_level``
+    CT_WINDOW_PRESETS, compute_auto_window_level — conventional CT windows,
+    and a window derived from an image's own intensity distribution for
+    modalities that have no conventional one.
 
 ``tk_rt_viewer.protocols``
     ViewerHost — the narrow view of the viewer its event controllers use.
@@ -61,6 +86,7 @@ Quick start::
 
 from typing import TYPE_CHECKING, Any
 
+from .geometry import Box3D
 from .isodose_levels import DEFAULT_ISODOSE_LEVELS, IsoDoseLevel, to_gy_pairs
 from .state.viewer_state import RoiEntry, SliceViewerState, StructureSet
 
@@ -69,6 +95,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DEFAULT_ISODOSE_LEVELS",
+    "Box3D",
     "DicomViewer",
     "IsoDoseLevel",
     "RoiEntry",
@@ -76,7 +103,7 @@ __all__ = [
     "StructureSet",
     "to_gy_pairs",
 ]
-__version__ = "2.0.7"
+__version__ = "2.1.0"
 
 
 def __getattr__(name: str) -> Any:

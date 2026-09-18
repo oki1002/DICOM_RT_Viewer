@@ -4,6 +4,105 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.1.0] — 2026
+
+A feature release. Three capabilities host applications were each building
+on their own — a volumetric region of interest, image registration, and
+contour editing addressed by ROI number — now live here, alongside the
+DICOM-scanning and display-window helpers every host needs before it can
+show anything. Nothing in the 2.0.x API changed behaviour; the one signature
+that grew (`set_secondary_image_data`) did so by optional arguments.
+
+### Added
+
+- **A volumetric bounding box (`Box3D`), independent of the per-view one.**
+  The existing bounding box is per-view and exists on one view at a time,
+  which is the wrong shape for selecting a *volume*: a registration region, a
+  crop, a 3-D inference prompt. `SliceViewerState` now also carries
+  `bounding_box_3d` — one box in physical coordinates that all three views
+  project — with `set_bounding_box_3d`, `set_bbox_3d_visible`,
+  `set_bbox_3d_from_view`, and index-space conversion through
+  `get_bbox_3d_index_bounds` / `set_bbox_3d_from_index_bounds`. Changes
+  broadcast as `events.BOUNDING_BOX_3D_CHANGED`. `Bbox3dEventHandler` makes it
+  drawable, movable and resizable from any view: a drag sets the two
+  dimensions that view displays and leaves the third alone, so a box drawn on
+  the axial view spans the full depth until another view trims it. Clicking
+  outside it clears it, as with the per-view box. Each view
+  draws it solid while the displayed slice cuts through it and dashed while
+  it does not, which is the only cue on screen for how deep it reaches. The
+  2-D box is unchanged in behaviour and API; when both are visible, the 3-D
+  box takes the mouse (it is the more specific tool, and a host showing it is
+  asking for a volume). The rectangle arithmetic both handlers share moved
+  into `event_controllers/rect_drag.py`.
+- **`tk_rt_viewer.registration`: rigid, template-based and deformable
+  registration.** `register_rigid` optimises a `Euler3DTransform` against
+  Mattes mutual information, correlation or mean squares, over the whole
+  image or a `Box3D`, with rotations optionally frozen — and a
+  translation-only run preserves any rotation the caller started with rather
+  than discarding it. `match_template_translation` cross-correlates a
+  template cut from the fixed image, with an optional intensity floor, for
+  implanted markers that an intensity metric over a whole region will not
+  find; it reports the peak correlation so a host can flag a doubtful match
+  instead of applying it silently. `register_deformable` fits a B-spline
+  (any modality) or runs Demons (same modality) *on top of* a rigid
+  alignment, confined to the region of interest and identity outside it.
+  Corrections are carried as `RigidParams` — Vert / Lat / Long / Roll / Pitch
+  / Yaw about a caller-chosen `rotation_center` — rather than as a transform,
+  and `params_from_resample_transform` re-expresses a transform about a
+  different centre so the numbers a UI shows always describe the transform
+  actually applied. The sub-package imports no Tkinter or Matplotlib, so it
+  runs on a worker thread or in a headless process.
+- **`SliceViewerState` keeps the secondary image as `(source, transform)`.**
+  `set_secondary_image_data` now takes an optional `transform` and
+  `fill_value`, `set_secondary_transform` moves the overlay by re-resampling
+  from the source, and `secondary_source_image` exposes the image as
+  supplied. Previously only the resampled result was kept, which cost a host
+  doing registration both correctness and speed: resampling clips the overlay
+  to the primary's field of view, so a correction that should have pulled
+  anatomy *into* view smeared the fill value instead; and moving the overlay
+  meant the host resampled the source itself and then the state resampled
+  that result again through an identity transform. `set_secondary_transform`
+  also leaves `blend_alpha` alone, so an interactive registration no longer
+  resets the blend the user set on every update. `resample_secondary_with`
+  performs the resampling without touching state, for hosts that want it off
+  the UI thread; its result can be passed straight back in.
+- **`RoiEditor`, reachable as `SliceViewerState.roi_editor`.** The operations
+  in `roi_operations` take and return masks; every host that exposes them in
+  a UI was writing the same layer over the top — look the mask up by ROI
+  number, run the operation, name the result after its source, turn a failure
+  into something showable. That layer is now here, raising
+  `RoiOperationError`. Computation and commitment stay separate: the methods
+  only read, so they can run on a worker thread, and adding or replacing an
+  ROI remains the caller's call on whichever thread its UI requires.
+- **`io.scan_dicom_series`: enumerate a directory tree's series without
+  reading pixel data.** Returns `SeriesScan` (`SeriesEntry` / `PhaseEntry`
+  records, REG file paths, patient identifiers) in display order, groups CT
+  series carrying respiratory-phase labels into one 4DCT entry holding its
+  phases in phase order (string-sorting those labels puts `"100%"` between
+  `"10%"` and `"20%"`), and raises `MultiplePatientError` when a tree holds
+  more than one patient — a mix-up whose consequence, one patient's contours
+  over another's images, is noticed late. `select_phase_series` narrows a
+  `load_all_series` result to the phases of one such entry.
+- **`tk_rt_viewer.window_level`: `CT_WINDOW_PRESETS` and
+  `compute_auto_window_level`.** The conventional CT windows, and a window
+  derived from an image's own percentiles for modalities that have none — MR
+  intensities carry no standard scale, so a fixed preset shows a blank image.
+  `io`'s internal percentile sampler moved here and is shared by both.
+- **`reg_io.save_registration`: write a rigid alignment back out as DICOM.**
+  `io.find_reg_matrices` has always read the registrations other systems
+  produced; this writes one, so an alignment computed here can leave the
+  application that found it. `transform_to_matrix` converts any linear
+  SimpleITK transform by measuring where it sends the origin and the basis
+  vectors, which needs no cast per transform type and rejects a non-linear
+  transform on the evidence rather than on its class name. Deformable results
+  are refused outright: a displacement field belongs to the Deformable
+  Spatial Registration IOD, and writing one as a matrix would silently
+  discard everything that made it deformable.
+- **`SliceViewerState.roi_has_contour_on_slice`.** Answers "does this ROI
+  appear on the slice being displayed" from the mask-slice cache. Host
+  applications were reading `mask_slice_cache` directly to answer it, which
+  is a performance cache with no stability guarantee.
+
 ## [2.0.7] — 2026
 
 A patch release with no public API changes beyond two call sites now

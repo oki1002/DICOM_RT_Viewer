@@ -81,6 +81,7 @@ from .events import (
     ACTIVE_CONTOURS_CHANGED,
     ALL_CONTOURS_CHANGED,
     BLEND_ALPHA_CHANGED,
+    BOUNDING_BOX_3D_CHANGED,
     BOUNDING_BOXES_CHANGED,
     CONTOUR_CACHE_BUILT,
     CROSSHAIR_CHANGED,
@@ -95,7 +96,7 @@ from .events import (
     SECONDARY_WINDOW_LEVEL_CHANGED,
     WINDOW_LEVEL_CHANGED,
 )
-from .geometry import AXES
+from .geometry import AXES, Box3D
 from .io import load_dcm_series
 from .rendering.blit_compositor import BlitCompositor
 from .rendering.contour_overlay import ContourOverlay
@@ -246,6 +247,8 @@ class DicomViewer(ttk.Frame):
             axis: {"h": None, "v": None} for axis in AXES
         }
         self.bbox_patches: dict[str, Any] = dict.fromkeys(AXES)
+        # Projections of the volumetric bounding box, one per view.
+        self.bbox_3d_patches: dict[str, Any] = dict.fromkeys(AXES)
         # Host-application overlay artists registered via add_overlay_artist.
         self._extra_blit_artists: dict[str, list] = {axis: [] for axis in AXES}
 
@@ -299,6 +302,7 @@ class DicomViewer(ttk.Frame):
             (CROSSHAIR_CHANGED, self._on_crosshair_changed),
             (CROSSHAIR_VISIBLE_CHANGED, self._on_crosshair_visible_changed),
             (BOUNDING_BOXES_CHANGED, self._on_bounding_boxes_changed),
+            (BOUNDING_BOX_3D_CHANGED, self._on_bounding_box_3d_changed),
             (ALL_CONTOURS_CHANGED, self._on_all_contours_changed),
             (ACTIVE_CONTOURS_CHANGED, self._on_active_contours_changed),
             (OVERLAY_CONTOURS_CHANGED, self._on_overlay_contours_changed),
@@ -377,6 +381,9 @@ class DicomViewer(ttk.Frame):
         bbox_patch = self.bbox_patches.get(axis)
         if bbox_patch is not None and bbox_patch.get_visible():
             artists.append(bbox_patch)
+        bbox_3d_patch = self.bbox_3d_patches.get(axis)
+        if bbox_3d_patch is not None and bbox_3d_patch.get_visible():
+            artists.append(bbox_3d_patch)
         artists.extend(
             line
             for line in self.crosshairs[axis].values()
@@ -403,6 +410,9 @@ class DicomViewer(ttk.Frame):
         bbox_patch = self.bbox_patches.get(axis)
         if bbox_patch is not None:
             artists.append(bbox_patch)
+        bbox_3d_patch = self.bbox_3d_patches.get(axis)
+        if bbox_3d_patch is not None:
+            artists.append(bbox_3d_patch)
         collection = self.contours.collection(axis)
         if collection is not None:
             artists.append(collection)
@@ -546,6 +556,7 @@ class DicomViewer(ttk.Frame):
         self.event_handler.brush_handler.reset()
         self.crosshairs = {axis: {"h": None, "v": None} for axis in AXES}
         self.bbox_patches = dict.fromkeys(AXES)
+        self.bbox_3d_patches = dict.fromkeys(AXES)
         self._extra_blit_artists = {axis: [] for axis in AXES}
         self._compositor.reset()
         # Reset the same-slice early-exit counters so the first slice of the
@@ -560,6 +571,7 @@ class DicomViewer(ttk.Frame):
         if self._has_valid_primary_image():
             self._update_all_slice_displays()
             self._update_all_contours()
+            self._on_bounding_box_3d_changed(self.viewer_state.bounding_box_3d)
             self.viewer_state.refresh_crosshair()
             self._compositor.cache_backgrounds()
         # A full canvas.draw() rather than the partial blit path: with
@@ -618,6 +630,7 @@ class DicomViewer(ttk.Frame):
         self._last_rendered_index[axis] = new_idx
 
         self._update_slice_display(axis)
+        self._update_bbox_3d_patch(axis)
         self.contours.draw(axis, self.axs[axis])
         if self.viewer_state.rt_dose_resampled is not None:
             self.isodose.update(axis, self.axs[axis])
@@ -692,6 +705,65 @@ class DicomViewer(ttk.Frame):
             patch.set_xy((x, y))
             patch.set_width(w)
             patch.set_height(h)
+            if not patch.get_visible():
+                patch.set_visible(True)
+                self._compositor.invalidate(axis)
+        self.drawing_manager.add_request(axis)
+
+    def _on_bounding_box_3d_changed(self, box: Box3D | None) -> None:
+        """Redraw every view's projection of the volumetric bounding box."""
+        for axis in self.axs:
+            self._update_bbox_3d_patch(axis, box)
+
+    def _update_bbox_3d_patch(self, axis: str, box: Box3D | None = None) -> None:
+        """Position (or hide) *axis*' projection of the 3-D bounding box.
+
+        The projection is drawn solid while the displayed slice cuts through
+        the box and dashed while it does not. Without that cue the box looks
+        identical on every slice, and nothing on screen would say how deep it
+        reaches — the one thing a volumetric selection has to communicate and
+        a per-view box never had to.
+
+        Args:
+            axis: The view to update.
+            box:  The box to draw. Defaults to the current state value; the
+                listener passes the notified box so a clear (``None``) is not
+                re-read as the stale one.
+        """
+        ax = self.axs.get(axis)
+        if ax is None:
+            return
+        if box is None:
+            box = self.viewer_state.bounding_box_3d
+
+        patch = self.bbox_3d_patches[axis]
+        if patch is None:
+            patch = Rectangle(
+                (0, 0),
+                0,
+                0,
+                linewidth=1.0,
+                edgecolor="red",
+                facecolor="none",
+                visible=False,
+            )
+            ax.add_patch(patch)
+            self.bbox_3d_patches[axis] = patch
+            self._compositor.invalidate(axis)
+
+        if box is None or not self.viewer_state.bbox_3d_visible:
+            if patch.get_visible():
+                patch.set_visible(False)
+                self._compositor.invalidate(axis)
+            patch.set_bounds(0, 0, 0, 0)
+        else:
+            patch.set_bounds(*box.project(axis))
+            slice_coord = self.viewer_state.index_to_physical(
+                axis, self.viewer_state.indices[axis]
+            )
+            patch.set_linestyle(
+                "solid" if box.contains_coordinate(axis, slice_coord) else "dashed"
+            )
             if not patch.get_visible():
                 patch.set_visible(True)
                 self._compositor.invalidate(axis)
@@ -789,6 +861,7 @@ class DicomViewer(ttk.Frame):
                 for axis in self.axs:
                     self.isodose.update(axis, self.axs[axis])
             self._update_all_contours()
+            self._on_bounding_box_3d_changed(self.viewer_state.bounding_box_3d)
             self.viewer_state.refresh_crosshair()
             self._compositor.cache_backgrounds()
 

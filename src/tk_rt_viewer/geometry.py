@@ -7,6 +7,9 @@ matplotlib paths. Extracted so that both ``viewer_state`` and
 the axis-branching logic.
 """
 
+from dataclasses import dataclass
+from itertools import product
+
 import numpy as np
 import SimpleITK as sitk
 from matplotlib.path import Path as MplPath
@@ -38,6 +41,209 @@ LAYOUT_MODES = ("single", "mpr_wide", "mpr")
 # module shares a single source of truth.
 AXIS_TO_NUMPY_DIM: dict[str, int] = {"axial": 0, "coronal": 1, "sagittal": 2}
 AXIS_TO_XYZ_DIM: dict[str, int] = {"axial": 2, "coronal": 1, "sagittal": 0}
+
+
+@dataclass(frozen=True)
+class Box3D:
+    """An axis-aligned box in physical (LPS, mm) coordinates.
+
+    The viewer's 2-D bounding box (``SliceViewerState.bounding_boxes``) is
+    per-view and only ever exists on one view at a time, which makes it a
+    poor fit for selecting a *volume* — a registration region of interest, a
+    crop, a 3-D inference prompt. This type is the volumetric counterpart:
+    one box, shared by all three views, each of which shows its own
+    projection (see :meth:`project`).
+
+    ``lower`` / ``upper`` are the two opposite corners, per physical
+    dimension ``(x, y, z)``. They are normalised on construction, so
+    ``lower[d] <= upper[d]`` always holds and callers may pass the corners
+    in either order.
+    """
+
+    lower: tuple[float, float, float]
+    upper: tuple[float, float, float]
+
+    def __post_init__(self) -> None:
+        """Normalise the corners so ``lower`` is component-wise the smaller.
+
+        A drag that ends above / left of where it started produces a
+        "negative" box, and a caller converting from index bounds on a
+        flipped axis produces another. Sorting here means no consumer has to
+        care: ``project``, ``contains_coordinate`` and every crop built from
+        this box can assume an ordered interval.
+        """
+        if len(self.lower) != 3 or len(self.upper) != 3:
+            raise ValueError(
+                f"Box3D takes two 3-element corners, got {self.lower!r} / "
+                f"{self.upper!r}."
+            )
+        lower = tuple(
+            float(min(a, b)) for a, b in zip(self.lower, self.upper, strict=True)
+        )
+        upper = tuple(
+            float(max(a, b)) for a, b in zip(self.lower, self.upper, strict=True)
+        )
+        object.__setattr__(self, "lower", lower)
+        object.__setattr__(self, "upper", upper)
+
+    # ------------------------------------------------------------------
+    # Construction
+    # ------------------------------------------------------------------
+    @classmethod
+    def from_image_extent(cls, image: sitk.Image) -> "Box3D":
+        """Return the box covering all of *image*, out to the voxel edges.
+
+        Uses the same pixel-center convention as :func:`compute_extent`: the
+        bounds sit half a voxel outside the first and last voxel centers.
+        """
+        size = np.array(image.GetSize(), dtype=float)
+        corners = np.array(
+            [
+                image.TransformContinuousIndexToPhysicalPoint(
+                    np.where(corner, size - 0.5, -0.5).tolist()
+                )
+                for corner in product((False, True), repeat=3)
+            ]
+        )
+        return cls(
+            lower=_as_point(corners.min(axis=0)),
+            upper=_as_point(corners.max(axis=0)),
+        )
+
+    @classmethod
+    def from_index_bounds(
+        cls,
+        image: sitk.Image,
+        lower: tuple[int, int, int],
+        upper: tuple[int, int, int],
+    ) -> "Box3D":
+        """Build a box from inclusive voxel index bounds on *image*'s grid.
+
+        The box spans the *centers* of the bounding voxels, which is what
+        makes it round-trip exactly through :meth:`index_bounds` (that method
+        maps physical coordinates back to the nearest voxel center). The half
+        voxel of extent beyond each bounding center is immaterial to every
+        consumer of these bounds — a crop, a region of interest, a prompt —
+        all of which work in whole voxels.
+        """
+        low_point = image.TransformContinuousIndexToPhysicalPoint(
+            [float(v) for v in lower]
+        )
+        high_point = image.TransformContinuousIndexToPhysicalPoint(
+            [float(v) for v in upper]
+        )
+        return cls(lower=_as_point(low_point), upper=_as_point(high_point))
+
+    # ------------------------------------------------------------------
+    # Derived values
+    # ------------------------------------------------------------------
+    @property
+    def center(self) -> tuple[float, float, float]:
+        """The box centre in physical coordinates."""
+        low, high = self.lower, self.upper
+        return (
+            (low[0] + high[0]) / 2.0,
+            (low[1] + high[1]) / 2.0,
+            (low[2] + high[2]) / 2.0,
+        )
+
+    @property
+    def size(self) -> tuple[float, float, float]:
+        """The box side lengths in mm, per physical dimension."""
+        low, high = self.lower, self.upper
+        return (high[0] - low[0], high[1] - low[1], high[2] - low[2])
+
+    def with_range(self, dim: int, low: float, high: float) -> "Box3D":
+        """Return a copy with physical dimension *dim* (0=x, 1=y, 2=z) replaced."""
+        lower, upper = list(self.lower), list(self.upper)
+        lower[dim], upper[dim] = min(low, high), max(low, high)
+        return Box3D(lower=_as_point(lower), upper=_as_point(upper))
+
+    def with_view_rect(
+        self, axis: str, rect: tuple[float, float, float, float]
+    ) -> "Box3D":
+        """Return a copy with the two dimensions shown by *axis* replaced.
+
+        *rect* is ``(x, y, width, height)`` in the physical coordinates that
+        view plots — the same shape the 2-D bounding box uses. The dimension
+        perpendicular to *axis* is left untouched, which is what lets a box
+        be drawn on one view and then trimmed in depth on another.
+        """
+        x, y, width, height = rect
+        dim_x, dim_y = view_dims(axis)
+        return self.with_range(dim_x, x, x + width).with_range(dim_y, y, y + height)
+
+    def project(self, axis: str) -> tuple[float, float, float, float]:
+        """Return this box seen from *axis*, as ``(x, y, width, height)``."""
+        dim_x, dim_y = view_dims(axis)
+        return (
+            self.lower[dim_x],
+            self.lower[dim_y],
+            self.upper[dim_x] - self.lower[dim_x],
+            self.upper[dim_y] - self.lower[dim_y],
+        )
+
+    def contains_coordinate(self, axis: str, coord: float) -> bool:
+        """Return whether *coord* lies within the box along *axis*' normal.
+
+        Used to tell whether the slice currently displayed on *axis* cuts
+        through the box, which the viewer renders differently from a slice
+        outside it.
+        """
+        dim = AXIS_TO_XYZ_DIM[axis]
+        return self.lower[dim] <= coord <= self.upper[dim]
+
+    def index_bounds(
+        self, image: sitk.Image
+    ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+        """Return inclusive voxel index bounds of this box on *image*'s grid.
+
+        Each bound is the nearest voxel center to the corresponding box face,
+        clamped to the image, so a box drawn partly outside it still yields a
+        usable region. Returns ``(lower, upper)`` as ``(x, y, z)`` index
+        triples.
+        """
+        corners = np.array(
+            [
+                image.TransformPhysicalPointToContinuousIndex(
+                    tuple(
+                        float(high if use_upper else low)
+                        for use_upper, low, high in zip(
+                            corner, self.lower, self.upper, strict=True
+                        )
+                    )
+                )
+                for corner in product((False, True), repeat=3)
+            ]
+        )
+        size = np.array(image.GetSize())
+        lower = np.clip(np.rint(corners.min(axis=0)), 0, size - 1).astype(int)
+        upper = np.clip(np.rint(corners.max(axis=0)), 0, size - 1).astype(int)
+        return (
+            (int(lower[0]), int(lower[1]), int(lower[2])),
+            (int(upper[0]), int(upper[1]), int(upper[2])),
+        )
+
+
+def _as_point(values) -> tuple[float, float, float]:
+    """Return the first three elements of *values* as a 3-element float tuple.
+
+    SimpleITK's point APIs and NumPy reductions both return sequences of
+    unspecified length; building a tuple from one directly widens it to
+    ``tuple[float, ...]`` and loses the 3-D shape this module works in.
+    """
+    return (float(values[0]), float(values[1]), float(values[2]))
+
+
+def view_dims(axis: str) -> tuple[int, int]:
+    """Return the physical dimensions backing *axis*' plotted x and y axes.
+
+    ``view_dims("axial") == (0, 1)``: the axial view plots physical x
+    horizontally and physical y vertically. Derived from
+    :data:`VIEW_TO_PIXEL_AXES` so the two never disagree.
+    """
+    x_axis, y_axis = VIEW_TO_PIXEL_AXES[axis]
+    return AXIS_TO_XYZ_DIM[x_axis], AXIS_TO_XYZ_DIM[y_axis]
 
 
 def resample_binary_mask(mask: sitk.Image, reference: sitk.Image) -> sitk.Image:

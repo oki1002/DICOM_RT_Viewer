@@ -1,11 +1,21 @@
-"""Tests for io.py — pure helpers (DS parsing, phase-label normalisation)."""
+"""Tests for io.py — pure helpers, and the header-only series scan."""
+
+import pathlib
 
 import numpy as np
 import pytest
 from pydicom.dataset import FileDataset, FileMetaDataset
 from pydicom.uid import CTImageStorage, ExplicitVRLittleEndian, generate_uid
 
-from tk_rt_viewer.io import _first_float, load_dcm_series, normalize_phase_label
+from tk_rt_viewer.io import (
+    MultiplePatientError,
+    PhaseEntry,
+    _first_float,
+    load_dcm_series,
+    normalize_phase_label,
+    scan_dicom_series,
+    select_phase_series,
+)
 
 
 class TestFirstFloat:
@@ -95,3 +105,105 @@ class TestLoadDcmSeriesDuplicateDescription:
 
         with pytest.raises(ValueError, match="found 2"):
             load_dcm_series(tmp_path)
+
+
+class TestScanDicomSeries:
+    """Tests for scan_dicom_series — grouping, ordering, and patient safety."""
+
+    @staticmethod
+    def write_series(
+        folder: pathlib.Path,
+        description: str,
+        modality: str = "CT",
+        slices: int = 2,
+        patient: str = "P1",
+    ) -> None:
+        """Write a minimal header-only DICOM series into *folder*."""
+        folder.mkdir(parents=True, exist_ok=True)
+        series_uid = generate_uid()
+        for index in range(slices):
+            meta = FileMetaDataset()
+            meta.MediaStorageSOPClassUID = CTImageStorage
+            meta.MediaStorageSOPInstanceUID = generate_uid()
+            meta.TransferSyntaxUID = ExplicitVRLittleEndian
+            ds = FileDataset(str(folder / f"{index}.dcm"), {}, file_meta=meta)
+            ds.SOPClassUID = CTImageStorage
+            ds.SOPInstanceUID = meta.MediaStorageSOPInstanceUID
+            ds.StudyInstanceUID = "1.2.3"
+            ds.SeriesInstanceUID = series_uid
+            ds.SeriesDescription = description
+            ds.Modality = modality
+            ds.PatientID = patient
+            ds.PatientName = patient
+            ds.save_as(folder / f"{index}.dcm", enforce_file_format=True)
+
+    @pytest.fixture
+    def tree(self, tmp_path: pathlib.Path) -> pathlib.Path:
+        self.write_series(tmp_path / "ct", "Body CT")
+        self.write_series(tmp_path / "mr", "T2 MR", modality="MR")
+        self.write_series(tmp_path / "dose", "Plan dose", modality="RTDOSE", slices=1)
+        for percent in (0, 10, 100, 20):
+            self.write_series(
+                tmp_path / f"phase{percent}", f"4D,,Vol,/{percent}%,{percent}%"
+            )
+        return tmp_path
+
+    def test_groups_phases_and_orders_series(self, tree: pathlib.Path) -> None:
+        scan = scan_dicom_series(tree)
+
+        descriptions = [entry.description for entry in scan.series]
+        # 4DCT first, images before dose.
+        assert descriptions == ["4DCT", "Body CT", "T2 MR", "Plan dose"]
+        assert [entry.is_4dct for entry in scan.series] == [True, False, False, False]
+
+    def test_phases_are_ordered_numerically(self, tree: pathlib.Path) -> None:
+        scan = scan_dicom_series(tree)
+        # String ordering would put "100%" between "10%" and "20%".
+        assert [phase.label for phase in scan.series[0].phases] == [
+            "0%",
+            "10%",
+            "20%",
+            "100%",
+        ]
+
+    def test_grouping_can_be_turned_off(self, tree: pathlib.Path) -> None:
+        scan = scan_dicom_series(tree, group_4dct=False)
+        assert all(not entry.is_4dct for entry in scan.series)
+        assert len(scan.series) == 7
+
+    def test_modalities_can_be_narrowed(self, tree: pathlib.Path) -> None:
+        scan = scan_dicom_series(tree, modalities=frozenset({"MR"}))
+        assert [entry.modality for entry in scan.series] == ["MR"]
+
+    def test_entries_point_at_their_own_files(self, tree: pathlib.Path) -> None:
+        scan = scan_dicom_series(tree)
+        ct = next(entry for entry in scan.series if entry.description == "Body CT")
+        assert ct.series_dir == tree / "ct"
+        assert ct.file_path.parent == ct.series_dir
+
+    def test_second_patient_raises(self, tree: pathlib.Path) -> None:
+        self.write_series(tree / "other", "Other CT", patient="P2")
+        with pytest.raises(MultiplePatientError):
+            scan_dicom_series(tree)
+
+    def test_second_patient_can_be_allowed(self, tree: pathlib.Path) -> None:
+        self.write_series(tree / "other", "Other CT", patient="P2")
+        scan = scan_dicom_series(tree, require_single_patient=False)
+        assert scan.patient_ids == frozenset({"P1", "P2"})
+
+
+class TestSelectPhaseSeries:
+    def test_selects_the_requested_phases_in_order(self) -> None:
+        all_series = {"0%": {"modality": "CT"}, "50%": {"modality": "CT"}}
+        phases = (
+            PhaseEntry(label="50%", description="50%", series_dir=pathlib.Path(".")),
+            PhaseEntry(label="0%", description="0%", series_dir=pathlib.Path(".")),
+        )
+        assert list(select_phase_series(all_series, phases)) == ["50%", "0%"]
+
+    def test_missing_phase_raises(self) -> None:
+        phases = (
+            PhaseEntry(label="70%", description="70%", series_dir=pathlib.Path(".")),
+        )
+        with pytest.raises(KeyError, match="70%"):
+            select_phase_series({"0%": {}}, phases)

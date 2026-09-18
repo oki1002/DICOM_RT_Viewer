@@ -66,6 +66,7 @@ from ..events import (
     ALL_CONTOURS_CHANGED,
     ALL_EVENTS,
     BLEND_ALPHA_CHANGED,
+    BOUNDING_BOX_3D_CHANGED,
     BOUNDING_BOXES_CHANGED,
     BRUSH_FILL_INSIDE_CHANGED,
     BRUSH_SIZE_MM_CHANGED,
@@ -91,6 +92,7 @@ from ..geometry import (
     AXES,
     LAYOUT_MODES,
     VIEW_TO_PIXEL_AXES,
+    Box3D,
     compute_extent,
     slice_along_axis,
 )
@@ -98,7 +100,9 @@ from ..geometry import AXIS_TO_NUMPY_DIM as _AXIS_TO_NUMPY_DIM
 from ..geometry import AXIS_TO_XYZ_DIM as _AXIS_TO_XYZ_DIM
 from .dose_manager import DoseManager
 from .phase_manager import PhaseManager
+from .roi_editor import RoiEditor
 from .roi_manager import RoiManager
+from .secondary_manager import DEFAULT_SECONDARY_FILL_VALUE, SecondaryManager
 
 # Re-exported: StructureSet and RoiEntry live in their own module, but
 # tk_rt_viewer.state.viewer_state stays their documented import path.
@@ -154,6 +158,7 @@ class SliceViewerState:
         ``"crosshair_changed"``             — ``()``
         ``"crosshair_visible_changed"``     — ``(visible: bool)``
         ``"bounding_boxes_changed"``        — ``(axis: str, bbox: tuple | None)``
+        ``"bounding_box_3d_changed"``       — ``(box: Box3D | None)``
         ``"all_contours_changed"``          — ``(structure_set: StructureSet)``
         ``"active_contours_changed"``       — ``(active: frozenset[int])``
         ``"overlay_contours_changed"``      — ``(enable: bool)``
@@ -213,11 +218,19 @@ class SliceViewerState:
     # --- Bounding box ---
     bbox_visible: bool = False
 
+    # --- 3-D bounding box ---
+    #: Whether the volumetric bounding box is shown and accepts mouse input.
+    #: Independent of :attr:`bbox_visible`; when both are on, the 3-D box
+    #: takes the mouse (see ``ViewerEventHandler.on_press``).
+    bbox_3d_visible: bool = False
+
     # --- Collaborators (created in __post_init__) ---
     _cache: ViewerCacheManager = field(init=False, repr=False)
     _phases: PhaseManager = field(init=False, repr=False)
+    _secondary: SecondaryManager = field(init=False, repr=False)
     _dose: DoseManager = field(init=False, repr=False)
     _rois: RoiManager = field(init=False, repr=False)
+    _roi_editor: RoiEditor = field(init=False, repr=False)
 
     # --- Private per-axis storage, published as read-only views ---
     _indices: dict[str, int] = field(
@@ -229,6 +242,10 @@ class SliceViewerState:
     _bounding_boxes: dict[str, tuple[float, float, float, float] | None] = field(
         init=False, repr=False, default_factory=lambda: dict.fromkeys(AXES)
     )
+    #: The volumetric bounding box, published read-only as
+    #: :attr:`bounding_box_3d` for the same reason as the per-axis boxes:
+    #: assigning it directly would skip the notification listeners rely on.
+    _bounding_box_3d: Box3D | None = field(init=False, repr=False, default=None)
     #: Which ROIs are displayed, as a set of ROI numbers. Private and
     #: published as a read-only ``frozenset`` (see the ``active_contours``
     #: property below) for the same reason as ``_indices`` /
@@ -275,7 +292,13 @@ class SliceViewerState:
             resample_to_primary=self._resample_dose,
             publish_volume=self._cache.build_dose_array,
         )
+        self._secondary = SecondaryManager(
+            resample=lambda image, transform, fill_value: self.get_resampled_image(
+                image, transform=transform, default_pixel_value=fill_value
+            )
+        )
         self._rois = RoiManager(self._cache, lambda: self.primary_image)
+        self._roi_editor = RoiEditor(lambda: self._rois.structure_set)
         if self.window_level_target not in WINDOW_LEVEL_TARGETS:
             raise ValueError(
                 f"Unknown window_level_target: {self.window_level_target!r}. "
@@ -295,6 +318,7 @@ class SliceViewerState:
         "window_level": "set_window_level",
         "crosshair_visible": "set_crosshair_visible",
         "bbox_visible": "set_bbox_visible",
+        "bbox_3d_visible": "set_bbox_3d_visible",
         # "active_contours" intentionally absent: it is now a read-only
         # property (see below), not an assignable field. Assigning
         # state.active_contours = ... raises AttributeError from the
@@ -412,6 +436,17 @@ class SliceViewerState:
         return self._cache.mask_slice_cache
 
     @property
+    def roi_editor(self) -> RoiEditor:
+        """Contour operations (margin, boolean, smoothing, ...) by ROI number.
+
+        Bound to this state's structure set. Its methods only read, so they
+        may be called from a worker thread; adding or replacing an ROI with
+        the result goes back through :meth:`add_contour` /
+        :meth:`update_contour_properties` on the main thread.
+        """
+        return self._roi_editor
+
+    @property
     def structure_set(self) -> StructureSet:
         """The ROI container (owned by :class:`RoiManager`).
 
@@ -513,6 +548,13 @@ class SliceViewerState:
         physical coords, or ``None``. Change with :meth:`set_bounding_box`.
         """
         return MappingProxyType(self._bounding_boxes)
+
+    @property
+    def bounding_box_3d(self) -> Box3D | None:
+        """The volumetric bounding box, or ``None``. Set with
+        :meth:`set_bounding_box_3d`.
+        """
+        return self._bounding_box_3d
 
     # =========================================================
     # Axis index helpers
@@ -718,6 +760,8 @@ class SliceViewerState:
         self._active_contours = set()
         object.__setattr__(self, "selected_roi_number", None)
         self._bounding_boxes = dict.fromkeys(AXES)
+        self._bounding_box_3d = None
+        self._secondary.clear()
         self.secondary_image = None
         object.__setattr__(self, "blend_alpha", 1.0)
         object.__setattr__(self, "secondary_window_level", None)
@@ -776,13 +820,19 @@ class SliceViewerState:
     # =========================================================
     # Secondary image & blend
     # =========================================================
-    def set_secondary_image_data(self, image: sitk.Image | None) -> None:
+    def set_secondary_image_data(
+        self,
+        image: sitk.Image | None,
+        transform: sitk.Transform | None = None,
+        fill_value: float = DEFAULT_SECONDARY_FILL_VALUE,
+    ) -> None:
         """Set (or clear) the secondary overlay image.
 
-        The image is automatically resampled to the primary image grid.
-        Setting ``image=None`` hides the overlay. When a new image is
-        provided, :attr:`blend_alpha` is set to ``0.5`` so both images are
-        visible immediately.
+        The image is kept as supplied and resampled onto the primary grid for
+        display; :attr:`secondary_source_image` returns the original and
+        :attr:`secondary_image` the resampled result. Setting ``image=None``
+        hides the overlay. When a new image is provided, :attr:`blend_alpha`
+        is set to ``0.5`` so both images are visible immediately.
 
         The secondary window/level is *not* reset here: a host application
         that has configured one for a given overlay modality keeps it across
@@ -791,15 +841,75 @@ class SliceViewerState:
 
         Args:
             image: Secondary ``sitk.Image`` to overlay, or ``None`` to clear.
+            transform: Transform mapping primary-grid points into *image*,
+                applied before resampling — a registration result, or a REG
+                transform for a 4DCT phase. ``None`` means identity.
+            fill_value: Value used where the transformed image does not cover
+                the primary grid. The default is air-equivalent HU; an
+                overlay on another intensity scale (PET, an MR, a dose map in
+                Gy) usually wants ``0.0``.
         """
-        if image is None:
-            self.secondary_image = None
-        else:
-            self.secondary_image = self.get_resampled_image(image)
+        self.secondary_image = self._secondary.set_source(image, transform, fill_value)
+        if image is not None:
             self.set_blend_alpha(0.5)
         # Pre-cast once at load time to eliminate sitk round-trips during scroll.
         self._cache.build_secondary_array(self.secondary_image)
         self._notify(SECONDARY_IMAGE_DATA_CHANGED, self.secondary_image)
+
+    def set_secondary_transform(
+        self,
+        transform: sitk.Transform | None,
+        resampled: sitk.Image | None = None,
+    ) -> None:
+        """Move the secondary overlay by re-resampling its source image.
+
+        Unlike :meth:`set_secondary_image_data` this leaves
+        :attr:`blend_alpha` alone, so an interactive registration can update
+        the overlay as often as it likes without resetting the blend the user
+        set. Does nothing when no secondary image is loaded.
+
+        Resampling a whole volume is slow enough to be worth moving off the
+        UI thread: call :meth:`resample_secondary_with` on a worker thread and
+        pass its result as *resampled*, and no resampling happens here.
+
+        Args:
+            transform: Transform mapping primary-grid points into the source
+                image, or ``None`` for identity.
+            resampled: The matching output of :meth:`resample_secondary_with`,
+                when already computed. The caller is responsible for it
+                corresponding to *transform*.
+        """
+        if self._secondary.source is None:
+            return
+        self.secondary_image = self._secondary.set_transform(transform, resampled)
+        self._cache.build_secondary_array(self.secondary_image)
+        self._notify(SECONDARY_IMAGE_DATA_CHANGED, self.secondary_image)
+
+    def resample_secondary_with(self, transform: sitk.Transform | None) -> sitk.Image:
+        """Resample the secondary source through *transform* onto the primary grid.
+
+        Reads state but writes none, so it is safe to call from a worker
+        thread; apply the result with :meth:`set_secondary_transform`.
+
+        Raises:
+            ValueError: If no secondary image is loaded.
+        """
+        return self._secondary.resample_with(transform)
+
+    @property
+    def secondary_source_image(self) -> sitk.Image | None:
+        """The secondary image as supplied, before resampling to the primary grid.
+
+        This is what a registration should be run against: it still covers
+        the parts of the overlay that fall outside the primary's field of
+        view, which :attr:`secondary_image` has already discarded.
+        """
+        return self._secondary.source
+
+    @property
+    def secondary_transform(self) -> sitk.Transform | None:
+        """The transform currently applied to the secondary source, or ``None``."""
+        return self._secondary.transform
 
     def set_blend_alpha(self, alpha: float) -> None:
         """Set the primary-image opacity for the blend slider (0.0-1.0).
@@ -1293,8 +1403,108 @@ class SliceViewerState:
         )
 
     # =========================================================
+    # 3-D bounding box
+    # =========================================================
+    def set_bounding_box_3d(self, box: Box3D | None) -> None:
+        """Set or clear the volumetric bounding box and notify listeners."""
+        if self._bounding_box_3d == box:
+            return
+        self._bounding_box_3d = box
+        self._notify(BOUNDING_BOX_3D_CHANGED, box)
+
+    def set_bbox_3d_visible(self, visible: bool) -> None:
+        """Show or hide the 3-D bounding box overlay.
+
+        Hiding keeps the box itself, so a host can toggle the tool off and
+        back on without the user having to draw it again.
+        """
+        if self.bbox_3d_visible != visible:
+            object.__setattr__(self, "bbox_3d_visible", visible)
+            self._notify(BOUNDING_BOX_3D_CHANGED, self._bounding_box_3d)
+
+    def set_bbox_3d_from_view(
+        self, axis: str, rect: tuple[float, float, float, float]
+    ) -> None:
+        """Update the two dimensions *axis* displays from a rectangle drawn on it.
+
+        *rect* is ``(x, y, width, height)`` in that view's physical
+        coordinates. The dimension perpendicular to *axis* keeps its current
+        range, or spans the whole primary image when no box exists yet — so
+        drawing on one view gives a full-depth box, and drawing on a second
+        view trims it.
+
+        Does nothing when no primary image is loaded, since there would be no
+        extent to fall back on for the third dimension.
+        """
+        if self.primary_image is None:
+            return
+        base = self._bounding_box_3d or Box3D.from_image_extent(self.primary_image)
+        self.set_bounding_box_3d(base.with_view_rect(axis, rect))
+
+    def get_bbox_3d_index_bounds(
+        self,
+    ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+        """Return the 3-D box as inclusive ``(x, y, z)`` voxel index bounds.
+
+        Bounds are on the primary image's grid and clamped to it, which is
+        the form a crop or a volumetric inference prompt needs.
+
+        Raises:
+            ValueError: If no 3-D box is set, or no primary image is loaded.
+        """
+        if self._bounding_box_3d is None:
+            raise ValueError("No 3-D bounding box is set.")
+        if self.primary_image is None:
+            raise ValueError("No primary image is loaded.")
+        return self._bounding_box_3d.index_bounds(self.primary_image)
+
+    def set_bbox_3d_from_index_bounds(
+        self, lower: tuple[int, int, int], upper: tuple[int, int, int]
+    ) -> None:
+        """Set the 3-D box from inclusive ``(x, y, z)`` voxel index bounds.
+
+        Inverse of :meth:`get_bbox_3d_index_bounds`; lets a host restore a box
+        it stored in index space without knowing the primary image's geometry.
+
+        Raises:
+            ValueError: If no primary image is loaded.
+        """
+        if self.primary_image is None:
+            raise ValueError("No primary image is loaded.")
+        self.set_bounding_box_3d(
+            Box3D.from_index_bounds(self.primary_image, lower, upper)
+        )
+
+    # =========================================================
     # ROI / contour management (delegates to RoiManager + notifies)
     # =========================================================
+    def roi_has_contour_on_slice(
+        self, roi_number: int | None, axis: str = "axial", index: int | None = None
+    ) -> bool:
+        """Return whether *roi_number* has any voxel set on the given slice.
+
+        Answers "does the ROI the user selected appear on the slice they are
+        looking at" — the question behind enabling a per-slice editing tool,
+        or deciding whether to offer a bounding-box prompt. Reads the mask
+        slice cache, which every ROI change keeps current, so it costs no
+        resampling.
+
+        Args:
+            roi_number: ROI to test; ``None`` (no selection) returns ``False``.
+            axis:       View axis the slice belongs to.
+            index:      Slice index, or ``None`` for the currently displayed one.
+
+        Returns:
+            ``True`` if the ROI has a mask with at least one set voxel there.
+        """
+        if roi_number is None:
+            return False
+        slice_index = self._indices[axis] if index is None else index
+        mask_slice = self._cache.mask_slice_cache.get_slice(
+            roi_number, axis, slice_index
+        )
+        return mask_slice is not None and bool(mask_slice.any())
+
     def set_active_contours(self, active_roi_numbers: Iterable[int]) -> None:
         """Set which ROIs are displayed.
 

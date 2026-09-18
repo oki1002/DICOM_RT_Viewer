@@ -25,7 +25,8 @@ The distribution name on PyPI is `tk-rt-viewer`; the import package is
 - **Independent window / level per image** — The primary and secondary images each carry their own display window, so a PET, MR, or dose overlay can be windowed without disturbing the CT underneath. The secondary follows the primary until an override is set. Right-click drag adjusts whichever image is targeted: horizontal → window width (WW), vertical → window centre (WL).
 - **RT-STRUCT support** — ROI masks stored in `StructureSet` (keyed by integer ROI number); contour overlay with optional semi-transparent fill; brush tool for mask editing.
 - **ROI operations** — Shape-based inter-slice interpolation, true Euclidean margins (uniform or 6-direction anisotropic), Gaussian smoothing, and boolean operations (union / intersection / subtraction).
-- **Bounding box tool** — Create, move, and resize a bounding box with click-drag interactions.
+- **Bounding box tools** — A per-view 2-D box, and a volumetric 3-D box shared by all three views: draw it on one view, trim its depth on another, and read it back as physical bounds or voxel indices for a crop, a registration region, or a 3-D prompt. Both support create / move / resize by click-drag and can be used independently.
+- **Registration (fusion)** — Rigid (translation-only or six degrees of freedom), template matching for implanted markers, and deformable (B-spline or Demons) registration of a secondary image onto the primary, restricted to the 3-D bounding box. Pure SimpleITK in `tk_rt_viewer.registration`, so it runs on a worker thread; the result is applied by handing the transform to `set_secondary_transform`, which re-resamples the overlay from its source image.
 - **RT-DOSE overlay** — RT-DOSE volumes are displayed as isodose fills and contour lines; a DVH panel is available in the `"mpr"` layout mode.
 - **Custom overlay artists** — Host applications can register their own Matplotlib artists (e.g. manual point markers) via `add_overlay_artist` so they survive the blit-restore cycle like any built-in overlay, without `DicomViewer` needing to know what they represent.
 
@@ -71,7 +72,9 @@ tk_rt_viewer/
 ├── protocols.py                # ViewerHost: what event handlers ask of the viewer
 ├── viewer.py                   # DicomViewer widget (wires up the collaborators below)
 ├── geometry.py                 # Pure geometric helpers (slicing, extent, contour paths)
-├── io.py                       # DICOM series loading utilities (CT, RT-DOSE, REG)
+├── io.py                       # DICOM series scanning and loading (CT, RT-DOSE, REG)
+├── reg_io.py                   # Writing DICOM Spatial Registration objects
+├── window_level.py             # CT window presets and data-derived windows
 ├── rtstruct_io.py              # RT-STRUCT read / write utilities
 ├── roi_operations.py           # Interpolation, margin, smoothing, boolean ops
 ├── isodose_levels.py           # Isodose level definitions and resolution
@@ -81,6 +84,8 @@ tk_rt_viewer/
 │   ├── roi_manager.py          # ROI lifecycle + cache bookkeeping
 │   ├── dose_manager.py         # RT-DOSE in both geometries, Dmax, slice lookup
 │   ├── phase_manager.py        # 4DCT phases with lazy resampling + LRU
+│   ├── secondary_manager.py    # Secondary image as (source, transform)
+│   ├── roi_editor.py           # ROI-number based contour operations
 │   └── viewer_cache.py         # ViewerCacheManager, ContourPathCache, MaskSliceCache
 ├── rendering/
 │   ├── drawing_manager.py      # DrawingManager (idle-driven redraw coalescing)
@@ -91,11 +96,19 @@ tk_rt_viewer/
 │   ├── isodose.py              # IsoDoseOverlay (fill bands + contour lines)
 │   ├── dvh.py                  # DvhPanel (cumulative DVH panel)
 │   └── layout.py               # LayoutManager (single / mpr / mpr_wide layouts)
+├── registration/
+│   ├── session.py              # RegistrationSession, cropping, resampling
+│   ├── params.py               # RigidParams <-> transforms (Vert/Lat/Long/...)
+│   ├── rigid.py                # Intensity-based rigid registration
+│   ├── template.py             # Template matching for markers
+│   └── deformable.py           # B-spline and Demons deformation
 └── event_controllers/
     ├── viewer_events.py        # ViewerEventHandler (dispatcher + hover state)
     ├── crosshair_handler.py
     ├── brush_handler.py
-    └── bbox_handler.py
+    ├── rect_drag.py            # Rectangle create / move / resize geometry
+    ├── bbox_handler.py
+    └── bbox3d_handler.py
 ```
 
 `state/` holds the Tkinter-independent observable state and performance
@@ -149,6 +162,26 @@ if validate_dicom_files("/path/to/dicom"):
     print(image.GetSpacing())   # e.g. (0.977, 0.977, 3.0)
 ```
 
+To show a picker before loading anything, scan the tree for its series
+first. Scanning reads headers only, so a folder holding several thousand
+slices is enumerated far faster than it could be loaded:
+
+```python
+from tk_rt_viewer.io import scan_dicom_series
+
+scan = scan_dicom_series("/path/to/patient")
+for entry in scan.series:
+    print(entry.modality, entry.description, entry.is_4dct)
+
+# CT series carrying respiratory-phase labels ("0%", "10%", ...) are grouped
+# into a single entry whose .phases lists them, in phase order.
+```
+
+`scan_dicom_series` raises `MultiplePatientError` when the tree holds more
+than one patient; pass `require_single_patient=False` to scan anyway. To load
+the phases of a 4DCT entry afterwards, narrow a `load_all_series` result with
+`select_phase_series(all_series, entry.phases)`.
+
 ## Setting the display window
 
 The primary and secondary images carry independent windows. The secondary
@@ -157,8 +190,17 @@ follows the primary until you set an override, which is what you want for a
 *not* want for a PET, MR, or dose overlay.
 
 ```python
+from tk_rt_viewer.window_level import CT_WINDOW_PRESETS, compute_auto_window_level
+
 # --- Primary image ---
 state.set_window_level(window=400, level=40)   # soft-tissue window
+state.set_window_level(*CT_WINDOW_PRESETS["Lung"])
+
+# MR and other modalities have no conventional window; derive one from the
+# image itself (returns None when the intensities are uniform)
+window = compute_auto_window_level(image)
+if window is not None:
+    state.set_window_level(*window)
 viewer.set_window(vmin=-160, vmax=240)         # or as vmin / vmax (HU)
 
 # --- Secondary image ---
@@ -357,6 +399,34 @@ It does not solve correspondence between multiple disconnected components:
 where a slice's component count changes, components merge or split around the
 middle of the gap.
 
+### By ROI number
+
+`SliceViewerState.roi_editor` runs the same operations against the structure
+set, so a host addresses ROIs by number instead of passing masks around. The
+methods only read, which keeps them safe to call from a worker thread;
+committing the result stays with the caller:
+
+```python
+from tk_rt_viewer.roi_operations import BooleanOp, MarginConfig
+from tk_rt_viewer.state.roi_editor import RoiOperationError
+
+editor = state.roi_editor
+
+try:
+    mask = editor.margin(roi_number, MarginConfig.uniform(5.0))
+except RoiOperationError as exc:      # missing ROI, or the operation failed
+    print(exc)
+else:
+    # Back on the main thread:
+    state.add_contour(
+        editor.derived_name(roi_number, "margin"), mask, editor.color_of(roi_number)
+    )
+
+# Two-ROI operations, and an in-place one
+combined = editor.combine(ptv_number, oar_number, BooleanOp.SUBTRACTION)
+state.update_contour_properties(roi_number, {"mask": editor.thin(roi_number, 2)})
+```
+
 ## Brush tool
 
 ```python
@@ -390,6 +460,39 @@ x, y, w, h = state.get_bbox_pixel_coords("axial")
 # Clear
 state.set_bounding_box("axial", None)
 ```
+
+### Volumetric (3-D) bounding box
+
+The 3-D box is one `Box3D` in physical coordinates that every view projects,
+so it selects a volume rather than a region of one slice. It is independent
+of the per-view box above: a host may show either, or both, and when both are
+visible the 3-D box takes the mouse.
+
+```python
+from tk_rt_viewer import Box3D
+
+# Turn the tool on; the user draws on any view. Drawing on a second view
+# trims the depth of the box drawn on the first.
+state.set_bbox_3d_visible(True)
+
+# Or set one programmatically
+state.set_bounding_box_3d(Box3D(lower=(-40, -60, -20), upper=(40, 20, 60)))
+
+# Read it back, in physical coordinates or as inclusive voxel indices
+box = state.bounding_box_3d
+lower, upper = state.get_bbox_3d_index_bounds()   # ((x, y, z), (x, y, z))
+
+# Clear
+state.set_bounding_box_3d(None)
+```
+
+Clicking outside the box clears it, as with the per-view box; a drag that
+follows redraws it in that plane while keeping the depth set on another view.
+
+Each view draws the box solid while the displayed slice cuts through it and
+dashed while it does not, so its depth is visible without leaving the slice.
+Listen for `events.BOUNDING_BOX_3D_CHANGED` (payload: `Box3D | None`) to keep
+a UI in sync.
 
 ## RT-DOSE & IsoDose display
 
@@ -429,6 +532,118 @@ ref_gy = state.prescription_dose or state.get_dose_fallback_ref_gy() or 0.0
 # Drops hidden and non-positive levels, sorts ascending.
 viewer.set_isodose_lines(to_gy_pairs(levels, ref_gy))
 ```
+
+## Registration (fusion)
+
+`tk_rt_viewer.registration` aligns a moving image onto the primary image. It
+imports no Tkinter or Matplotlib, so a host can run it on a worker thread
+while the UI stays responsive, or use it from a script with no display at
+all. The viewer never calls it: the host decides when to register, and
+applies the outcome to the overlay itself.
+
+Corrections are carried as `RigidParams` — the six values a treatment
+workflow speaks in (Vert / Lat / Long / Roll / Pitch / Yaw, mm and degrees),
+expressed as the *motion of the moving image* about
+`session.rotation_center`. See `tk_rt_viewer.registration.params` for the
+sign and axis conventions before wiring them into a UI.
+
+```python
+from tk_rt_viewer.registration import (
+    DegreesOfFreedom,
+    RegistrationMetric,
+    RegistrationSession,
+    RigidParams,
+    match_template_translation,
+    register_deformable,
+    register_rigid,
+    resample_transform,
+)
+
+session = RegistrationSession.create(
+    fixed=state.primary_image,
+    moving=state.secondary_source_image,   # the overlay before resampling
+    # rotation_center=state.bounding_box_3d.center,  # default: image centre
+)
+
+# Rigid, restricted to the 3-D bounding box
+params = register_rigid(
+    session,
+    RigidParams(),                          # or the user's manual alignment
+    box=state.bounding_box_3d,
+    dof=DegreesOfFreedom.RIGID,             # or TRANSLATION
+    metric=RegistrationMetric.MUTUAL_INFORMATION,
+)
+
+# Implanted markers: cross-correlate a template cut from the fixed image.
+# intensity_floor removes everything below it from the comparison.
+match = match_template_translation(
+    session, params, box=state.bounding_box_3d, intensity_floor=1000.0
+)
+print(match.shift, match.score)
+
+# Deformable, on top of the rigid alignment and confined to the box
+deformation = register_deformable(session, match.params, box=state.bounding_box_3d)
+```
+
+Apply a result by handing the transform to the state, which re-resamples the
+overlay from its source image and leaves the blend alpha alone:
+
+```python
+state.set_secondary_transform(
+    resample_transform(match.params, session.rotation_center)
+)
+
+# With a deformation, compose it ahead of the rigid transform
+from tk_rt_viewer.registration import moving_chain
+
+state.set_secondary_transform(
+    moving_chain(session, resample_transform(match.params, session.rotation_center),
+                 deformation)
+)
+```
+
+Resampling a whole volume is slow enough to be worth keeping off the UI
+thread. `resample_secondary_with` does the work without touching state, so a
+host can compute on a worker thread and apply the finished image:
+
+```python
+# worker thread
+image = state.resample_secondary_with(transform)
+# main thread
+state.set_secondary_transform(transform, resampled=image)
+```
+
+A deformation is the residual of the rigid correction it was computed
+against, so discard it whenever that correction changes.
+
+### Exporting a registration
+
+A rigid result can be written back out as a DICOM Spatial Registration, for a
+treatment planning system to read. Pass one dataset from each series — a
+single slice read with `stop_before_pixels=True` is enough — for the patient,
+study and frame of reference identifiers:
+
+```python
+import pydicom
+from tk_rt_viewer.reg_io import save_registration, transform_to_matrix
+from tk_rt_viewer.registration import motion_transform
+
+# motion_transform is the movement of the moving image, which is the
+# direction DICOM stores; resample_transform is its inverse.
+matrix = transform_to_matrix(motion_transform(params, session.rotation_center))
+
+save_registration(
+    "registration.dcm",
+    matrix,
+    fixed_reference=pydicom.dcmread(fixed_slice, stop_before_pixels=True),
+    moving_reference=pydicom.dcmread(moving_slice, stop_before_pixels=True),
+    description="Marker match",
+)
+```
+
+Only rigid registrations can be written: a deformation is a displacement
+field and belongs to a different IOD, so `transform_to_matrix` raises
+`RegistrationExportError` rather than flattening one into a matrix.
 
 ## Layout modes
 

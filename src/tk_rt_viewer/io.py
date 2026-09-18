@@ -10,6 +10,13 @@ find_reg_matrices(dcm_root_dir) -> dict[str, np.ndarray]
     files and return a mapping of referenced SOP Instance UID to 4x4
     transformation matrix.
 
+scan_dicom_series(dcm_root_dir) -> SeriesScan
+    Enumerate the image series in a directory tree without reading any pixel
+    data, for a series picker.
+
+select_phase_series(all_series, phases) -> dict[str, SeriesInfo]
+    Pick the 4DCT phases named by a scan result out of a load_all_series map.
+
 load_all_series(dcm_root_dir) -> dict[str, SeriesInfo]
     Load every DICOM *image* series found under *dcm_root_dir*, keyed by
     SeriesDescription.
@@ -33,6 +40,7 @@ import logging
 import math
 import pathlib
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TypedDict
 
@@ -40,6 +48,8 @@ import numpy as np
 import pydicom
 import SimpleITK as sitk
 from pydicom.errors import InvalidDicomError
+
+from .window_level import WINDOW_PERCENTILE_SAMPLE_TARGET, strided_sample
 
 logger = logging.getLogger(__name__)
 
@@ -64,12 +74,9 @@ _NON_IMAGE_MODALITIES: frozenset[str] = frozenset(
 #: rather than as water (which a plain 0 would imply)
 _OUT_OF_FOV_HU: float = -1024.0
 
-#: Upper bound on the number of voxels sampled when deriving a display
-#: window from image statistics. ``np.percentile`` sorts its input, so
-#: running it over a full volume costs O(N log N) on tens of millions of
-#: voxels; a strided sample of this size yields percentiles that agree to
-#: well within one display step at a fraction of the cost
-_WINDOW_PERCENTILE_SAMPLE_TARGET: int = 2_000_000
+#: Modalities :func:`scan_dicom_series` lists by default: the image series a
+#: viewer can display as primary or secondary, plus RT-DOSE.
+DEFAULT_SCAN_MODALITIES: frozenset[str] = frozenset({"CT", "MR", "PT", "RTDOSE"})
 
 
 class SeriesInfo(TypedDict):
@@ -282,6 +289,251 @@ def _collect_reg_matrices(
 
 
 # ---------------------------------------------------------------------------
+# Series enumeration
+# ---------------------------------------------------------------------------
+class MultiplePatientError(ValueError):
+    """More than one patient was found in a directory tree being scanned.
+
+    Loading a folder that mixes two patients is never intentional, and the
+    failure it leads to — contours or a dose from one patient displayed over
+    the other's images — is the kind that is noticed late. Raised by
+    :func:`scan_dicom_series` unless the caller opts out.
+    """
+
+
+@dataclass(frozen=True)
+class PhaseEntry:
+    """One respiratory phase of a 4DCT series.
+
+    Attributes:
+        label:       Normalised phase label, e.g. ``"10%"``.
+        description: The phase's own SeriesDescription.
+        series_dir:  Directory holding the phase's files.
+    """
+
+    label: str
+    description: str
+    series_dir: pathlib.Path
+
+
+@dataclass(frozen=True)
+class SeriesEntry:
+    """One series found by :func:`scan_dicom_series`.
+
+    Attributes:
+        modality:    DICOM modality, e.g. ``"CT"``, ``"MR"``, ``"RTDOSE"``.
+        description: SeriesDescription, or ``""`` when the series has none.
+        series_dir:  Directory holding the series' files.
+        series_uid:  SeriesInstanceUID. Empty for a grouped 4DCT entry, which
+            stands for several series.
+        file_path:   One file of the series. RT-DOSE is loaded from this
+            directly, since a directory may hold several dose objects that
+            a directory-level load could not tell apart.
+        phases:      The phases of a 4DCT series, oldest label first; empty
+            for an ordinary series.
+    """
+
+    modality: str
+    description: str
+    series_dir: pathlib.Path
+    series_uid: str
+    file_path: pathlib.Path
+    phases: tuple[PhaseEntry, ...] = ()
+
+    @property
+    def is_4dct(self) -> bool:
+        """Whether this entry groups the phases of a 4DCT acquisition."""
+        return bool(self.phases)
+
+
+@dataclass(frozen=True)
+class SeriesScan:
+    """What :func:`scan_dicom_series` found.
+
+    Attributes:
+        series:        The image and dose series, in display order.
+        reg_files:     Spatial Registration Object files found on the way.
+        patient_ids:   Every PatientID encountered.
+        patient_names: Every PatientName encountered.
+    """
+
+    series: tuple[SeriesEntry, ...]
+    reg_files: tuple[pathlib.Path, ...] = ()
+    patient_ids: frozenset[str] = frozenset()
+    patient_names: frozenset[str] = frozenset()
+
+
+def scan_dicom_series(
+    dcm_root_dir: str | pathlib.Path,
+    modalities: frozenset[str] = DEFAULT_SCAN_MODALITIES,
+    group_4dct: bool = True,
+    require_single_patient: bool = True,
+) -> SeriesScan:
+    """List the series under *dcm_root_dir* without reading any pixel data.
+
+    This is the scan behind a series picker: it reads headers only, so a
+    folder of several thousand slices is enumerated in a fraction of the time
+    loading it would take, and the host loads only what the user then selects
+    (:func:`load_dcm_series`, :func:`load_rt_dose`).
+
+    Series are returned images first, then RT-DOSE, each group ordered by
+    modality and description, which is the order a picker wants to show.
+
+    Args:
+        dcm_root_dir: Root directory to scan, recursively.
+        modalities: Modalities to list. Anything else (RT-STRUCT, RT-PLAN, ...)
+            is ignored, except REG files, which are always collected into
+            :attr:`SeriesScan.reg_files`.
+        group_4dct: Whether to collapse CT series whose descriptions carry a
+            respiratory-phase label (``"0%"``, ``"10%"``, ...) into one entry
+            holding them as phases. A 4DCT otherwise shows up as ten
+            near-identical rows.
+        require_single_patient: Whether to raise when the tree holds more than
+            one patient.
+
+    Returns:
+        The scan result.
+
+    Raises:
+        MultiplePatientError: If *require_single_patient* and more than one
+            PatientID or PatientName was found.
+    """
+    root = pathlib.Path(dcm_root_dir)
+    series_by_uid: dict[str, SeriesEntry] = {}
+    reg_files: list[pathlib.Path] = []
+    patient_ids: set[str] = set()
+    patient_names: set[str] = set()
+
+    for file in root.rglob("*"):
+        if not file.is_file() or not pydicom.misc.is_dicom(file):
+            continue
+        try:
+            ds = pydicom.dcmread(str(file), stop_before_pixels=True)
+        except Exception as exc:
+            logger.warning(f"Skipping unreadable DICOM file '{file}': {exc}")
+            continue
+
+        patient_id = str(ds.get("PatientID", "")).strip()
+        patient_name = str(ds.get("PatientName", "")).strip()
+        if patient_id:
+            patient_ids.add(patient_id)
+        if patient_name:
+            patient_names.add(patient_name)
+
+        modality = str(ds.get("Modality", "")).strip().upper()
+        if modality == "REG":
+            reg_files.append(file)
+            continue
+        if modality not in modalities:
+            continue
+
+        series_uid = str(ds.get("SeriesInstanceUID", ""))
+        if not series_uid or series_uid in series_by_uid:
+            continue
+        series_by_uid[series_uid] = SeriesEntry(
+            modality=modality,
+            description=str(ds.get("SeriesDescription", "")).strip(),
+            series_dir=file.parent,
+            series_uid=series_uid,
+            file_path=file,
+        )
+
+    if require_single_patient and (len(patient_ids) > 1 or len(patient_names) > 1):
+        raise MultiplePatientError(
+            f"Found more than one patient: ids={sorted(patient_ids)}, "
+            f"names={sorted(patient_names)}."
+        )
+
+    series = _order_series(list(series_by_uid.values()), group_4dct)
+    logger.info(
+        f"Scanned '{root}': {len(series)} series "
+        f"({sum(len(entry.phases) for entry in series)} 4DCT phases, "
+        f"{len(reg_files)} REG files)."
+    )
+    return SeriesScan(
+        series=tuple(series),
+        reg_files=tuple(reg_files),
+        patient_ids=frozenset(patient_ids),
+        patient_names=frozenset(patient_names),
+    )
+
+
+def _order_series(entries: list[SeriesEntry], group_4dct: bool) -> list[SeriesEntry]:
+    """Group 4DCT phases and sort the result into display order."""
+    phases: list[SeriesEntry] = []
+    ordinary: list[SeriesEntry] = []
+    for entry in entries:
+        # Only CT carries respiratory phases; testing every modality would
+        # misread a dose series whose description happens to contain "50%".
+        is_phase = (
+            group_4dct
+            and entry.modality == "CT"
+            and normalize_phase_label(entry.description) is not None
+        )
+        (phases if is_phase else ordinary).append(entry)
+
+    ordinary.sort(key=lambda e: (e.modality == "RTDOSE", e.modality, e.description))
+
+    if not phases:
+        return ordinary
+
+    phases.sort(key=lambda e: _phase_sort_key(e.description))
+    grouped = SeriesEntry(
+        modality="CT",
+        description="4DCT",
+        series_dir=phases[0].series_dir,
+        series_uid="",
+        file_path=phases[0].file_path,
+        phases=tuple(
+            PhaseEntry(
+                label=str(normalize_phase_label(entry.description)),
+                description=entry.description,
+                series_dir=entry.series_dir,
+            )
+            for entry in phases
+        ),
+    )
+    return [grouped, *ordinary]
+
+
+def _phase_sort_key(description: str) -> tuple[float, str]:
+    """Sort key ordering phase descriptions by their percentage.
+
+    Sorting the descriptions as plain strings puts ``"100%"`` between
+    ``"10%"`` and ``"20%"``, so the numeric part leads the key.
+    """
+    label = normalize_phase_label(description)
+    percent = float(label.rstrip("%")) if label else math.inf
+    return percent, description
+
+
+def select_phase_series(
+    all_series: dict[str, SeriesInfo], phases: Sequence[PhaseEntry]
+) -> dict[str, SeriesInfo]:
+    """Pick the entries of *all_series* named by *phases*.
+
+    :func:`load_all_series` keys its result by the same normalised phase
+    label :func:`scan_dicom_series` records, but loads everything under the
+    directory it was given. This narrows that to the phases of one 4DCT
+    acquisition, in the order they were scanned.
+
+    Args:
+        all_series: Output of :func:`load_all_series`.
+        phases: The phases to pick, from ``SeriesEntry.phases``.
+
+    Returns:
+        ``{phase_label: SeriesInfo}``.
+
+    Raises:
+        KeyError: If any requested phase is missing from *all_series*.
+    """
+    missing = [phase.label for phase in phases if phase.label not in all_series]
+    if missing:
+        raise KeyError(f"Phases not found in the loaded series: {missing}.")
+    return {phase.label: all_series[phase.label] for phase in phases}
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 def _read_series(
@@ -416,21 +668,6 @@ def _first_float(value: str) -> float:
     return float(value.split("\\")[0])
 
 
-def _sampled_view(arr: np.ndarray, target_voxels: int) -> np.ndarray:
-    """Return a strided view of *arr* holding at most *target_voxels* voxels.
-
-    Used to keep percentile-derived display windows cheap on large volumes. A
-    uniform stride preserves the intensity distribution closely enough for a
-    display window, which the UI quantises to integer units anyway.
-    """
-    if arr.size <= target_voxels:
-        return arr
-    # The stride is applied to every dimension, so the sample shrinks by
-    # step ** ndim; take the ndim-th root of the required reduction.
-    step = max(1, int(math.ceil((arr.size / target_voxels) ** (1.0 / arr.ndim))))
-    return arr[(slice(None, None, step),) * arr.ndim]
-
-
 def _get_window_level(
     reader: sitk.ImageSeriesReader,
     image: sitk.Image,
@@ -456,7 +693,7 @@ def _get_window_level(
         return 300.0, 25.0
 
     arr = sitk.GetArrayViewFromImage(image)
-    sample = _sampled_view(arr, _WINDOW_PERCENTILE_SAMPLE_TARGET)
+    sample = strided_sample(arr, WINDOW_PERCENTILE_SAMPLE_TARGET)
     vmin, vmax = (float(v) for v in np.percentile(sample, (0.5, 99.5)))
     return vmax - vmin, (vmin + vmax) / 2
 

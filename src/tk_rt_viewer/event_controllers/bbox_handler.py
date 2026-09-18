@@ -5,6 +5,10 @@ coordinates ``(x_min, y_min, width, height)``.  This handler translates
 mouse events into state updates; rendering is performed by
 :class:`DicomViewer` through the ``"bounding_boxes_changed"`` listener.
 
+The rectangle arithmetic itself lives in
+:mod:`tk_rt_viewer.event_controllers.rect_drag`, shared with the volumetric
+box handler so both gestures behave identically.
+
 Supported interactions:
     - **Create**: left-click on empty space -> drag to define a new box.
     - **Move**: left-click inside an existing box -> drag to reposition.
@@ -14,10 +18,16 @@ Supported interactions:
 
 from typing import TYPE_CHECKING
 
-import numpy as np
-
 from ..protocols import ViewerHost
 from ..state.viewer_state import SliceViewerState
+from .rect_drag import (
+    contains,
+    data_tolerance,
+    detect_handle,
+    move_rect,
+    rect_from_drag,
+    resize_rect,
+)
 
 if TYPE_CHECKING:
     from .viewer_events import ViewerEventHandler
@@ -54,7 +64,7 @@ class BboxEventHandler:
         self._active_axis: str | None = None
         self._is_dragging: bool = False
         self._drag_start_pos_data: tuple[float, float] | None = None
-        self._original_pos: list[float] | None = None
+        self._original_pos: tuple[float, float, float, float] | None = None
 
     @property
     def is_dragging(self) -> bool:
@@ -102,15 +112,13 @@ class BboxEventHandler:
             # Resize an existing box. _detect_handle only returns a handle
             # when a box exists, so the bbox check is for the type checker
             # and against future refactors breaking that invariant.
-            self._begin_drag(axis, "resize", (px, py), list(bbox))
+            self._begin_drag(axis, "resize", (px, py), bbox)
             self._resize_handle = handle
             return True
 
-        if bbox is not None and (
-            bbox[0] <= px <= bbox[0] + bbox[2] and bbox[1] <= py <= bbox[1] + bbox[3]
-        ):
+        if bbox is not None and contains(bbox, px, py):
             # Move the existing box.
-            self._begin_drag(axis, "move", (px, py), list(bbox))
+            self._begin_drag(axis, "move", (px, py), bbox)
             return True
 
         # Click outside any existing box: clear the old one and begin
@@ -167,34 +175,27 @@ class BboxEventHandler:
         axis = self._active_axis
         if axis is None or self._drag_start_pos_data is None:
             return
-        x0, y0 = self._drag_start_pos_data
+        start = self._drag_start_pos_data
         mode = self._interaction_mode
 
         if mode == "create":
-            x_start, x_end = (x0, px) if x0 <= px else (px, x0)
-            y_start, y_end = (y0, py) if y0 <= py else (py, y0)
-            width, height = x_end - x_start, y_end - y_start
-            if width == 0 and height == 0:
-                # A press with no movement yet (handle_motion's first call
-                # during a real drag) or a round-trip exactly back to the
-                # start (handle_release's final call after a press with no
-                # drag at all) has no box to show. Skip writing it rather
-                # than storing a zero-area box: state.bounding_boxes[axis]
-                # would then be non-None while nothing is visible on
-                # screen, which every consumer keying off "is a box set"
-                # (e.g. a bbox-based inference prompt) reads as "a box
-                # exists" and would act on the degenerate box in place of
-                # what the user actually drew — or, for a plain click,
-                # drew nothing at all.
-                return
-            self.state.set_bounding_box(axis, (x_start, y_start, width, height))
+            # A press with no movement yet, or a round-trip exactly back to
+            # the start, has no box to show. rect_from_drag returns None for
+            # both, and skipping the write is what keeps
+            # state.bounding_boxes[axis] from holding a zero-area box that
+            # is invisible on screen yet reads as "a box exists" to every
+            # consumer (e.g. a bbox-based inference prompt).
+            rect = rect_from_drag(start, (px, py))
+            if rect is not None:
+                self.state.set_bounding_box(axis, rect)
         elif mode == "move":
             if self._original_pos is None:
                 return
-            x, y, w, h = self._original_pos
-            self.state.set_bounding_box(axis, (x + px - x0, y + py - y0, w, h))
+            self.state.set_bounding_box(
+                axis, move_rect(self._original_pos, px - start[0], py - start[1])
+            )
         elif mode == "resize":
-            self._resize_bbox(px - x0, py - y0)
+            self._resize_bbox(px - start[0], py - start[1])
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -204,7 +205,7 @@ class BboxEventHandler:
         axis: str,
         mode: str,
         start_pos: tuple[float, float],
-        original_pos: list[float] | None,
+        original_pos: tuple[float, float, float, float] | None,
     ) -> None:
         """Initialise drag state for any of the three interaction modes."""
         self._interaction_mode = mode
@@ -217,65 +218,20 @@ class BboxEventHandler:
         """Return the name of the resize handle under the cursor, or ``None``.
 
         Handle names use compass notation: ``"t"``, ``"b"``, ``"l"``, ``"r"``
-        for edges and ``"tl"``, ``"tr"``, ``"bl"``, ``"br"`` for corners.
-
-        Edge-to-handle mapping (defined in data coordinates):
-            "l" = left edge   (x_min)
-            "r" = right edge  (x_max = x + w)
-            "b" = bottom edge (y_min; posterior in axial, inferior in cor/sag)
-            "t" = top edge    (y_max = y + h; anterior in axial, superior in cor/sag)
-
-        Detection is performed in data coordinates. The pixel tolerance is
-        converted to data units via an inverse transform so that the correct
-        handle is returned regardless of ylim orientation.
+        for edges and ``"tl"``, ``"tr"``, ``"bl"``, ``"br"`` for corners,
+        defined in data coordinates so that the correct handle is returned
+        regardless of ylim orientation (see
+        :mod:`tk_rt_viewer.event_controllers.rect_drag`).
         """
         bbox = self.state.bounding_boxes.get(axis)
-        if bbox is None or self.viewer.axes_map.get(axis) is None:
+        ax = self.viewer.axes_map.get(axis)
+        if bbox is None or ax is None:
             return None
         if event.xdata is None or event.ydata is None:
             return None
 
-        ax = self.viewer.axes_map[axis]
-        x, y, w, h = bbox
-        x_min, x_max = x, x + w
-        y_min, y_max = y, y + h
-
-        # Convert the pixel tolerance to data units via the inverse display
-        # transform. Before the axes has been drawn its transform can be
-        # singular, so a non-invertible / degenerate transform falls back to
-        # a 1-data-unit tolerance rather than swallowing unrelated errors.
-        try:
-            inv = ax.transData.inverted()
-            p0 = inv.transform((0, 0))
-            p1 = inv.transform((self.TOLERANCE_PIXELS, self.TOLERANCE_PIXELS))
-            tol_x = abs(p1[0] - p0[0])
-            tol_y = abs(p1[1] - p0[1])
-        except (np.linalg.LinAlgError, ValueError):
-            tol_x = tol_y = 1.0
-
-        ex, ey = event.xdata, event.ydata
-        on_l = abs(ex - x_min) < tol_x
-        on_r = abs(ex - x_max) < tol_x
-        on_b = abs(ey - y_min) < tol_y
-        on_t = abs(ey - y_max) < tol_y
-
-        if on_t and on_l:
-            return "tl"
-        if on_t and on_r:
-            return "tr"
-        if on_b and on_l:
-            return "bl"
-        if on_b and on_r:
-            return "br"
-        if on_t:
-            return "t"
-        if on_b:
-            return "b"
-        if on_l:
-            return "l"
-        if on_r:
-            return "r"
-        return None
+        tol_x, tol_y = data_tolerance(ax, self.TOLERANCE_PIXELS)
+        return detect_handle(bbox, event.xdata, event.ydata, tol_x, tol_y)
 
     def _resize_bbox(self, dx: float, dy: float) -> None:
         """Apply a resize delta to the original box according to the active handle.
@@ -283,35 +239,12 @@ class BboxEventHandler:
         dx/dy are data-coordinate deltas (event.xdata/ydata - drag_start).
         Because :meth:`_detect_handle` also operates in data coordinates, the
         dragged edge always moves in the expected direction regardless of
-        ylim orientation:
-
-            dragging "t" up   (dy > 0) -> increase y_max -> h += dy
-            dragging "b" down (dy < 0) -> decrease y_min -> y += dy; h -= dy
+        ylim orientation.
         """
         handle = self._resize_handle
         axis = self._active_axis
         if handle is None or axis is None or self._original_pos is None:
             return
-        x, y, w, h = self._original_pos
-        min_size = self._MIN_SIZE
-
-        if "l" in handle:
-            new_w = w - dx
-            if new_w >= min_size:
-                x += dx
-                w = new_w
-        if "r" in handle:
-            new_w = w + dx
-            if new_w >= min_size:
-                w = new_w
-        if "t" in handle:
-            new_h = h + dy
-            if new_h >= min_size:
-                h = new_h
-        if "b" in handle:
-            new_h = h - dy
-            if new_h >= min_size:
-                y += dy
-                h = new_h
-
-        self.state.set_bounding_box(axis, (x, y, w, h))
+        self.state.set_bounding_box(
+            axis, resize_rect(self._original_pos, handle, dx, dy, self._MIN_SIZE)
+        )

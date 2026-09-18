@@ -28,6 +28,7 @@ WINDOW_LEVEL_CHANGED: Final = "window_level_changed"
 CROSSHAIR_CHANGED: Final = "crosshair_changed"
 CROSSHAIR_VISIBLE_CHANGED: Final = "crosshair_visible_changed"
 BOUNDING_BOXES_CHANGED: Final = "bounding_boxes_changed"
+BOUNDING_BOX_3D_CHANGED: Final = "bounding_box_3d_changed"
 ALL_CONTOURS_CHANGED: Final = "all_contours_changed"
 ACTIVE_CONTOURS_CHANGED: Final = "active_contours_changed"
 OVERLAY_CONTOURS_CHANGED: Final = "overlay_contours_changed"
@@ -57,6 +58,7 @@ ALL_EVENTS: Final[frozenset[str]] = frozenset(
         CROSSHAIR_CHANGED,
         CROSSHAIR_VISIBLE_CHANGED,
         BOUNDING_BOXES_CHANGED,
+        BOUNDING_BOX_3D_CHANGED,
         ALL_CONTOURS_CHANGED,
         ACTIVE_CONTOURS_CHANGED,
         OVERLAY_CONTOURS_CHANGED,

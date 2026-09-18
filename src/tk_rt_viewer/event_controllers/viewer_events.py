@@ -9,7 +9,14 @@ Event priority for ``on_press`` / ``on_motion``:
     1. Brush tool (exclusive when active)
     2. Crosshair drag
     3. Window / level adjustment (right-click drag)
-    4. Bounding box interaction
+    4. 3-D bounding box interaction
+    5. 2-D bounding box interaction
+
+    The two bounding-box tools are independent — a host may show either, or
+    both — so one of them has to win the mouse when both are visible. The 3-D
+    box goes first because it is the more specific tool: a host that has
+    turned it on is asking the user to select a volume, and the per-view box
+    is normally off while that is happening.
 
 Hover tracking:
     ``current_axis`` lives here, not on ``SliceViewerState``. "Which view is
@@ -33,6 +40,7 @@ import numpy as np
 from .. import events
 from ..protocols import ViewerHost
 from ..state.viewer_state import SliceViewerState
+from .bbox3d_handler import Bbox3dEventHandler
 from .bbox_handler import BboxEventHandler
 from .brush_handler import BrushEventHandler
 from .crosshair_handler import CrosshairEventHandler
@@ -80,6 +88,7 @@ class ViewerEventHandler:
         self.crosshair_handler = CrosshairEventHandler(state, viewer, self)
         self.brush_handler = BrushEventHandler(state, viewer, self)
         self.bbox_handler = BboxEventHandler(state, viewer, self)
+        self.bbox_3d_handler = Bbox3dEventHandler(state, viewer, self)
 
         # Window / level drag state.
         self._dragging_wl: bool = False
@@ -116,6 +125,7 @@ class ViewerEventHandler:
             self._reset_wl_drag()
             self.crosshair_handler.cancel()
             self.bbox_handler.cancel()
+            self.bbox_3d_handler.cancel()
         else:
             self.brush_handler.deactivate()
 
@@ -265,8 +275,10 @@ class ViewerEventHandler:
             self._begin_wl_drag(event)
             return
 
-        # Priority 4: bounding box (all views).
+        # Priority 4: 3-D bounding box, then priority 5: 2-D bounding box.
         if event.button == 1 and self._current_axis:
+            if self.bbox_3d_handler.handle_press(event):
+                return
             self.bbox_handler.handle_press(event)
 
     def _begin_wl_drag(self, event) -> None:
@@ -332,7 +344,12 @@ class ViewerEventHandler:
             self._apply_wl_drag(event)
             return
 
-        # Priority 4: bounding box.
+        # Priority 4: 3-D bounding box.
+        if self.bbox_3d_handler.is_dragging:
+            self.bbox_3d_handler.handle_motion(event)
+            return
+
+        # Priority 5: 2-D bounding box.
         if self.bbox_handler.is_dragging:
             self.bbox_handler.handle_motion(event)
 
@@ -375,6 +392,7 @@ class ViewerEventHandler:
             or self.crosshair_handler.is_dragging
             or self._dragging_wl
             or self.bbox_handler.is_dragging
+            or self.bbox_3d_handler.is_dragging
         )
 
     def _recover_lost_drag(self, event) -> None:
@@ -403,6 +421,8 @@ class ViewerEventHandler:
             self.crosshair_handler.cancel()
         if self.bbox_handler.is_dragging:
             self.bbox_handler.cancel()
+        if self.bbox_3d_handler.is_dragging:
+            self.bbox_3d_handler.cancel()
         if self._dragging_wl:
             self._reset_wl_drag()
 
@@ -439,6 +459,9 @@ class ViewerEventHandler:
             return
 
         self.crosshair_handler.handle_release(event)
+
+        if self.bbox_3d_handler.is_dragging:
+            self.bbox_3d_handler.handle_release(event)
 
         if self.bbox_handler.is_dragging:
             self.bbox_handler.handle_release(event)
