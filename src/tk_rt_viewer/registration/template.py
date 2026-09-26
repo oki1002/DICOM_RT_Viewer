@@ -20,7 +20,7 @@ import numpy as np
 import SimpleITK as sitk
 from skimage.feature import match_template
 
-from ..geometry import Box3D, _as_point
+from ..geometry import Box3D, as_point
 from .errors import RegistrationError
 from .params import RigidParams, resample_transform
 from .session import RegistrationSession, crop_to_box, moving_chain
@@ -121,7 +121,7 @@ def match_template_translation(
 
     # The content was found that far from where it should be, so it has to
     # move back by the same amount.
-    shift = _as_point(-found_at)
+    shift = as_point(-found_at)
     score = float(correlation[peak])
     logger.info(
         f"Template match: shift_mm=({shift[0]:.2f}, {shift[1]:.2f}, {shift[2]:.2f}), "

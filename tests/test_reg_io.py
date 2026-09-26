@@ -7,6 +7,7 @@ import SimpleITK as sitk
 from pydicom.dataset import Dataset, FileMetaDataset
 from pydicom.uid import CTImageStorage, ExplicitVRLittleEndian, generate_uid
 
+from tk_rt_viewer.io import find_reg_matrices
 from tk_rt_viewer.reg_io import (
     SPATIAL_REGISTRATION_SOP_CLASS_UID,
     RegistrationExportError,
@@ -122,3 +123,49 @@ class TestSaveRegistration:
         del moving.FrameOfReferenceUID
         with pytest.raises(RegistrationExportError, match="moving reference"):
             save_registration(tmp_path / "reg.dcm", np.eye(4), make_reference(), moving)
+
+
+class TestRoundTripThroughFindRegMatrices:
+    """What this module writes, io.find_reg_matrices must be able to read.
+
+    save_registration records its references under
+    ``ReferencedSeriesSequence``; the reader only looked at
+    ``ReferencedImageSequence`` and accessed it unguarded, so scanning a
+    folder holding a registration written here raised ``AttributeError``
+    and took the whole series load with it.
+    """
+
+    @staticmethod
+    def _written_reg(tmp_path) -> tuple[Dataset, np.ndarray]:
+        fixed = make_reference("1.2.3.FIXED")
+        moving = make_reference("1.2.3.MOVING")
+        matrix = transform_to_matrix(
+            motion_transform(
+                RigidParams(lat=4.0, vert=-2.0, long=1.0), center=(0.0, 0.0, 0.0)
+            )
+        )
+        save_registration(tmp_path / "reg.dcm", matrix, fixed, moving)
+        return moving, matrix
+
+    def test_the_moving_series_transform_is_recovered(self, tmp_path) -> None:
+        moving, matrix = self._written_reg(tmp_path)
+
+        matrices = find_reg_matrices(tmp_path)
+
+        assert str(moving.SOPInstanceUID) in matrices
+        # find_reg_matrices inverts what it reads: the file stores
+        # Fixed <- Moving, callers want Moving <- Fixed.
+        recovered = matrices[str(moving.SOPInstanceUID)]
+        assert recovered == pytest.approx(np.linalg.inv(matrix))
+
+    def test_the_fixed_identity_item_is_not_reported(self, tmp_path) -> None:
+        fixed = make_reference("1.2.3.FIXED")
+        moving = make_reference("1.2.3.MOVING")
+        matrix = transform_to_matrix(
+            motion_transform(RigidParams(lat=4.0), center=(0.0, 0.0, 0.0))
+        )
+        save_registration(tmp_path / "reg.dcm", matrix, fixed, moving)
+
+        matrices = find_reg_matrices(tmp_path)
+
+        assert str(fixed.SOPInstanceUID) not in matrices

@@ -4,12 +4,13 @@ import pathlib
 
 import numpy as np
 import pytest
-from pydicom.dataset import FileDataset, FileMetaDataset
+from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
 from pydicom.uid import CTImageStorage, ExplicitVRLittleEndian, generate_uid
 
 from tk_rt_viewer.io import (
     MultiplePatientError,
     PhaseEntry,
+    _collect_reg_matrices,
     _first_float,
     load_dcm_series,
     normalize_phase_label,
@@ -207,3 +208,93 @@ class TestSelectPhaseSeries:
         )
         with pytest.raises(KeyError, match="70%"):
             select_phase_series({"0%": {}}, phases)
+
+
+class TestCollectRegMatrices:
+    """REG items must be read defensively, and by both reference sequences.
+
+    ``ReferencedImageSequence`` is optional. Reading it unguarded raised
+    ``AttributeError`` out of the whole directory walk, so one REG object
+    that recorded its references any other way took every series in the
+    tree down with it — including the objects this package writes itself,
+    which use ``ReferencedSeriesSequence``.
+    """
+
+    @staticmethod
+    def _matrix_item(matrix: np.ndarray) -> Dataset:
+        matrix_item = Dataset()
+        matrix_item.FrameOfReferenceTransformationMatrixType = "RIGID"
+        matrix_item.FrameOfReferenceTransformationMatrix = [
+            float(value) for value in np.asarray(matrix).reshape(16)
+        ]
+        matrix_registration = Dataset()
+        matrix_registration.MatrixSequence = [matrix_item]
+
+        item = Dataset()
+        item.MatrixRegistrationSequence = [matrix_registration]
+        return item
+
+    @staticmethod
+    def _reg_dataset(items: list[Dataset]) -> Dataset:
+        ds = Dataset()
+        ds.RegistrationSequence = items
+        return ds
+
+    @staticmethod
+    def _shift_matrix(dx: float) -> np.ndarray:
+        matrix = np.eye(4)
+        matrix[0, 3] = dx
+        return matrix
+
+    def _collect(self, items: list[Dataset]) -> dict[str, np.ndarray]:
+        out: dict[str, np.ndarray] = {}
+        _collect_reg_matrices(self._reg_dataset(items), pathlib.Path("reg.dcm"), out)
+        return out
+
+    def test_series_sequence_references_are_read(self) -> None:
+        """This is the shape reg_io.save_registration writes."""
+        item = self._matrix_item(self._shift_matrix(5.0))
+        instance = Dataset()
+        instance.ReferencedSOPInstanceUID = "1.2.3.MOVING"
+        series = Dataset()
+        series.ReferencedInstanceSequence = [instance]
+        item.ReferencedSeriesSequence = [series]
+
+        assert "1.2.3.MOVING" in self._collect([item])
+
+    def test_item_without_any_reference_is_skipped_not_raised(self) -> None:
+        good = self._matrix_item(self._shift_matrix(5.0))
+        image = Dataset()
+        image.ReferencedSOPInstanceUID = "1.2.3.GOOD"
+        good.ReferencedImageSequence = [image]
+
+        result = self._collect([self._matrix_item(self._shift_matrix(9.0)), good])
+        assert result == {
+            "1.2.3.GOOD": pytest.approx(np.linalg.inv(self._shift_matrix(5.0)))
+        }
+
+    def test_identity_items_are_not_stored(self) -> None:
+        """A registration names its own frame of reference with an identity.
+
+        Storing that would hand the fixed series a transform meaning "do not
+        move", indistinguishable from one that really was registered.
+        """
+        item = self._matrix_item(np.eye(4))
+        image = Dataset()
+        image.ReferencedSOPInstanceUID = "1.2.3.FIXED"
+        item.ReferencedImageSequence = [image]
+
+        assert self._collect([item]) == {}
+
+    def test_a_malformed_matrix_does_not_abort_the_remaining_items(self) -> None:
+        broken = self._matrix_item(np.eye(4))
+        broken.MatrixRegistrationSequence[0].MatrixSequence[
+            0
+        ].FrameOfReferenceTransformationMatrix = [1.0, 2.0, 3.0]  # not 16 values
+
+        good = self._matrix_item(self._shift_matrix(2.0))
+        image = Dataset()
+        image.ReferencedSOPInstanceUID = "1.2.3.GOOD"
+        good.ReferencedImageSequence = [image]
+
+        assert list(self._collect([broken, good])) == ["1.2.3.GOOD"]

@@ -24,7 +24,7 @@ from itertools import product
 import numpy as np
 import SimpleITK as sitk
 
-from ..geometry import Box3D, _as_point
+from ..geometry import Box3D, as_point
 from .errors import RegistrationError
 from .params import RigidParams, resample_transform
 
@@ -99,7 +99,7 @@ class RegistrationSession:
             fixed=fixed,
             moving=moving,
             base_transform=base_transform,
-            rotation_center=_as_point(rotation_center),
+            rotation_center=as_point(rotation_center),
             default_pixel_value=float(default_pixel_value),
         )
 

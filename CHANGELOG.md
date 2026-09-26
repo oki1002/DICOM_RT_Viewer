@@ -4,6 +4,113 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.1.1] — 2026
+
+A patch release from a review of the 2.1.0 tree. The headline is that
+`load_all_series` / `load_dcm_series` could be brought down entirely by one
+Spatial Registration object in the folder — including the ones this package
+writes itself, which 2.1.0 added the ability to produce. Everything else is
+a correctness or robustness fix with no API change, apart from three names
+that became public and one argument that gained a meaning it should always
+have had.
+
+### Fixed
+
+- **A REG object without `ReferencedImageSequence` no longer aborts the
+  whole load.** `io._collect_reg_matrices` read that sequence outside the
+  guard that exists to contain a malformed REG file, so a missing one —
+  the sequence is optional — raised `AttributeError` out of
+  `_scan_dicom_tree`, past `load_all_series`, and out of
+  `DicomViewer.load_ct`. One file the reader did not expect took every
+  series in the tree with it. The reference lookup now happens inside the
+  guard, alongside a `ValueError` for a matrix that is not 16 values.
+- **Registrations written by `reg_io.save_registration` can be read back.**
+  That function records its references under `ReferencedSeriesSequence`,
+  which the reader never looked at, so scanning a folder holding a
+  registration this package had just written hit exactly the
+  `AttributeError` above. Both sequences are now read. The identity item a
+  registration carries to name the frame of reference it registers *to* is
+  skipped rather than stored, since attaching it to the fixed series would
+  give that series a transform meaning "do not move" — indistinguishable,
+  everywhere downstream, from one that really was registered.
+- **An RT-STRUCT with no contours returns `{}` instead of raising.**
+  `load_rt_struct` read `StructureSetROISequence` and `ROIContourSequence`
+  outside its own guard. `ROIContourSequence` is conditional, so a structure
+  set holding no contours may omit it, and the result was a bare
+  `AttributeError` — a third outcome the documented contract (an empty dict,
+  or `RtStructLoadError`) does not mention and no caller was written for.
+- **`DicomViewer.set_isodose_lines(None)` restores the default ladder.** It
+  tested its argument for truthiness, collapsing "hide every level" and
+  "go back to the defaults" onto the same behaviour, so a host that had once
+  set custom levels had no way back through the public API. The two are now
+  distinct: `[]` hides, `None` restores.
+- **A brush stroke stays on the slice it started on.** The slice index was
+  read afresh from the state on every write and again at commit time, so a
+  slice change while the button was held — an arrow key, or a host widget
+  driving the index from elsewhere — silently redirected the rest of the
+  stroke, and the commit, onto a slice the user never painted on. The index
+  is now captured at press time, as the ROI number already was.
+- **A background contour build cannot write into a cache it no longer
+  belongs to.** The build loop compared a generation counter between slices,
+  which left a window between the check and the write that followed it;
+  since ROI numbers restart at 1 for each new image, paths from the previous
+  image's ROI 1 could land under the new one's. `ContourPathCache` now
+  issues each ROI an *epoch* from a counter that is never reset, retires it
+  on any invalidation, and re-checks it inside `set` under its own lock, so
+  the window is closed rather than narrowed.
+- **The listener registry is safe against its one genuine concurrent
+  writer.** `contour_cache_built` is emitted from the build pool while the
+  main thread may be subscribing. `add_listener`, `remove_listener` and the
+  snapshot taken by `_notify` now hold a lock; it is released before any
+  listener runs, so a listener may still subscribe or unsubscribe from
+  inside its own callback.
+- **The blend slider no longer echoes its own update.** A value that does
+  not survive the round trip through Tk as a string wrote back a
+  hair-different alpha, rebuilding both LUTs a second time and re-windowing
+  every slice for nothing.
+- **Caches are discarded before the first notification of an image switch.**
+  `set_primary_image_data` fired `all_contours_changed` and
+  `active_contours_changed` while the extent and array caches still
+  described the previous image, with `primary_image` already pointing at the
+  new one. Nothing was drawn from the stale values in practice, which made
+  it a trap rather than a bug; the order now matches what the method's own
+  comment promises its listeners.
+- **A duplicate `ROINumber` no longer loses an original ROI name.**
+  `load_rt_struct`'s temporary-rename bookkeeping was keyed by ROI number,
+  so a malformed file with two entries sharing one would restore one name
+  onto the other. It is keyed by the entry itself now.
+
+### Changed
+
+- **Resampling refuses a missing primary image with a message that names
+  it.** `SliceViewerState.get_resampled_image` — and therefore
+  `set_secondary_image_data` with an image — raises `RuntimeError` instead
+  of letting `SetReferenceImage(None)` fail somewhere inside SimpleITK.
+  The two entry points that reach it also disagreed: the 4DCT one already
+  refused early. Clearing an overlay is unaffected.
+- **Three names became public**, because other modules already depended on
+  them: `geometry.as_point` (was `_as_point`, imported by
+  `registration.session` and `registration.template`) and
+  `state.viewer_state.MIN_BRUSH_SIZE_MM` (was `_MIN_BRUSH_SIZE_MM`, which
+  `BrushEventHandler` shadowed with a larger floor of its own, so the
+  smallest reachable brush depended on whether the user got there by
+  scrolling or through a host's size control).
+- **`DicomViewer.load_ct` takes `str | pathlib.Path`** and normalises it, so
+  `SliceViewerState.primary_image_dir` is a `Path` whichever the caller
+  passed. It was annotated `Any`.
+- **`ViewerCacheManager.build_contour_paths_for_roi`** takes `epoch` in
+  place of `generation`, and the manager no longer keeps a generation
+  counter of its own. The method is internal to the cache layer.
+- **README**: the stated numpy floor was 1.24 while `pyproject.toml`
+  required 1.26.
+
+### Performance
+
+- **`render.slice_to_rgba` allocates two full-slice temporaries per frame
+  instead of four**, and no longer promotes an int16 CT slice to float64 on
+  the way. Reusing the RGBA output buffer had left most of the per-frame
+  allocation cost in the windowing step ahead of it.
+
 ## [2.1.0] — 2026
 
 A feature release. Three capabilities host applications were each building

@@ -36,7 +36,7 @@ The distribution name on PyPI is `tk-rt-viewer`; the import package is
 - SimpleITK ≥ 2.3
 - contourpy ≥ 1.2
 - matplotlib ≥ 3.10
-- numpy ≥ 1.24
+- numpy ≥ 1.26
 - pydicom ≥ 2.4
 - rt-utils ≥ 1.2
 - scikit-image ≥ 0.21
@@ -181,6 +181,13 @@ for entry in scan.series:
 than one patient; pass `require_single_patient=False` to scan anyway. To load
 the phases of a 4DCT entry afterwards, narrow a `load_all_series` result with
 `select_phase_series(all_series, entry.phases)`.
+
+Load the primary image first. The secondary overlay, the 4DCT phases and
+RT-DOSE are all displayed on the primary image's grid, so there is nothing
+to resample them onto until it is set; `set_secondary_image_data` and
+`get_resampled_image` raise `RuntimeError` saying so rather than letting
+SimpleITK fail with a message that names neither. Clearing an overlay
+(`set_secondary_image_data(None)`) is always allowed.
 
 ## Setting the display window
 
@@ -447,6 +454,13 @@ state.set_brush_fill_inside(True)
 state.set_brush_tool_active(False)
 ```
 
+A stroke belongs to the slice and the ROI it started on: both are captured
+when the button goes down, so changing the displayed slice or the selected
+ROI mid-drag from elsewhere in the application cannot redirect the paint —
+or the commit — onto something the user was not looking at. The wheel
+resizes the brush while it is active, down to the same
+`MIN_BRUSH_SIZE_MM` floor `set_brush_size_mm` enforces.
+
 ## Bounding box
 
 ```python
@@ -507,8 +521,10 @@ state.set_rt_dose_image(dose_image)
 state.set_prescription_dose(60.0)  # 60 Gy
 
 # Customise isodose lines on the viewer itself ((Gy, colour) pairs).
-# Pass an empty list to hide all lines.
+# Pass an empty list to hide all lines, or None to go back to the
+# percentage-based default ladder.
 viewer.set_isodose_lines([(18.0, "#0000cc"), (54.0, "#ffcc00"), (60.0, "#ff0000")])
+viewer.set_isodose_lines(None)  # back to 30 / 50 / 70 / 80 / 90 / 95 / 100 %
 ```
 
 Levels are normally chosen as percentages of a reference dose rather than in
@@ -645,6 +661,14 @@ Only rigid registrations can be written: a deformation is a displacement
 field and belongs to a different IOD, so `transform_to_matrix` raises
 `RegistrationExportError` rather than flattening one into a matrix.
 
+A registration written this way is read back by
+`tk_rt_viewer.io.find_reg_matrices` (and therefore applied automatically by
+`load_all_series` / `load_dcm_series`) when the file sits anywhere under the
+scanned directory. The reader takes the references from either
+`ReferencedImageSequence` or `ReferencedSeriesSequence`, and skips the
+identity item that names the fixed image's own frame of reference, so the
+fixed series is not handed a transform meaning "do not move".
+
 ## Layout modes
 
 The viewer supports three layout modes controlled via `state.set_layout_mode()`:
@@ -778,6 +802,18 @@ editing) runs on the main thread.
 `ContourPathCache` is internally locked, because the background build and the
 UI thread genuinely do write the same ROI concurrently: the overlay stores
 the paths for any slice it renders before the background build reaches it.
+Each ROI also carries a cache *epoch*, retired whenever its entries are
+invalidated. A background build passes the epoch it started from with every
+write, so paths computed against a mask or a reference geometry that has
+since been replaced are dropped instead of landing in the cache — which
+matters because ROI numbers restart at 1 for each new image, so a build left
+over from the previous one would otherwise write into the new image's ROI 1.
+
+`SliceViewerState`'s listener registry is locked for the same reason:
+`add_listener` / `remove_listener` run on the main thread while
+`contour_cache_built` is emitted from the build pool. The lock is released
+before any listener runs, so a listener remains free to subscribe or
+unsubscribe from inside its own callback.
 
 `load_rt_struct` decodes ROI masks sequentially by default; parallel
 decoding is opt-in via `max_workers` because rt-utils does not document

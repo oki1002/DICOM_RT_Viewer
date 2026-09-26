@@ -665,3 +665,32 @@ class TestPackagingMarker:
 
         marker = pathlib.Path(tk_rt_viewer.__file__).parent / "py.typed"
         assert marker.is_file()
+
+
+class TestResampleRequiresAPrimaryImage:
+    """Resampling without a reference grid must fail on this side of SimpleITK.
+
+    ``ResampleImageFilter.SetReferenceImage(None)`` fails somewhere inside
+    SimpleITK with a message naming neither the method nor the caller's
+    mistake, and the two entry points that reach it disagreed: the 4DCT one
+    refused early, the secondary-image one did not.
+    """
+
+    @staticmethod
+    def _small_image() -> sitk.Image:
+        return sitk.GetImageFromArray(np.zeros((2, 4, 4), dtype=np.int16))
+
+    def test_get_resampled_image_raises_without_a_primary(self) -> None:
+        state = SliceViewerState()
+        with pytest.raises(RuntimeError, match="no primary image"):
+            state.get_resampled_image(self._small_image())
+
+    def test_setting_a_secondary_without_a_primary_raises(self) -> None:
+        state = SliceViewerState()
+        with pytest.raises(RuntimeError, match="no primary image"):
+            state.set_secondary_image_data(self._small_image())
+
+    def test_clearing_the_secondary_without_a_primary_is_allowed(self) -> None:
+        state = SliceViewerState()
+        state.set_secondary_image_data(None)  # must not raise
+        assert state.secondary_image is None

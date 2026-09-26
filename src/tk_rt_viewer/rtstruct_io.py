@@ -277,18 +277,26 @@ def load_rt_struct(
             rt_struct_path=str(rtstruct_path),
         )
         ds = pydicom.dcmread(str(rtstruct_path))
+        # Both sequences are read inside this guard, and through ``getattr``
+        # with an empty default. ``ROIContourSequence`` is conditional: a
+        # structure set that holds no contours at all may legitimately omit
+        # it, and ``ds.ROIContourSequence`` then raises a bare
+        # ``AttributeError`` — neither the empty dict nor the
+        # RtStructLoadError this function documents, leaving a caller with a
+        # third failure shape to handle.
+        roi_name_map: dict[int, str] = {
+            int(roi.ROINumber): str(roi.ROIName)
+            for roi in getattr(ds, "StructureSetROISequence", [])
+        }
+        roi_contours = list(getattr(ds, "ROIContourSequence", []))
     except Exception as exc:
         raise RtStructLoadError(
             f"Failed to create RTStructBuilder from '{rtstruct_path}': {exc}"
         ) from exc
 
-    roi_name_map: dict[int, str] = {
-        roi.ROINumber: roi.ROIName for roi in ds.StructureSetROISequence
-    }
-
     # Build a list of (roi_number, roi_name, color_hex) tuples for each ROI.
     roi_tasks: list[tuple[int, str, str]] = []
-    for roi_contour in ds.ROIContourSequence:
+    for roi_contour in roi_contours:
         roi_number = int(roi_contour.ReferencedROINumber)
         roi_name = roi_name_map.get(roi_number, f"ROI_{roi_number}")
         color_hex = _extract_roi_color(roi_contour)
@@ -313,14 +321,18 @@ def load_rt_struct(
     name_counts = Counter(name for _, name, _ in roi_tasks)
     duplicate_names = {name for name, count in name_counts.items() if count > 1}
     lookup_name_by_number: dict[int, str] = {}
-    # Original ROIName values for every entry renamed below, so they can be
-    # restored once loading finishes. rtstruct.ds is the same dataset object
+    # Original ROIName values for every entry renamed below, paired with the
+    # entry itself so they can be restored once loading finishes. The pairing
+    # is by dataset object, not by ROINumber: a file with two entries sharing
+    # a ROINumber is malformed but does occur, and a number-keyed map would
+    # then restore one entry's name onto the other and lose the second
+    # original entirely. rtstruct.ds is the same dataset object
     # RTStructBuilder.create_from returned and that this function's caller
     # may still hold a reference to (or that a future change here might pass
     # on to a save path); leaving the temporary names in place after this
     # function returns would let them leak into anything that reads
     # ROIName off that dataset afterwards.
-    renamed_original: dict[int, str] = {}
+    renamed_original: list[tuple[Any, str]] = []
     if duplicate_names:
         logger.warning(
             f"RTSTRUCT '{rtstruct_path.name}' has duplicate ROI name(s) "
@@ -331,7 +343,7 @@ def load_rt_struct(
             if roi.ROIName in duplicate_names:
                 unique_name = f"__tk_rt_viewer_load_tmp_{roi.ROINumber}__"
                 lookup_name_by_number[int(roi.ROINumber)] = unique_name
-                renamed_original[int(roi.ROINumber)] = roi.ROIName
+                renamed_original.append((roi, roi.ROIName))
                 roi.ROIName = unique_name
 
     def _load_single_roi(
@@ -364,11 +376,8 @@ def load_rt_struct(
                 if progress_callback is not None:
                     progress_callback(completed, total_rois)
     finally:
-        if renamed_original:
-            for roi in rtstruct.ds.StructureSetROISequence:
-                original = renamed_original.get(int(roi.ROINumber))
-                if original is not None:
-                    roi.ROIName = original
+        for roi, original_name in renamed_original:
+            roi.ROIName = original_name
 
     logger.info(f"RTSTRUCT loaded: {len(structures)} ROIs.")
     return structures

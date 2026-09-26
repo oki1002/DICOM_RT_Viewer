@@ -14,7 +14,7 @@ import numpy as np
 import SimpleITK as sitk
 
 from tk_rt_viewer.rendering.render import GRAY_LUT, slice_to_rgba
-from tk_rt_viewer.state.viewer_cache import ViewerCacheManager
+from tk_rt_viewer.state.viewer_cache import ContourPathCache, ViewerCacheManager
 from tk_rt_viewer.state.viewer_state import SliceViewerState
 
 
@@ -125,7 +125,7 @@ class TestContourBuildSkipEmpty:
 
         mgr = ViewerCacheManager(on_contour_built=lambda _n: None)
         mgr.register_mask_volume(1, sitk.GetImageFromArray(arr))
-        mgr.build_contour_paths_for_roi(1, ref, generation=mgr._generation)
+        mgr.build_contour_paths_for_roi(1, ref, epoch=mgr.contour_path_cache.epoch(1))
 
         # Every slice on every axis must have a cache entry (complete cache),
         # and non-empty slices must yield at least one path.
@@ -206,3 +206,56 @@ class TestLazyPhaseCache:
     def test_max_cached_phases_below_one_is_clamped(self) -> None:
         state = SliceViewerState(max_cached_phases=0)
         assert state.max_cached_phases == 1
+
+
+class TestContourCacheEpochs:
+    """A build overtaken by an invalidation must not write into the cache.
+
+    The manager used to hold a single generation counter that the build loop
+    checked between slices. Between such a check and the write that followed
+    it, an invalidation could land and the stale paths went in anyway — and
+    because ROI numbers restart at 1 for each new image, they went in under
+    a number the new image was about to use.
+    """
+
+    @staticmethod
+    def _mask_and_reference() -> tuple[sitk.Image, sitk.Image]:
+        arr = np.zeros((6, 12, 12), dtype=np.uint8)
+        arr[2:4, 4:8, 4:8] = 1
+        reference = sitk.GetImageFromArray(np.zeros((6, 12, 12), dtype=np.int16))
+        return sitk.GetImageFromArray(arr), reference
+
+    def test_a_write_from_a_retired_epoch_is_dropped(self) -> None:
+        cache = ContourPathCache()
+        epoch = cache.epoch(1)
+        cache.invalidate_roi(1)  # e.g. a brush-stroke commit
+
+        cache.set(1, "axial", 0, ["stale"], epoch=epoch)
+
+        assert cache.get(1, "axial", 0) is None
+
+    def test_an_epoch_is_never_reissued_after_a_clear(self) -> None:
+        """ROI numbers are reused across images; epochs must not be."""
+        cache = ContourPathCache()
+        first = cache.epoch(1)
+        cache.clear()
+        assert cache.epoch(1) != first
+
+    def test_a_write_without_an_epoch_is_unconditional(self) -> None:
+        """The UI thread computes and stores in one breath; nothing to check."""
+        cache = ContourPathCache()
+        cache.set(1, "axial", 0, ["fresh"])
+        assert cache.get(1, "axial", 0) == ["fresh"]
+
+    def test_a_build_after_an_invalidation_writes_nothing(self) -> None:
+        mask, reference = self._mask_and_reference()
+        mgr = ViewerCacheManager(on_contour_built=lambda _n: None)
+        mgr.register_mask_volume(1, mask)
+        epoch = mgr.contour_path_cache.epoch(1)
+
+        # The invalidation lands before the (already scheduled) build runs.
+        mgr.invalidate_roi(1)
+        mgr.register_mask_volume(1, mask)
+        mgr.build_contour_paths_for_roi(1, reference, epoch)
+
+        assert len(mgr.contour_path_cache) == 0

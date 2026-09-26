@@ -16,7 +16,7 @@ from matplotlib.patches import Circle
 from scipy.ndimage import binary_fill_holes
 
 from ..protocols import ViewerHost
-from ..state.viewer_state import SliceViewerState
+from ..state.viewer_state import MIN_BRUSH_SIZE_MM, SliceViewerState
 
 if TYPE_CHECKING:
     from .viewer_events import ViewerEventHandler
@@ -60,6 +60,8 @@ class BrushEventHandler:
         # does not re-slice the mask volume on every motion event during
         # a stroke.
         self._stroke_slice_shape: tuple[int, int] | None = None
+        # Slice index the stroke is painting into, captured at press time.
+        self._stroke_index: int | None = None
 
         self._cached_mask_volume: np.ndarray | None = None
         self._cached_roi_number: int | None = None
@@ -174,6 +176,12 @@ class BrushEventHandler:
         self._is_dragging = True
         self._button = event.button
         self._active_axis = axis
+        # Pinned for the whole stroke, like _stroke_radii_px below. Reading
+        # state.indices afresh on every write meant a slice change mid-drag
+        # — an arrow key, or a host widget moving the slice from elsewhere —
+        # silently redirected the rest of the stroke, and the final commit,
+        # onto a slice the user never painted on.
+        self._stroke_index = self.state.indices[axis]
 
         mask_slice = self.state.get_slice_data(mask_image, self._active_axis)
         self._stroke_mask = np.zeros_like(mask_slice, dtype=bool)
@@ -293,11 +301,17 @@ class BrushEventHandler:
         self._reset_stroke()
 
     def handle_scroll(self, event) -> None:
-        """Adjust the brush size by 1 mm per scroll step."""
+        """Adjust the brush size by 1 mm per scroll step.
+
+        The floor is the state's own :data:`MIN_BRUSH_SIZE_MM` rather than a
+        number of this module's choosing: a second, larger floor here made
+        the smallest reachable brush depend on whether the user got there by
+        scrolling or through a host's size control.
+        """
         if not self._hover.current_axis or not self.is_active:
             return
         new_size = self.state.brush_size_mm + 1.0 * np.sign(event.step)
-        self.state.set_brush_size_mm(max(1.0, new_size))
+        self.state.set_brush_size_mm(max(MIN_BRUSH_SIZE_MM, new_size))
         self._update_brush_cursor(event)
 
     # ------------------------------------------------------------------
@@ -496,13 +510,22 @@ class BrushEventHandler:
     # Cache helpers
     # ------------------------------------------------------------------
     def _make_slobj(self, axis: str) -> tuple:
-        """Return a 3-D index tuple selecting the current slice along *axis*.
+        """Return a 3-D index tuple selecting this stroke's slice along *axis*.
 
         Equivalent to ``[slice(None), slice(None), slice(None)]`` with the
-        dimension for *axis* replaced by the current slice index.
+        dimension for *axis* replaced by the slice index.
+
+        The index is the one pinned at press time whenever a stroke is in
+        progress (see :meth:`handle_press`), and the current one otherwise —
+        so a caller outside a stroke still gets the slice on screen.
         """
+        index = (
+            self._stroke_index
+            if self._stroke_index is not None
+            else self.state.indices[axis]
+        )
         slobj: list = [slice(None)] * 3
-        slobj[self.state.axis_to_numpy_index(axis)] = self.state.indices[axis]
+        slobj[self.state.axis_to_numpy_index(axis)] = index
         return tuple(slobj)
 
     def _reset_stroke(self) -> None:
@@ -517,6 +540,7 @@ class BrushEventHandler:
         self._stroke_mask = None
         self._stroke_radii_px = None
         self._stroke_slice_shape = None
+        self._stroke_index = None
         self._last_pos_px = None
         self._button = None
         self._discard_cache()

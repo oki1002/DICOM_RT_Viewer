@@ -63,6 +63,7 @@ Performance notes:
 
 import contextlib
 import logging
+import pathlib
 import tkinter as tk
 from collections.abc import Callable, Mapping
 from tkinter import ttk
@@ -188,6 +189,9 @@ class DicomViewer(ttk.Frame):
         self.toolbar.update()
         self.toolbar.pack(side=tk.BOTTOM, fill=tk.X)
 
+        # Set before the Scale exists: ttk.Scale.set below fires the command
+        # immediately, so the flag has to be readable from the first callback.
+        self._syncing_blend_slider: bool = False
         self._blend_frame = ttk.Frame(self)
         ttk.Label(self._blend_frame, text="Blend Alpha").pack(side=tk.LEFT, padx=5)
         self.blend_slider = ttk.Scale(
@@ -589,7 +593,19 @@ class DicomViewer(ttk.Frame):
         self._compositor.schedule_rebuild()
 
     def _on_blend_alpha_changed(self, alpha: float) -> None:
-        self.blend_slider.set(alpha)
+        # ttk.Scale.set fires the widget's own command, which calls back into
+        # set_blend_alpha. The value survives the round trip through Tk as a
+        # string, so it usually compares equal there and the echo stops of its
+        # own accord — but a value that does not round-trip exactly (a drag
+        # delta such as 0.3333333) writes back a hair-different alpha,
+        # rebuilds both LUTs a second time and re-windows every slice for
+        # nothing. The flag ends the echo at the first hop instead of relying
+        # on float equality to end it at the second.
+        self._syncing_blend_slider = True
+        try:
+            self.blend_slider.set(alpha)
+        finally:
+            self._syncing_blend_slider = False
         # The blend alpha is baked into the secondary LUT and the isodose fill
         # colormap; rebuild both, then re-window the current slices.
         self.image_layer.rebuild_secondary_lut()
@@ -831,6 +847,8 @@ class DicomViewer(ttk.Frame):
         self._rebuild_layout(mode)
 
     def _on_blend_slider_change(self, value: str) -> None:
+        if self._syncing_blend_slider:
+            return
         self.viewer_state.set_blend_alpha(float(value))
 
     # ------------------------------------------------------------------
@@ -879,7 +897,11 @@ class DicomViewer(ttk.Frame):
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def load_ct(self, ct_dir: Any, window: tuple[float, float] | None = None) -> None:
+    def load_ct(
+        self,
+        ct_dir: str | pathlib.Path,
+        window: tuple[float, float] | None = None,
+    ) -> None:
         """Load a DICOM CT series from *ct_dir* and display it.
 
         Window / level is taken from the DICOM metadata via
@@ -889,6 +911,11 @@ class DicomViewer(ttk.Frame):
             ct_dir: Path to the DICOM folder.
             window: Optional ``(window_width, window_level)`` override.
         """
+        # Normalised here rather than passed through as given: the state
+        # stores it as ``primary_image_dir``, typed as a Path, and a host
+        # that hands in a plain string should not be the reason that field
+        # holds one of two different types depending on the caller.
+        ct_dir = pathlib.Path(ct_dir)
         info = load_dcm_series(ct_dir)
         self.viewer_state.set_primary_image_data(info["sitk_image"], image_dir=ct_dir)
         ww, wl = window if window is not None else info["window_level"]
@@ -922,16 +949,22 @@ class DicomViewer(ttk.Frame):
             raise ValueError("set_secondary_window requires both vmin and vmax.")
         self.viewer_state.set_secondary_window_level(clim_to_window_level((vmin, vmax)))
 
-    def set_isodose_lines(self, gy_pairs: list[tuple[float, str]]) -> None:
+    def set_isodose_lines(self, gy_pairs: list[tuple[float, str]] | None) -> None:
         """Dynamically update IsoDose level definitions and trigger a redraw.
 
         Intended to be called as a callback from an IsoDose settings dialog.
 
         Args:
             gy_pairs: A list of (Gy value, hex colour string) tuples, sorted
-                ascending. Passing an empty list hides all IsoDose display.
+                ascending. An empty list hides all IsoDose display; ``None``
+                restores the percentage-based default ladder
+                (:data:`~tk_rt_viewer.isodose_levels.DEFAULT_ISODOSE_LEVELS`).
+                The two are kept distinct because collapsing them — as an
+                earlier version did by testing the list's truthiness — left a
+                host that had once set custom levels with no way back to the
+                defaults through the public API at all.
         """
-        self.isodose.set_custom_levels(list(gy_pairs) if gy_pairs else [])
+        self.isodose.set_custom_levels(None if gy_pairs is None else list(gy_pairs))
 
         if self.viewer_state.rt_dose_resampled is not None:
             for axis in self.axs:

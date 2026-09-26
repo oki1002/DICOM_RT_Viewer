@@ -48,6 +48,22 @@ class ContourPathCache:
           Call this when the primary image or the entire structure set is
           replaced.
 
+    Epochs:
+        Either invalidation can happen while a background build for that ROI
+        is still running, and a build cannot be interrupted mid-flight. Each
+        ROI therefore carries an *epoch*, a number drawn from a
+        monotonically increasing counter and issued afresh the first time the
+        ROI is seen after an invalidation. A writer that passes the epoch it
+        started from (see
+        :meth:`ViewerCacheManager.build_contour_paths_for_roi`) has its write
+        dropped once that epoch is no longer current, so paths computed
+        against a mask or a reference geometry that has since been replaced
+        cannot land in the cache. The counter is never reset, so an epoch is
+        never reissued — which matters because ROI numbers *are* reused:
+        loading a new image restarts them at 1, and a plain per-ROI
+        "changed?" flag would let a build from the previous image's ROI 1
+        write into the new one's.
+
     Thread safety:
         Every method takes a lock. Writes come from two directions at once —
         the background contour-build pool pre-computes whole ROIs while the
@@ -67,7 +83,32 @@ class ContourPathCache:
         # Nested per-ROI so invalidate_roi is O(1) (a flat dict required
         # a full key scan).
         self._cache: dict[int, dict[tuple[str, int], list]] = {}
+        # { roi_number: epoch }. Dropped alongside the entries themselves, so
+        # the next lookup issues a fresh epoch from the counter below.
+        self._epochs: dict[int, int] = {}
+        self._next_epoch: int = 0
         self._lock = threading.Lock()
+
+    def epoch(self, roi_number: int) -> int:
+        """Return the current cache epoch for *roi_number*.
+
+        Snapshot this before starting a long build and pass it back to
+        :meth:`set`; see the class docstring.
+        """
+        with self._lock:
+            return self._epoch_locked(roi_number)
+
+    def _epoch_locked(self, roi_number: int) -> int:
+        """Return *roi_number*'s epoch, issuing one if it has none.
+
+        Caller must hold ``self._lock``.
+        """
+        epoch = self._epochs.get(roi_number)
+        if epoch is None:
+            epoch = self._next_epoch
+            self._next_epoch += 1
+            self._epochs[roi_number] = epoch
+        return epoch
 
     def get(self, roi_number: int, axis: str, index: int) -> list | None:
         """Return cached paths, or ``None`` when the entry is absent."""
@@ -77,20 +118,45 @@ class ContourPathCache:
                 return None
             return roi_cache.get((axis, index))
 
-    def set(self, roi_number: int, axis: str, index: int, paths: list) -> None:
-        """Store *paths* for the given key."""
+    def set(
+        self,
+        roi_number: int,
+        axis: str,
+        index: int,
+        paths: list,
+        epoch: int | None = None,
+    ) -> None:
+        """Store *paths* for the given key.
+
+        Args:
+            roi_number: ROI the paths belong to.
+            axis:       View axis.
+            index:      Slice index along *axis*.
+            paths:      The computed paths.
+            epoch:      The epoch the caller started from, when it is a
+                background build that may have been overtaken by an
+                invalidation. The write is dropped when that epoch is no
+                longer current. ``None`` (the default) writes
+                unconditionally, which is what the UI thread wants: it
+                computes from the mask as it stands and stores it in the same
+                breath, so there is no window for it to be stale in.
+        """
         with self._lock:
+            if epoch is not None and epoch != self._epoch_locked(roi_number):
+                return
             self._cache.setdefault(roi_number, {})[(axis, index)] = paths
 
     def invalidate_roi(self, roi_number: int) -> None:
-        """Remove all cached entries for *roi_number*."""
+        """Remove all cached entries for *roi_number* and retire its epoch."""
         with self._lock:
             self._cache.pop(roi_number, None)
+            self._epochs.pop(roi_number, None)
 
     def clear(self) -> None:
-        """Remove every cached entry."""
+        """Remove every cached entry and retire every epoch."""
         with self._lock:
             self._cache.clear()
+            self._epochs.clear()
 
     def __len__(self) -> int:
         with self._lock:
@@ -295,10 +361,6 @@ class ViewerCacheManager:
         # recreating a new executor (and leaking a thread pool that is
         # never closed) after the manager has been torn down.
         self._closed: bool = False
-        # Incremented on every clear_all() to prevent an in-flight
-        # background task from writing into a stale generation's cache
-        # after an image switch.
-        self._generation: int = 0
 
     # ------------------------------------------------------------------
     # Image / dose array caches
@@ -438,7 +500,6 @@ class ViewerCacheManager:
         down permanently.
         """
         self.cancel_all_contour_builds()
-        self._generation += 1
         self.primary_array = None
         self.secondary_array = None
         self.dose_array = None
@@ -498,10 +559,10 @@ class ViewerCacheManager:
         argument covering its unlocked writes into ``contour_path_cache``.
         """
         self.cancel_contour_build(roi_number)
-        generation = self._generation
+        epoch = self.contour_path_cache.epoch(roi_number)
         executor = self._get_executor()
         future = executor.submit(
-            self.build_contour_paths_for_roi, roi_number, primary_image, generation
+            self.build_contour_paths_for_roi, roi_number, primary_image, epoch
         )
         with self._futures_lock:
             self._contour_futures[roi_number] = future
@@ -549,7 +610,7 @@ class ViewerCacheManager:
             future.cancel()
 
     def build_contour_paths_for_roi(
-        self, roi_number: int, primary_image: sitk.Image | None, generation: int
+        self, roi_number: int, primary_image: sitk.Image | None, epoch: int
     ) -> None:
         """Run ``find_contours`` for every axis and slice of *roi_number*.
 
@@ -561,12 +622,16 @@ class ViewerCacheManager:
             roi_number: Target ROI number.
             primary_image: Reference image used to derive the physical
                 coordinate extent of the contours.
-            generation: The generation number at the time this task was
-                scheduled. If ``clear_all`` (e.g. an image switch) occurs
-                while this task is running, it no longer matches the
-                current generation and subsequent cache writes are aborted.
-                This prevents paths computed with a stale extent from
-                leaking into a re-numbered ROI number for a new image.
+            epoch: The ROI's cache epoch when this task was scheduled (see
+                :class:`ContourPathCache`). An invalidation while this task
+                runs — an image switch, a brush-stroke commit — retires that
+                epoch, and every write below is then dropped. The loop also
+                checks it between slices so a superseded build stops doing
+                work rather than merely discarding it; the checks are an
+                optimisation, and correctness rests on the epoch being
+                re-tested inside ``ContourPathCache.set`` under its own lock,
+                which closes the window between a check here and the write
+                that follows it.
 
         Thread safety: ``contour_path_cache`` is internally locked, which is
         what makes the unsynchronised interleaving here safe. The UI thread
@@ -601,12 +666,12 @@ class ViewerCacheManager:
         cache = self.contour_path_cache
 
         for axis in AXES:
-            if self._generation != generation:
+            if cache.epoch(roi_number) != epoch:
                 return
             x0, x1, y0, y1 = compute_extent(primary_image, axis)
             occupied = nonzero_indices[axis]
             for idx in range(n_slices[axis]):
-                if self._generation != generation:
+                if cache.epoch(roi_number) != epoch:
                     return
                 if cache.get(roi_number, axis, idx) is not None:
                     continue
@@ -615,13 +680,13 @@ class ViewerCacheManager:
                 # find_contours. ``idx`` can exceed len(occupied) only if the
                 # mask and reference geometry disagree; treat as empty.
                 if idx >= occupied.shape[0] or not occupied[idx]:
-                    cache.set(roi_number, axis, idx, [])
+                    cache.set(roi_number, axis, idx, [], epoch=epoch)
                     continue
 
                 mask_slice = slice_along_axis(arr, axis, idx)
                 if mask_slice.shape[0] < 2 or mask_slice.shape[1] < 2:
-                    cache.set(roi_number, axis, idx, [])
+                    cache.set(roi_number, axis, idx, [], epoch=epoch)
                     continue
 
                 paths = mask_slice_to_paths(mask_slice, x0, x1, y0, y1)
-                cache.set(roi_number, axis, idx, paths)
+                cache.set(roi_number, axis, idx, paths, epoch=epoch)

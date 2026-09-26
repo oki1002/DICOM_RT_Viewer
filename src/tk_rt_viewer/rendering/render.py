@@ -78,7 +78,16 @@ def slice_to_rgba(
         reuses the same buffer.
     """
     span = max(float(vmax) - float(vmin), 1e-6)
-    indices = np.clip((data - vmin) * (255.0 / span), 0.0, 255.0).astype(np.uint8)
+    # Written as three in-place steps on one float32 scratch rather than as
+    # the expression ``np.clip((data - vmin) * (255.0 / span), 0, 255)``,
+    # which allocates a full-slice temporary at each of its three stages and
+    # promotes an int16 CT slice to float64 while doing it. Reusing the RGBA
+    # buffer via *out* below while still paying four allocations here left
+    # most of the per-frame allocation cost in place.
+    scaled = np.subtract(data, vmin, dtype=np.float32)
+    scaled *= 255.0 / span
+    np.clip(scaled, 0.0, 255.0, out=scaled)
+    indices = scaled.astype(np.uint8)
     expected_shape = (data.shape[0], data.shape[1], 4)
     if out is not None and out.shape == expected_shape and out.dtype == np.uint8:
         # np.take with out= writes directly into the reused buffer, avoiding
@@ -90,7 +99,7 @@ def slice_to_rgba(
         # change.
         np.take(lut, indices, axis=0, out=out, mode="clip")
         return out
-    return lut[indices]
+    return np.asarray(lut[indices])
 
 
 def window_level_to_clim(window_level: tuple[float, float]) -> tuple[float, float]:

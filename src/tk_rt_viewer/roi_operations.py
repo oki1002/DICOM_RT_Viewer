@@ -304,7 +304,7 @@ def _margin_sampling(
     floor = reference_radius * _MIN_RADIUS_RATIO
     scaled = tuple(
         sp * reference_radius / max(radius, floor)
-        for sp, radius in zip(spacing, radii_mm, strict=False)
+        for sp, radius in zip(spacing, radii_mm, strict=True)
     )
     return (scaled[2], scaled[1], scaled[0])
 
@@ -327,7 +327,7 @@ def _margin_bounds(
     if any(indices.size == 0 for indices in occupied):
         return None
     bounds = []
-    for indices, pad, extent in zip(occupied, pad_voxels, mask.shape, strict=False):
+    for indices, pad, extent in zip(occupied, pad_voxels, mask.shape, strict=True):
         lo = max(0, int(indices[0]) - pad)
         hi = min(extent, int(indices[-1]) + pad + 1)
         bounds.append(slice(lo, hi))
@@ -435,7 +435,7 @@ def apply_margin(mask_image: sitk.Image, config: MarginConfig) -> sitk.Image:
 
     # Reach of the operation in voxels per axis, used to size the working
     # sub-volume. Only a dilation can reach outside the mask's bounding box.
-    reach_mm = [radius + abs(off) for radius, off in zip(radii, offset, strict=False)]
+    reach_mm = [radius + abs(off) for radius, off in zip(radii, offset, strict=True)]
     pad_voxels = (
         int(np.ceil(reach_mm[2] / spacing[2])) + 2 if expand else 2,
         int(np.ceil(reach_mm[1] / spacing[1])) + 2 if expand else 2,

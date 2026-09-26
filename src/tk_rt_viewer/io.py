@@ -256,6 +256,32 @@ def _scan_dicom_tree(dcm_root_dir: str | pathlib.Path) -> _ScanResult:
     return scan
 
 
+def _referenced_sop_uids(reg_item: pydicom.Dataset) -> list[str]:
+    """Return every SOP Instance UID one Registration Sequence item refers to.
+
+    ``ReferencedImageSequence`` is optional, and an object that records its
+    references only under ``ReferencedSeriesSequence`` is equally valid —
+    including the ones :func:`tk_rt_viewer.reg_io.save_registration` writes.
+    Reading both is what makes a registration written by this package
+    loadable again by :func:`find_reg_matrices`; reading only the former
+    also raised ``AttributeError`` on any file that omitted it, which is
+    exactly the per-file failure :func:`_collect_reg_matrices` exists to
+    contain.
+    """
+    uids = [
+        str(item.ReferencedSOPInstanceUID)
+        for item in getattr(reg_item, "ReferencedImageSequence", [])
+        if "ReferencedSOPInstanceUID" in item
+    ]
+    for series in getattr(reg_item, "ReferencedSeriesSequence", []):
+        uids.extend(
+            str(item.ReferencedSOPInstanceUID)
+            for item in getattr(series, "ReferencedInstanceSequence", [])
+            if "ReferencedSOPInstanceUID" in item
+        )
+    return uids
+
+
 def _collect_reg_matrices(
     ds: pydicom.Dataset,
     file: pathlib.Path,
@@ -265,7 +291,16 @@ def _collect_reg_matrices(
 
     A single malformed REG file (missing sequence, singular matrix, ...) must
     not abort loading of every other series in the tree, so failures here are
-    logged and skipped rather than propagated.
+    logged and skipped rather than propagated. Every per-item attribute
+    access therefore has to sit inside the guard below, reference lookup
+    included.
+
+    Identity matrices are skipped. A Spatial Registration object names the
+    frame of reference it registers *to* with an identity item of its own
+    (see :func:`tk_rt_viewer.reg_io.save_registration`), and attaching that
+    to the fixed series would give it a transform that says "do not move" —
+    indistinguishable, at every later call site, from a series that really
+    was registered.
     """
     try:
         reg_sequence = ds[0x0070, 0x0308].value
@@ -278,14 +313,25 @@ def _collect_reg_matrices(
             matrix = np.array(
                 reg_item.MatrixRegistrationSequence[0]
                 .MatrixSequence[0]
-                .FrameOfReferenceTransformationMatrix
+                .FrameOfReferenceTransformationMatrix,
+                dtype=float,
             ).reshape(4, 4)
             inv_matrix = np.linalg.inv(matrix)
-        except (AttributeError, IndexError, KeyError, np.linalg.LinAlgError) as exc:
+            referenced = _referenced_sop_uids(reg_item)
+        except (
+            AttributeError,
+            IndexError,
+            KeyError,
+            ValueError,
+            np.linalg.LinAlgError,
+        ) as exc:
             logger.warning(f"Failed to parse REG matrix in '{file}': {exc}")
             continue
-        for ref_item in reg_item.ReferencedImageSequence:
-            reg_matrices[ref_item.ReferencedSOPInstanceUID] = inv_matrix
+
+        if np.allclose(matrix, np.eye(4)):
+            continue
+        for sop_uid in referenced:
+            reg_matrices[sop_uid] = inv_matrix
 
 
 # ---------------------------------------------------------------------------

@@ -106,8 +106,8 @@ class Box3D:
             ]
         )
         return cls(
-            lower=_as_point(corners.min(axis=0)),
-            upper=_as_point(corners.max(axis=0)),
+            lower=as_point(corners.min(axis=0)),
+            upper=as_point(corners.max(axis=0)),
         )
 
     @classmethod
@@ -132,7 +132,7 @@ class Box3D:
         high_point = image.TransformContinuousIndexToPhysicalPoint(
             [float(v) for v in upper]
         )
-        return cls(lower=_as_point(low_point), upper=_as_point(high_point))
+        return cls(lower=as_point(low_point), upper=as_point(high_point))
 
     # ------------------------------------------------------------------
     # Derived values
@@ -157,7 +157,7 @@ class Box3D:
         """Return a copy with physical dimension *dim* (0=x, 1=y, 2=z) replaced."""
         lower, upper = list(self.lower), list(self.upper)
         lower[dim], upper[dim] = min(low, high), max(low, high)
-        return Box3D(lower=_as_point(lower), upper=_as_point(upper))
+        return Box3D(lower=as_point(lower), upper=as_point(upper))
 
     def with_view_rect(
         self, axis: str, rect: tuple[float, float, float, float]
@@ -225,12 +225,16 @@ class Box3D:
         )
 
 
-def _as_point(values) -> tuple[float, float, float]:
+def as_point(values) -> tuple[float, float, float]:
     """Return the first three elements of *values* as a 3-element float tuple.
 
     SimpleITK's point APIs and NumPy reductions both return sequences of
     unspecified length; building a tuple from one directly widens it to
     ``tuple[float, ...]`` and loses the 3-D shape this module works in.
+
+    Public rather than underscore-prefixed: ``registration.session`` and
+    ``registration.template`` both need it, and a name that says "private"
+    while two other modules import it documents the opposite of the truth.
     """
     return (float(values[0]), float(values[1]), float(values[2]))
 

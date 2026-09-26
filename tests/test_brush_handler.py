@@ -22,7 +22,7 @@ import numpy as np
 import SimpleITK as sitk
 
 from tk_rt_viewer.event_controllers.brush_handler import BrushEventHandler
-from tk_rt_viewer.state.viewer_state import SliceViewerState
+from tk_rt_viewer.state.viewer_state import MIN_BRUSH_SIZE_MM, SliceViewerState
 
 
 class _FakeViewer:
@@ -69,10 +69,17 @@ class _FakeHover:
 class _Event:
     """Minimal stand-in for a matplotlib MouseEvent."""
 
-    def __init__(self, xdata: float | None, ydata: float | None, button: int = 1):
+    def __init__(
+        self,
+        xdata: float | None,
+        ydata: float | None,
+        button: int = 1,
+        step: float = 0.0,
+    ):
         self.xdata = xdata
         self.ydata = ydata
         self.button = button
+        self.step = step
 
 
 def _make_mask(primary_image: sitk.Image) -> sitk.Image:
@@ -349,3 +356,75 @@ class TestDeactivateAbandonsInProgressStroke:
             assert handler._stroke_mask is None
         finally:
             plt.close(fig)
+
+
+class TestStrokeIsPinnedToItsSlice:
+    """A stroke must stay on the slice it started on.
+
+    ``_make_slobj`` used to read ``state.indices`` afresh on every write, so
+    a slice change while the button was held — an arrow key, or a host
+    widget driving the index from elsewhere — silently redirected the rest
+    of the stroke and the final commit onto a slice the user never painted
+    on.
+    """
+
+    @staticmethod
+    def _state_and_handler() -> tuple[SliceViewerState, int, BrushEventHandler]:
+        state = SliceViewerState()
+        img = sitk.GetImageFromArray(np.zeros((6, 16, 16), dtype=np.int16))
+        img.SetSpacing((1.0, 1.0, 1.0))
+        state.set_primary_image_data(img)
+        roi_number = state.add_contour("PTV", _make_mask(img), "#ff0000")
+        state.set_selected_roi(roi_number)
+        state.set_brush_size_mm(3.0)
+        hover = _FakeHover()
+        hover.current_axis = "axial"
+        return state, roi_number, BrushEventHandler(state, _FakeViewer(), hover)
+
+    def test_commit_lands_on_the_slice_the_press_started_on(self) -> None:
+        state, roi_number, handler = self._state_and_handler()
+        handler.activate()
+        state.set_index("axial", 2)
+        start_index = state.indices["axial"]
+
+        event = _Event(xdata=8.0, ydata=8.0)
+        handler.handle_press(event)
+        # The host moves the slice while the button is still held.
+        state.set_index("axial", 5)
+        handler.handle_release(event)
+
+        painted = sitk.GetArrayFromImage(state.structure_set.get_mask(roi_number))
+        assert painted[start_index].any()
+        assert not painted[5].any()
+
+    def test_pinned_index_is_released_with_the_stroke(self) -> None:
+        state, _, handler = self._state_and_handler()
+        handler.activate()
+        event = _Event(xdata=8.0, ydata=8.0)
+        handler.handle_press(event)
+        assert handler._stroke_index is not None
+        handler.handle_release(event)
+        assert handler._stroke_index is None
+
+
+class TestScrollHonoursTheStateMinimum:
+    """Scrolling down must not stop above the state's own minimum radius.
+
+    The handler used to clamp at a hardcoded 1.0 mm, so the smallest
+    reachable brush depended on whether the user got there by scrolling or
+    through a host's size control.
+    """
+
+    def test_scrolling_down_reaches_the_state_minimum(self) -> None:
+        state = SliceViewerState()
+        img = sitk.GetImageFromArray(np.zeros((4, 8, 8), dtype=np.int16))
+        state.set_primary_image_data(img)
+        state.set_brush_size_mm(1.0)
+        hover = _FakeHover()
+        hover.current_axis = "axial"
+        handler = BrushEventHandler(state, _FakeViewer(), hover)
+        handler.activate()
+
+        handler.handle_scroll(_Event(xdata=None, ydata=None, button=None, step=-1.0))
+
+        assert state.brush_size_mm == MIN_BRUSH_SIZE_MM

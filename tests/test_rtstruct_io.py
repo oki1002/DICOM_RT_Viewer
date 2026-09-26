@@ -446,3 +446,47 @@ class TestLoadRtStructDuplicateNames:
         rtstruct_io.load_rt_struct(ct_dir="/ct", rtstruct_path="/rs.dcm")
 
         assert [roi.ROIName for roi in ds.StructureSetROISequence] == ["PTV", "PTV"]
+
+
+class TestLoadRtStructMissingSequences:
+    """A structure set with no contours must return ``{}``, not raise.
+
+    ``ROIContourSequence`` is conditional, so a structure set holding no
+    contours may omit it entirely. Reading it outside the guard that turns
+    parse failures into ``RtStructLoadError`` produced a bare
+    ``AttributeError`` — a third failure shape the documented contract does
+    not mention and no caller was written for.
+    """
+
+    class _EmptyDs:
+        """A dataset carrying neither ROI sequence."""
+
+    class _FakeRTStruct:
+        def __init__(self, ds) -> None:
+            self.ds = ds
+
+        def get_roi_mask_by_name(self, name: str):  # pragma: no cover - unused
+            raise AssertionError("no ROI should be requested")
+
+    def _patch(self, monkeypatch, ds) -> None:
+        monkeypatch.setattr(
+            rtstruct_io.RTStructBuilder,
+            "create_from",
+            lambda **kw: self._FakeRTStruct(ds),
+        )
+        monkeypatch.setattr(rtstruct_io.pydicom, "dcmread", lambda *a, **kw: ds)
+
+    def test_missing_roi_contour_sequence_returns_empty(self, monkeypatch) -> None:
+        self._patch(monkeypatch, self._EmptyDs())
+        result = rtstruct_io.load_rt_struct(ct_dir="/ct", rtstruct_path="/rs.dcm")
+        assert result == {}
+
+    def test_an_unreadable_file_still_raises_rtstruct_load_error(
+        self, monkeypatch
+    ) -> None:
+        def _boom(**kwargs):
+            raise OSError("truncated")
+
+        monkeypatch.setattr(rtstruct_io.RTStructBuilder, "create_from", _boom)
+        with pytest.raises(rtstruct_io.RtStructLoadError):
+            rtstruct_io.load_rt_struct(ct_dir="/ct", rtstruct_path="/rs.dcm")

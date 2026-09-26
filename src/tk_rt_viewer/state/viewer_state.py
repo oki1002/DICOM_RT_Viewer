@@ -52,6 +52,7 @@ Collaborators:
 
 import logging
 import pathlib
+import threading
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -120,8 +121,10 @@ WINDOW_LEVEL_TARGETS: tuple[str, ...] = ("primary", "secondary")
 
 #: Smallest brush radius the state will accept, in mm. A radius of zero (or
 #: less) divides by zero in the stroke-interpolation step of the brush, so it
-#: is clamped here rather than guarded at every consumer
-_MIN_BRUSH_SIZE_MM: float = 0.1
+#: is clamped here rather than guarded at every consumer. Public because the
+#: brush handler's own scroll-to-resize clamp has to agree with it; it
+#: previously hardcoded a different floor of its own
+MIN_BRUSH_SIZE_MM: float = 0.1
 
 
 @dataclass(eq=False)
@@ -262,6 +265,13 @@ class SliceViewerState:
     # listeners fire in a deterministic, registration order.
     _listeners: dict[str, dict[Callable, None]] = field(
         init=False, repr=False, default_factory=lambda: defaultdict(dict)
+    )
+    # Guards _listeners. Registration happens on the main thread, but
+    # "contour_cache_built" is fired from the background contour-build pool,
+    # so the two genuinely do touch this registry concurrently. See _notify
+    # for why the lock is not held while listeners run.
+    _listeners_lock: threading.Lock = field(
+        init=False, repr=False, default_factory=threading.Lock
     )
 
     # Cache for get_extent() results, keyed by axis name.
@@ -483,19 +493,27 @@ class SliceViewerState:
     # =========================================================
     def add_listener(self, event_type: str, listener: Callable) -> None:
         """Register *listener* to be called when *event_type* is emitted."""
-        self._listeners[event_type][listener] = None
+        with self._listeners_lock:
+            self._listeners[event_type][listener] = None
 
     def remove_listener(self, event_type: str, listener: Callable) -> None:
         """Unregister *listener* from *event_type*. No-op if not registered."""
-        registered = self._listeners.get(event_type)
-        if registered is not None:
-            registered.pop(listener, None)
+        with self._listeners_lock:
+            registered = self._listeners.get(event_type)
+            if registered is not None:
+                registered.pop(listener, None)
 
     def _notify(self, event_type: str, *args, **kwargs) -> None:
         """Call every listener registered for *event_type*.
 
-        The listener set is snapshotted so a listener that mutates the
-        registry during iteration does not raise RuntimeError.
+        The listener set is snapshotted under the registry lock so that
+        neither a listener that mutates the registry during iteration nor a
+        concurrent :meth:`add_listener` / :meth:`remove_listener` on another
+        thread can raise ``RuntimeError``. The lock is released before any
+        listener runs: ``contour_cache_built`` is emitted from the
+        contour-build pool while the main thread may be subscribing, but a
+        listener is free to subscribe or unsubscribe from inside its own
+        callback, and holding the lock across the calls would deadlock that.
 
         Raises:
             ValueError: If *event_type* is not one of the names declared in
@@ -509,9 +527,12 @@ class SliceViewerState:
                 f"Unknown event type: {event_type!r}. "
                 f"See tk_rt_viewer.events for the full list."
             )
-        # .get rather than the defaultdict's __getitem__: firing an event that
-        # nobody listens for should not grow the registry with an empty entry.
-        for listener in list(self._listeners.get(event_type, ())):
+        with self._listeners_lock:
+            # .get rather than the defaultdict's __getitem__: firing an event
+            # nobody listens for should not grow the registry with an empty
+            # entry.
+            listeners = list(self._listeners.get(event_type, ()))
+        for listener in listeners:
             try:
                 listener(*args, **kwargs)
             except Exception:
@@ -706,7 +727,21 @@ class SliceViewerState:
 
         Returns:
             A ``sitk.Image`` resampled to the primary image grid.
+
+        Raises:
+            RuntimeError: If no primary image is loaded. Without this,
+                ``SetReferenceImage(None)`` fails somewhere inside SimpleITK
+                with a message that names neither this method nor the
+                caller's mistake, and the two public entry points that reach
+                here (:meth:`set_secondary_image_data` and
+                :meth:`set_active_phase_as_secondary`) disagreed on the
+                matter — the phase one already refused early.
         """
+        if self.primary_image is None:
+            raise RuntimeError(
+                "Cannot resample: no primary image is loaded, so there is no "
+                "reference grid to resample onto."
+            )
         resample = sitk.ResampleImageFilter()
         resample.SetReferenceImage(self.primary_image)
         resample.SetInterpolator(sitk.sitkLinear)
@@ -769,16 +804,27 @@ class SliceViewerState:
         self._dose.clear()
         object.__setattr__(self, "prescription_dose", None)
 
+        # Discard every performance cache and cancel in-flight background
+        # builds. This happens *before* the first notification, not after:
+        # self.primary_image already points at the new image here, while the
+        # extent cache and the array caches still describe the old one, and a
+        # listener for either event below re-renders from both
+        # (ContourOverlay.draw reads get_extent, DvhPanel.update reads the
+        # dose volume cache). Today the active set is empty by this point so
+        # nothing is actually drawn from the stale values, which makes the
+        # ordering a latent trap rather than a live bug — the comment above
+        # promises listeners a consistent state, so the code should give them
+        # one rather than depend on there being nothing to be inconsistent
+        # about.
+        self._cache.clear_all()
+        self._invalidate_extent_cache()
+
         # A host application mirroring the ROI list off these two events (a
         # listbox, a legend) would otherwise keep showing the previous
         # image's ROIs after this reset: none of the 3 notifications later
         # in this method names either one.
         self._notify(ALL_CONTOURS_CHANGED, self.structure_set)
         self._notify(ACTIVE_CONTOURS_CHANGED, frozenset())
-
-        # Discard every performance cache and cancel in-flight background builds.
-        self._cache.clear_all()
-        self._invalidate_extent_cache()
 
         # Clamp the slice indices to the new image's bounds *before* firing any
         # notification, and build the array cache immediately.
@@ -848,6 +894,11 @@ class SliceViewerState:
                 the primary grid. The default is air-equivalent HU; an
                 overlay on another intensity scale (PET, an MR, a dose map in
                 Gy) usually wants ``0.0``.
+
+        Raises:
+            RuntimeError: If *image* is given while no primary image is
+                loaded, since there is no grid to resample the overlay onto.
+                Clearing the overlay (``image=None``) is always allowed.
         """
         self.secondary_image = self._secondary.set_source(image, transform, fill_value)
         if image is not None:
@@ -1651,13 +1702,13 @@ class SliceViewerState:
     def set_brush_size_mm(self, size_mm: float) -> None:
         """Set the brush radius in millimetres.
 
-        Clamped to at least :data:`_MIN_BRUSH_SIZE_MM`: the brush converts its
+        Clamped to at least :data:`MIN_BRUSH_SIZE_MM`: the brush converts its
         radius to pixels and divides by it when interpolating between two
         motion events, so a zero or negative radius raises from inside the
         stroke rather than simply painting nothing. Clamping here means every
         consumer can assume a positive radius.
         """
-        size_mm = max(_MIN_BRUSH_SIZE_MM, float(size_mm))
+        size_mm = max(MIN_BRUSH_SIZE_MM, float(size_mm))
         if self.brush_size_mm != size_mm:
             object.__setattr__(self, "brush_size_mm", size_mm)
             self._notify(BRUSH_SIZE_MM_CHANGED, size_mm)

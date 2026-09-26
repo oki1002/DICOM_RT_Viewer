@@ -18,6 +18,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.colors import to_rgba
 from matplotlib.figure import Figure
 
+from tk_rt_viewer.isodose_levels import DEFAULT_ISODOSE_LEVELS, to_gy_pairs
 from tk_rt_viewer.rendering.blit_compositor import BlitCompositor
 from tk_rt_viewer.rendering.contour_overlay import ContourOverlay
 from tk_rt_viewer.rendering.drawing_manager import DrawingManager
@@ -493,6 +494,36 @@ class TestIsoDoseDownsampling:
         assert overlay.reference_dose() == pytest.approx(60.0)
         state.set_prescription_dose(50.0)
         assert overlay.reference_dose() == pytest.approx(50.0)
+
+
+class TestIsoDoseCustomLevels:
+    """An empty level list and ``None`` must not mean the same thing.
+
+    ``DicomViewer.set_isodose_lines`` used to test its argument for
+    truthiness, collapsing the two: a host that had once set custom levels
+    then had no way back to the default ladder through the public API.
+    """
+
+    @staticmethod
+    def _overlay() -> IsoDoseOverlay:
+        state = _loaded_state()
+        state.set_prescription_dose(60.0)
+        overlay = IsoDoseOverlay(state, on_artists_changed=lambda _axis: None)
+        return overlay
+
+    def test_an_empty_list_hides_every_level(self) -> None:
+        overlay = self._overlay()
+        overlay.set_custom_levels([])
+        assert overlay._resolve_levels() == []
+
+    def test_none_restores_the_default_ladder(self) -> None:
+        overlay = self._overlay()
+        overlay.set_custom_levels([(30.0, "#ffffff")])
+        assert overlay._resolve_levels() == [(30.0, "#ffffff")]
+
+        overlay.set_custom_levels(None)
+        restored = overlay._resolve_levels()
+        assert restored == to_gy_pairs(DEFAULT_ISODOSE_LEVELS, 60.0)
 
 
 class TestDoseSliceCachedStaysOnTheCtGrid:
