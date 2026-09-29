@@ -13,6 +13,13 @@ scan_dicom_series(dcm_root_dir) -> SeriesScan
     Enumerate the image series in a directory tree without reading pixel
     data, for a series picker.
 
+load_scanned_series(entry, reg_files=()) -> SeriesInfo
+    Load one series found by scan_dicom_series, reading only its own files.
+
+load_phase_series(phases, reg_files=(), max_workers=None)
+    -> dict[str, SeriesInfo]
+    Load the phases of a scanned 4DCT, reading only their own files.
+
 select_phase_series(all_series, phases) -> dict[str, SeriesInfo]
     Pick the 4DCT phases named by a scan result out of a load_all_series map.
 
@@ -42,8 +49,9 @@ import logging
 import math
 import pathlib
 import re
-from collections.abc import Iterator, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Iterable, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field, replace
 from typing import TypedDict
 
 import numpy as np
@@ -81,8 +89,17 @@ _NON_CT_WINDOW_PERCENTILES: tuple[float, float] = (0.5, 99.5)
 #: Width used for an image with a flat intensity range (no meaningful window).
 _FLAT_IMAGE_WINDOW_WIDTH: float = 1.0
 
+#: Upper bound on the worker threads :func:`load_phase_series` uses by default.
+#: Phases are read concurrently because reading is I/O bound and SimpleITK
+#: releases the GIL; more workers than this mostly contend for the disk.
+_DEFAULT_PHASE_LOAD_WORKERS: int = 4
+
 #: Modalities :func:`scan_dicom_series` lists by default.
 DEFAULT_SCAN_MODALITIES: frozenset[str] = frozenset({"CT", "MR", "PT", "RTDOSE"})
+
+
+#: ``(by_sop_instance_uid, by_series_instance_uid)`` registration matrices.
+type _RegMatrices = tuple[dict[str, np.ndarray], dict[str, np.ndarray]]
 
 
 class SeriesInfo(TypedDict):
@@ -327,6 +344,24 @@ class MultiplePatientError(ValueError):
     """
 
 
+class MixedSeriesDirectoryError(ValueError):
+    """A directory being scanned holds more than one image series.
+
+    Raised by :func:`scan_dicom_series` when *require_single_series_per_dir*
+    is set. Code that addresses a series by its directory (RT-STRUCT export
+    and import through rt-utils, for one) would silently mix the slices of
+    every image series in that directory.
+
+    Attributes:
+        directories: The offending directories, sorted.
+    """
+
+    def __init__(self, directories: Sequence[pathlib.Path]) -> None:
+        self.directories: tuple[pathlib.Path, ...] = tuple(sorted(directories))
+        listing = ", ".join(f"'{d}'" for d in self.directories)
+        super().__init__(f"Found more than one image series in: {listing}.")
+
+
 @dataclass(frozen=True)
 class PhaseEntry:
     """One respiratory phase of a 4DCT series.
@@ -335,11 +370,16 @@ class PhaseEntry:
         label:       Normalised phase label, e.g. ``"10%"``.
         description: The phase's own SeriesDescription.
         series_dir:  Directory holding the phase's files.
+        series_uid:  The phase's SeriesInstanceUID.
+        file_paths:  The phase's files in slice order (see
+            :attr:`SeriesEntry.file_paths`).
     """
 
     label: str
     description: str
     series_dir: pathlib.Path
+    series_uid: str = ""
+    file_paths: tuple[pathlib.Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -355,6 +395,9 @@ class SeriesEntry:
             directly, since a directory may hold several dose objects.
         phases:      The phases of a 4DCT series, lowest percentage first;
             empty for an ordinary series.
+        file_paths:  Every file of the series, in slice order, so
+            :func:`load_scanned_series` reads them without scanning the
+            directory again. Empty for a grouped 4DCT entry (see *phases*).
     """
 
     modality: str
@@ -363,6 +406,7 @@ class SeriesEntry:
     series_uid: str
     file_path: pathlib.Path
     phases: tuple[PhaseEntry, ...] = ()
+    file_paths: tuple[pathlib.Path, ...] = ()
 
     @property
     def is_4dct(self) -> bool:
@@ -392,13 +436,16 @@ def scan_dicom_series(
     modalities: frozenset[str] = DEFAULT_SCAN_MODALITIES,
     group_4dct: bool = True,
     require_single_patient: bool = True,
+    require_single_series_per_dir: bool = False,
 ) -> SeriesScan:
     """List the series under *dcm_root_dir* without reading any pixel data.
 
     Headers only, so a large folder is enumerated quickly and the host loads
-    just what the user selects (:func:`load_dcm_series`,
-    :func:`load_rt_dose`). Series come back images first, then RT-DOSE, each
-    group ordered by modality and description.
+    just what the user selects (:func:`load_scanned_series`,
+    :func:`load_phase_series`, :func:`load_rt_dose`). Each entry records its
+    files in slice order, so loading it never scans the directory again.
+    Series come back images first, then RT-DOSE, each group ordered by
+    modality and description.
 
     Args:
         dcm_root_dir: Root directory to scan, recursively.
@@ -408,13 +455,23 @@ def scan_dicom_series(
             (``"0%"``, ``"10%"``, ...) into one entry holding them as phases.
         require_single_patient: Raise when the tree holds more than one
             patient.
+        require_single_series_per_dir: Raise when a directory holding a
+            listed series also holds another image series. Non-image objects
+            (RT-STRUCT, RT-PLAN, RT-DOSE, REG, ...) may share the directory,
+            and so may the phases of one grouped 4DCT. Set this when the
+            host addresses a series by its directory, e.g. for RT-STRUCT
+            import and export.
 
     Raises:
         MultiplePatientError: If *require_single_patient* and more than one
-            PatientID or PatientName was found.
+            PatientID or PatientName was found. Checked first.
+        MixedSeriesDirectoryError: If *require_single_series_per_dir* and a
+            directory mixes image series.
     """
     root = pathlib.Path(dcm_root_dir)
     series_by_uid: dict[str, SeriesEntry] = {}
+    files_by_uid: dict[str, list[tuple[tuple[float, float], pathlib.Path]]] = {}
+    image_series_by_dir: dict[pathlib.Path, set[str]] = {}
     reg_files: list[pathlib.Path] = []
     patient_ids: set[str] = set()
     patient_names: set[str] = set()
@@ -431,19 +488,24 @@ def scan_dicom_series(
         if modality == "REG":
             reg_files.append(file)
             continue
+
+        series_uid = str(ds.get("SeriesInstanceUID", ""))
+        if not series_uid:
+            continue
+        if modality not in _NON_IMAGE_MODALITIES:
+            image_series_by_dir.setdefault(file.parent, set()).add(series_uid)
         if modality not in modalities:
             continue
 
-        series_uid = str(ds.get("SeriesInstanceUID", ""))
-        if not series_uid or series_uid in series_by_uid:
-            continue
-        series_by_uid[series_uid] = SeriesEntry(
-            modality=modality,
-            description=str(ds.get("SeriesDescription", "")).strip(),
-            series_dir=file.parent,
-            series_uid=series_uid,
-            file_path=file,
-        )
+        files_by_uid.setdefault(series_uid, []).append((_slice_sort_key(ds), file))
+        if series_uid not in series_by_uid:
+            series_by_uid[series_uid] = SeriesEntry(
+                modality=modality,
+                description=str(ds.get("SeriesDescription", "")).strip(),
+                series_dir=file.parent,
+                series_uid=series_uid,
+                file_path=file,
+            )
 
     if require_single_patient and (len(patient_ids) > 1 or len(patient_names) > 1):
         raise MultiplePatientError(
@@ -451,7 +513,19 @@ def scan_dicom_series(
             f"names={sorted(patient_names)}."
         )
 
-    series = _order_series(list(series_by_uid.values()), group_4dct)
+    entries = [
+        replace(entry, file_paths=_sorted_files(files_by_uid[uid]))
+        for uid, entry in series_by_uid.items()
+    ]
+    series = _order_series(entries, group_4dct)
+
+    if require_single_series_per_dir:
+        mixed_dirs = _find_mixed_series_dirs(
+            image_series_by_dir, frozenset(series_by_uid), series
+        )
+        if mixed_dirs:
+            raise MixedSeriesDirectoryError(mixed_dirs)
+
     logger.info(
         f"Scanned '{root}': {len(series)} series "
         f"({sum(len(entry.phases) for entry in series)} 4DCT phases, "
@@ -463,6 +537,58 @@ def scan_dicom_series(
         patient_ids=frozenset(patient_ids),
         patient_names=frozenset(patient_names),
     )
+
+
+def _slice_sort_key(ds: pydicom.Dataset) -> tuple[float, float]:
+    """Return ``(position along the slice normal, InstanceNumber)`` for a slice.
+
+    The position is the ImagePositionPatient projected onto the normal of
+    ImageOrientationPatient, the order GDCM itself sorts a series into. A
+    slice without usable geometry falls back to its InstanceNumber.
+    """
+    try:
+        instance = float(ds.get("InstanceNumber"))
+    except (TypeError, ValueError):
+        instance = math.inf
+
+    position = ds.get("ImagePositionPatient")
+    orientation = ds.get("ImageOrientationPatient")
+    if position is None or orientation is None:
+        return instance, instance
+    try:
+        cosines = np.asarray(orientation, dtype=float)
+        normal = np.cross(cosines[:3], cosines[3:6])
+        distance = float(np.dot(normal, np.asarray(position, dtype=float)))
+    except (TypeError, ValueError):
+        return instance, instance
+    return distance, instance
+
+
+def _sorted_files(
+    keyed_files: Iterable[tuple[tuple[float, float], pathlib.Path]],
+) -> tuple[pathlib.Path, ...]:
+    """Order a series' files by their slice keys, the path breaking ties."""
+    return tuple(
+        file for _, file in sorted(keyed_files, key=lambda kf: (kf[0], str(kf[1])))
+    )
+
+
+def _find_mixed_series_dirs(
+    image_series_by_dir: dict[pathlib.Path, set[str]],
+    listed_uids: frozenset[str],
+    series: Sequence[SeriesEntry],
+) -> list[pathlib.Path]:
+    """Return the directories where a listed series shares with another image series.
+
+    The phases of a grouped 4DCT count as one acquisition, so a directory
+    holding only those phases is not mixed.
+    """
+    phase_uids = {phase.series_uid for entry in series for phase in entry.phases}
+    return [
+        directory
+        for directory, uids in image_series_by_dir.items()
+        if len(uids) > 1 and uids & listed_uids and not uids <= phase_uids
+    ]
 
 
 def _order_series(entries: list[SeriesEntry], group_4dct: bool) -> list[SeriesEntry]:
@@ -495,6 +621,8 @@ def _order_series(entries: list[SeriesEntry], group_4dct: bool) -> list[SeriesEn
                 label=str(normalize_phase_label(entry.description)),
                 description=entry.description,
                 series_dir=entry.series_dir,
+                series_uid=entry.series_uid,
+                file_paths=entry.file_paths,
             )
             for entry in phases
         ),
@@ -714,8 +842,7 @@ def _find_reg_matrix(
 def _build_series_info(
     reader: sitk.ImageSeriesReader,
     raw_image: sitk.Image,
-    file_names: tuple[str, ...],
-    scan: _ScanResult,
+    reg_matrix: np.ndarray | None,
     series_id: str,
 ) -> tuple[str, SeriesInfo]:
     """Build the ``(description, SeriesInfo)`` pair for one loaded series."""
@@ -723,7 +850,6 @@ def _build_series_info(
     modality = _get_modality(reader)
     window_level = _get_window_level(reader, image_lps, modality)
 
-    reg_matrix = _find_reg_matrix(scan, file_names, series_id)
     if reg_matrix is not None:
         logger.info(f"Applying REG matrix to series '{series_id}'.")
         transform: sitk.AffineTransform | None = _build_transform(reg_matrix)
@@ -739,6 +865,49 @@ def _build_series_info(
         modality=modality,
         window_level=window_level,
     )
+
+
+def _read_reg_files(
+    reg_files: Iterable[pathlib.Path],
+) -> _RegMatrices:
+    """Return ``(by_sop_instance_uid, by_series_instance_uid)`` from REG files.
+
+    Reads only the files given (typically :attr:`SeriesScan.reg_files`), so
+    no directory tree is walked. Unreadable files are logged and skipped.
+    """
+    by_sop: dict[str, np.ndarray] = {}
+    by_series: dict[str, np.ndarray] = {}
+    for file in reg_files:
+        try:
+            ds = pydicom.dcmread(str(file))
+        except Exception as exc:
+            logger.warning(f"Skipping unreadable REG file '{file}': {exc}")
+            continue
+        if ds.get("SOPClassUID", "") == _SPATIAL_REGISTRATION_UID:
+            _collect_reg_matrices(ds, pathlib.Path(file), by_sop, by_series)
+    return by_sop, by_series
+
+
+def _match_reg_matrix(
+    reader: sitk.ImageSeriesReader,
+    file_count: int,
+    series_uid: str,
+    reg_matrices: _RegMatrices,
+) -> np.ndarray | None:
+    """Return the REG matrix for a series read by *reader*, if any.
+
+    Matched by the SOP Instance UID of any slice (a REG object may name only
+    one), in slice order, then by *series_uid*.
+    """
+    by_sop, by_series = reg_matrices
+    if by_sop:
+        for index in range(file_count):
+            if not reader.HasMetaDataKey(index, "0008|0018"):
+                continue
+            sop_uid = reader.GetMetaData(index, "0008|0018").strip().rstrip("\0")
+            if sop_uid in by_sop:
+                return by_sop[sop_uid]
+    return by_series.get(series_uid)
 
 
 # ---------------------------------------------------------------------------
@@ -773,7 +942,7 @@ def _load_all_series_impl(
                 continue
             raw_image, file_names = _read_series(reader, dcm_dir, sid)
             description, info = _build_series_info(
-                reader, raw_image, file_names, scan, sid
+                reader, raw_image, _find_reg_matrix(scan, file_names, sid), sid
             )
             loaded_count += 1
             if description in series_dict:
@@ -872,3 +1041,102 @@ def load_dcm_series(dcm_dir: str | pathlib.Path) -> SeriesInfo:
             f"but found {loaded_count}."
         )
     return next(iter(series_dict.values()))
+
+
+def load_scanned_series(
+    entry: SeriesEntry | PhaseEntry,
+    reg_files: Sequence[pathlib.Path] = (),
+) -> SeriesInfo:
+    """Load one series found by :func:`scan_dicom_series`.
+
+    Reads exactly the entry's own files, in the slice order the scan
+    recorded, so it neither walks the directory again nor trips over other
+    series stored in the same directory. An entry built without
+    ``file_paths`` falls back to asking GDCM for the files of its
+    ``series_uid`` in ``series_dir``.
+
+    Args:
+        entry: An image series or a single 4DCT phase from a scan.
+        reg_files: REG files to look the series up in, typically
+            :attr:`SeriesScan.reg_files`. The matching transform is attached
+            as ``SeriesInfo["transform"]``; with none given it is ``None``.
+
+    Raises:
+        ValueError: If *entry* is a grouped 4DCT (use
+            :func:`load_phase_series`) or an RT-DOSE (use
+            :func:`load_rt_dose`).
+        FileNotFoundError: If the entry has no files to read.
+    """
+    return _load_scanned_series(entry, _read_reg_files(reg_files))
+
+
+def load_phase_series(
+    phases: Sequence[PhaseEntry],
+    reg_files: Sequence[pathlib.Path] = (),
+    max_workers: int | None = None,
+) -> dict[str, SeriesInfo]:
+    """Load the phases of a scanned 4DCT, keyed by phase label in *phases* order.
+
+    Only the phases' own files are read, several phases at a time.
+
+    Args:
+        phases: :attr:`SeriesEntry.phases` of a grouped 4DCT entry.
+        reg_files: REG files to look each phase up in (see
+            :func:`load_scanned_series`).
+        max_workers: Phases read concurrently. Defaults to
+            ``min(len(phases), 4)``.
+
+    Raises:
+        FileNotFoundError: If a phase has no files to read. The first
+            failure of any phase is propagated.
+    """
+    if not phases:
+        return {}
+    reg_matrices = _read_reg_files(reg_files)
+    workers = max_workers or min(len(phases), _DEFAULT_PHASE_LOAD_WORKERS)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        infos = list(
+            executor.map(
+                lambda phase: _load_scanned_series(phase, reg_matrices), phases
+            )
+        )
+    return {phase.label: info for phase, info in zip(phases, infos, strict=True)}
+
+
+def _load_scanned_series(
+    entry: SeriesEntry | PhaseEntry,
+    reg_matrices: _RegMatrices,
+) -> SeriesInfo:
+    """Load one scanned series with REG matrices already read.
+
+    Shared by :func:`load_scanned_series` and :func:`load_phase_series`.
+    """
+    if isinstance(entry, SeriesEntry):
+        if entry.is_4dct:
+            raise ValueError("A grouped 4DCT entry must be loaded by its phases.")
+        if entry.modality == "RTDOSE":
+            raise ValueError("RT-DOSE must be loaded with load_rt_dose.")
+
+    reader = sitk.ImageSeriesReader()
+    file_names = [str(file) for file in entry.file_paths]
+    if not file_names and entry.series_uid:
+        file_names = list(
+            reader.GetGDCMSeriesFileNames(str(entry.series_dir), entry.series_uid)
+        )
+    if not file_names:
+        raise FileNotFoundError(
+            f"No files recorded for series '{entry.series_uid}' in "
+            f"'{entry.series_dir}'."
+        )
+
+    reader.SetFileNames(file_names)
+    reader.MetaDataDictionaryArrayUpdateOn()
+    raw_image = reader.Execute()
+    series_id = entry.series_uid or str(entry.series_dir)
+    logger.info(f"Series '{series_id}' loaded with {len(file_names)} files.")
+
+    reg_matrix = _match_reg_matrix(
+        reader, len(file_names), entry.series_uid, reg_matrices
+    )
+    _, info = _build_series_info(reader, raw_image, reg_matrix, series_id)
+    return info

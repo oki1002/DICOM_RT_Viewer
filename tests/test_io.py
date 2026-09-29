@@ -8,11 +8,14 @@ from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
 from pydicom.uid import CTImageStorage, ExplicitVRLittleEndian, generate_uid
 
 from tk_rt_viewer.io import (
+    MixedSeriesDirectoryError,
     MultiplePatientError,
     PhaseEntry,
     _collect_reg_matrices,
     _first_float,
     load_dcm_series,
+    load_phase_series,
+    load_scanned_series,
     normalize_phase_label,
     scan_dicom_series,
     select_phase_series,
@@ -349,3 +352,251 @@ class TestNonCtWindowFallback:
         width, level = _get_window_level(sitk.ImageSeriesReader(), image, "MR")
         assert width > 0
         assert level == pytest.approx(7.0)
+
+
+def _write_ct_slices(
+    directory: pathlib.Path,
+    series_description: str,
+    n_slices: int = 3,
+    prefix: str = "",
+    patient: str = "Test",
+    positions: list[float] | None = None,
+    value: int = 0,
+) -> tuple[str, list[pathlib.Path]]:
+    """Write a CT series whose file names do not follow the slice order.
+
+    Files are named in *reverse* slice order, and several series can share
+    *directory* through distinct *prefix* values. Every voxel of slice ``i``
+    holds ``value + i`` so the slice order of a loaded volume can be read
+    back. Returns ``(series_uid, files in slice order)``.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    series_uid, study, for_ref = generate_uid(), generate_uid(), generate_uid()
+    z_values = (
+        positions if positions is not None else [float(i) for i in range(n_slices)]
+    )
+    files: list[pathlib.Path] = []
+    for i, z in enumerate(z_values):
+        file_meta = FileMetaDataset()
+        file_meta.MediaStorageSOPClassUID = CTImageStorage
+        sop_uid = generate_uid()
+        file_meta.MediaStorageSOPInstanceUID = sop_uid
+        file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+
+        path = directory / f"{prefix}{len(z_values) - i:03d}.dcm"
+        ds = FileDataset(str(path), {}, file_meta=file_meta, preamble=b"\0" * 128)
+        ds.SOPClassUID = CTImageStorage
+        ds.SOPInstanceUID = sop_uid
+        ds.StudyInstanceUID = study
+        ds.SeriesInstanceUID = series_uid
+        ds.FrameOfReferenceUID = for_ref
+        ds.PatientName = patient
+        ds.PatientID = patient
+        ds.Modality = "CT"
+        ds.SeriesDescription = series_description
+        ds.Rows = 4
+        ds.Columns = 4
+        ds.BitsAllocated = 16
+        ds.BitsStored = 16
+        ds.HighBit = 15
+        ds.PixelRepresentation = 1
+        ds.SamplesPerPixel = 1
+        ds.PhotometricInterpretation = "MONOCHROME2"
+        ds.PixelSpacing = [1.0, 1.0]
+        ds.SliceThickness = 1.0
+        ds.ImagePositionPatient = [0.0, 0.0, z]
+        ds.ImageOrientationPatient = [1, 0, 0, 0, 1, 0]
+        ds.InstanceNumber = i + 1
+        ds.RescaleIntercept = 0
+        ds.RescaleSlope = 1
+        ds.PixelData = np.full((4, 4), value + i, dtype=np.int16).tobytes()
+        ds.save_as(str(path), enforce_file_format=True)
+        files.append(path)
+    return series_uid, files
+
+
+def _write_rtdose(path: pathlib.Path, patient: str = "Test") -> None:
+    """Write a header-only RT-DOSE object (enough for the scan)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    meta = FileMetaDataset()
+    meta.MediaStorageSOPClassUID = "1.2.840.10008.5.1.4.1.1.481.2"
+    meta.MediaStorageSOPInstanceUID = generate_uid()
+    meta.TransferSyntaxUID = ExplicitVRLittleEndian
+    ds = FileDataset(str(path), {}, file_meta=meta, preamble=b"\0" * 128)
+    ds.SOPClassUID = meta.MediaStorageSOPClassUID
+    ds.SOPInstanceUID = meta.MediaStorageSOPInstanceUID
+    ds.SeriesInstanceUID = generate_uid()
+    ds.Modality = "RTDOSE"
+    ds.PatientID = patient
+    ds.PatientName = patient
+    ds.save_as(str(path), enforce_file_format=True)
+
+
+def _slice_values(image) -> list[int]:
+    import SimpleITK as sitk
+
+    array = sitk.GetArrayFromImage(image)
+    return [int(array[k, 0, 0]) for k in range(array.shape[0])]
+
+
+class TestScanRecordsSeriesFiles:
+    def test_files_are_recorded_in_slice_order(self, tmp_path) -> None:
+        # Positions deliberately out of step with both names and numbers
+        _, files = _write_ct_slices(tmp_path, "CT", positions=[2.0, 0.0, 1.0])
+        (entry,) = scan_dicom_series(tmp_path).series
+        assert entry.file_paths == (files[1], files[2], files[0])
+
+    def test_order_matches_gdcm(self, tmp_path) -> None:
+        import SimpleITK as sitk
+
+        uid, _ = _write_ct_slices(tmp_path, "CT", positions=[5.0, -1.0, 3.0, 0.5])
+        (entry,) = scan_dicom_series(tmp_path).series
+        gdcm = sitk.ImageSeriesReader.GetGDCMSeriesFileNames(str(tmp_path), uid)
+        assert [str(p) for p in entry.file_paths] == list(gdcm)
+
+    def test_phases_carry_their_uid_and_files(self, tmp_path) -> None:
+        uid, files = _write_ct_slices(tmp_path / "p0", "4D 0%")
+        _write_ct_slices(tmp_path / "p50", "4D 50%")
+        (entry,) = scan_dicom_series(tmp_path).series
+        phase = entry.phases[0]
+        assert phase.series_uid == uid
+        assert phase.file_paths == tuple(files)
+        # The grouped entry itself holds no files of its own
+        assert entry.file_paths == ()
+
+
+class TestRequireSingleSeriesPerDir:
+    def test_two_image_series_in_one_directory_raise(self, tmp_path) -> None:
+        _write_ct_slices(tmp_path / "mixed", "Plan CT", prefix="a")
+        _write_ct_slices(tmp_path / "mixed", "Other CT", prefix="b")
+        with pytest.raises(MixedSeriesDirectoryError) as info:
+            scan_dicom_series(tmp_path, require_single_series_per_dir=True)
+        assert info.value.directories == (tmp_path / "mixed",)
+
+    def test_off_by_default(self, tmp_path) -> None:
+        _write_ct_slices(tmp_path, "Plan CT", prefix="a")
+        _write_ct_slices(tmp_path, "Other CT", prefix="b")
+        assert len(scan_dicom_series(tmp_path).series) == 2
+
+    def test_non_image_objects_may_share_the_directory(self, tmp_path) -> None:
+        _write_ct_slices(tmp_path, "Plan CT")
+        _write_rtdose(tmp_path / "dose.dcm")
+        scan = scan_dicom_series(tmp_path, require_single_series_per_dir=True)
+        assert [e.modality for e in scan.series] == ["CT", "RTDOSE"]
+
+    def test_series_in_separate_directories_pass(self, tmp_path) -> None:
+        _write_ct_slices(tmp_path / "a", "Plan CT")
+        _write_ct_slices(tmp_path / "b", "Other CT")
+        scan = scan_dicom_series(tmp_path, require_single_series_per_dir=True)
+        assert len(scan.series) == 2
+
+    def test_4dct_phases_may_share_a_directory(self, tmp_path) -> None:
+        for percent in (0, 50):
+            _write_ct_slices(tmp_path / "4d", f"4D {percent}%", prefix=f"p{percent}_")
+        scan = scan_dicom_series(tmp_path, require_single_series_per_dir=True)
+        assert len(scan.series[0].phases) == 2
+
+    def test_4dct_phases_mixed_with_another_series_raise(self, tmp_path) -> None:
+        for percent in (0, 50):
+            _write_ct_slices(tmp_path / "4d", f"4D {percent}%", prefix=f"p{percent}_")
+        _write_ct_slices(tmp_path / "4d", "AIP", prefix="aip_")
+        with pytest.raises(MixedSeriesDirectoryError):
+            scan_dicom_series(tmp_path, require_single_series_per_dir=True)
+
+    def test_multiple_patients_are_reported_first(self, tmp_path) -> None:
+        _write_ct_slices(tmp_path, "Plan CT", prefix="a", patient="P1")
+        _write_ct_slices(tmp_path, "Other CT", prefix="b", patient="P2")
+        with pytest.raises(MultiplePatientError):
+            scan_dicom_series(tmp_path, require_single_series_per_dir=True)
+
+
+class TestLoadScannedSeries:
+    def test_loads_only_the_selected_series_from_a_shared_directory(
+        self, tmp_path
+    ) -> None:
+        _write_ct_slices(tmp_path, "A", prefix="a", value=100)
+        _write_ct_slices(tmp_path, "B", prefix="b", n_slices=5, value=200)
+        scan = scan_dicom_series(tmp_path)
+        entry_b = next(e for e in scan.series if e.description == "B")
+
+        info = load_scanned_series(entry_b)
+
+        assert info["sitk_image"].GetSize() == (4, 4, 5)
+        assert _slice_values(info["sitk_image"]) == [200, 201, 202, 203, 204]
+        assert info["transform"] is None
+
+    def test_matches_load_dcm_series(self, tmp_path) -> None:
+        _write_ct_slices(tmp_path, "A", positions=[3.0, 1.0, 2.0, 0.0], value=10)
+        (entry,) = scan_dicom_series(tmp_path).series
+        expected = load_dcm_series(tmp_path)
+        actual = load_scanned_series(entry)
+        import SimpleITK as sitk
+
+        for key in ("sitk_image", "original_sitk_image"):
+            assert actual[key].GetOrigin() == expected[key].GetOrigin()
+            assert actual[key].GetDirection() == expected[key].GetDirection()
+            assert np.array_equal(
+                sitk.GetArrayFromImage(actual[key]),
+                sitk.GetArrayFromImage(expected[key]),
+            )
+        assert actual["window_level"] == expected["window_level"]
+        assert actual["modality"] == expected["modality"]
+
+    def test_entry_without_files_falls_back_to_gdcm(self, tmp_path) -> None:
+        import dataclasses
+
+        _write_ct_slices(tmp_path, "A", prefix="a", value=1)
+        _write_ct_slices(tmp_path, "B", prefix="b", value=50)
+        entry = next(
+            e for e in scan_dicom_series(tmp_path).series if e.description == "B"
+        )
+        info = load_scanned_series(dataclasses.replace(entry, file_paths=()))
+        assert _slice_values(info["sitk_image"]) == [50, 51, 52]
+
+    def test_rejects_grouped_4dct_and_dose(self, tmp_path) -> None:
+        _write_ct_slices(tmp_path / "p0", "4D 0%")
+        _write_rtdose(tmp_path / "dose" / "dose.dcm")
+        scan = scan_dicom_series(tmp_path)
+        for entry in scan.series:
+            with pytest.raises(ValueError):
+                load_scanned_series(entry)
+
+
+class TestLoadPhaseSeries:
+    def test_loads_phases_in_order_with_their_registration(self, tmp_path) -> None:
+        import pydicom
+
+        from tk_rt_viewer.reg_io import save_registration
+
+        _write_ct_slices(tmp_path / "plan", "Plan CT")
+        for percent in (50, 0, 10):
+            _write_ct_slices(
+                tmp_path / "4d", f"4D {percent}%", prefix=f"p{percent}_", value=percent
+            )
+        # An unrelated series in the tree must not be read at all
+        _write_ct_slices(tmp_path / "other", "Other CT")
+
+        scan = scan_dicom_series(tmp_path / "plan")  # only for the reference
+        fixed_ref = pydicom.dcmread(scan.series[0].file_path, stop_before_pixels=True)
+        moving_ref = pydicom.dcmread(
+            tmp_path / "4d" / "p10_001.dcm", stop_before_pixels=True
+        )
+        matrix = np.eye(4)
+        matrix[:3, 3] = (5.0, -3.0, 2.0)
+        save_registration(tmp_path / "reg" / "reg.dcm", matrix, fixed_ref, moving_ref)
+
+        scan = scan_dicom_series(tmp_path)
+        four_d = scan.series[0]
+        phases = load_phase_series(four_d.phases, scan.reg_files)
+
+        assert list(phases) == ["0%", "10%", "50%"]
+        assert _slice_values(phases["50%"]["sitk_image"]) == [50, 51, 52]
+        assert phases["0%"]["transform"] is None
+        transform = phases["10%"]["transform"]
+        assert transform is not None
+        assert transform.TransformPoint((0.0, 0.0, 0.0)) == pytest.approx(
+            (-5.0, 3.0, -2.0)
+        )
+
+    def test_no_phases(self) -> None:
+        assert load_phase_series(()) == {}

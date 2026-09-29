@@ -178,9 +178,29 @@ for entry in scan.series:
 ```
 
 `scan_dicom_series` raises `MultiplePatientError` when the tree holds more
-than one patient; pass `require_single_patient=False` to scan anyway. To load
-the phases of a 4DCT entry afterwards, narrow a `load_all_series` result with
-`select_phase_series(all_series, entry.phases)`.
+than one patient; pass `require_single_patient=False` to scan anyway.
+
+Each entry records its own files in slice order, so the series the user picks
+is loaded without scanning its directory again, even when other series share
+that directory. A 4DCT entry is loaded phase by phase, several at a time:
+
+```python
+from tk_rt_viewer.io import load_phase_series, load_scanned_series
+
+info = load_scanned_series(entry, scan.reg_files)            # one series
+phases = load_phase_series(four_d.phases, scan.reg_files)    # {"0%": ..., ...}
+```
+
+Passing `scan.reg_files` attaches the transform of any registration naming
+the series (see [Registration](#registration-fusion)). Load RT-DOSE entries with
+`load_rt_dose(entry.file_path)`.
+
+Code that addresses a series by its directory, such as RT-STRUCT import and
+export (`rtstruct_io`, through rt-utils), needs one image series per
+directory. Pass `require_single_series_per_dir=True` to have the scan raise
+`MixedSeriesDirectoryError` (listing the directories) instead of letting
+those slices mix. Non-image objects (RT-STRUCT, RT-PLAN, RT-DOSE, REG) may
+share a directory with their series, and so may the phases of one 4DCT.
 
 Load the primary image first. The secondary overlay, the 4DCT phases and
 RT-DOSE are all displayed on the primary image's grid, so there is nothing
@@ -664,7 +684,8 @@ field and belongs to a different IOD, so `transform_to_matrix` raises
 A registration written this way is read back by
 `tk_rt_viewer.io.find_reg_matrices` (and therefore applied automatically by
 `load_all_series` / `load_dcm_series`) when the file sits anywhere under the
-scanned directory. Any referenced slice is enough: references are resolved
+scanned directory; `load_scanned_series` / `load_phase_series` apply it when
+the file is among the `reg_files` passed in. Any referenced slice is enough: references are resolved
 to their whole series. The reader also accepts the item-level
 `ReferencedSeriesSequence` written by 2.1.x, and skips the identity item that
 names the fixed image's own frame of reference, so the fixed series is not

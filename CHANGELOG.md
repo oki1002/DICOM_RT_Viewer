@@ -4,6 +4,38 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.2.0]
+
+Loading a series picked from a scan now reads only that series' files.
+
+### Added
+
+- **`load_scanned_series(entry, reg_files=())`** loads one series found by
+  `scan_dicom_series` from the files the scan recorded. `load_dcm_series`
+  walked the directory with pydicom and then twice more through GDCM before
+  reading, and refused any directory holding a second image series.
+- **`load_phase_series(phases, reg_files=(), max_workers=None)`** loads the
+  phases of a 4DCT entry, several at a time. `load_all_series` +
+  `select_phase_series` read every image series under the root just to keep
+  the phases.
+  Both apply registrations from the REG files passed in (normally
+  `SeriesScan.reg_files`), matched by any slice's SOP Instance UID or by the
+  series, as `load_all_series` does.
+- **`SeriesEntry.file_paths`** and **`PhaseEntry.file_paths`**: a series'
+  files in slice order (ImagePositionPatient along the slice normal, as GDCM
+  sorts). **`PhaseEntry.series_uid`** records the phase's SeriesInstanceUID.
+  All new fields have defaults, so existing constructor calls still work.
+- **`scan_dicom_series(..., require_single_series_per_dir=False)`**: when
+  set, raises the new **`MixedSeriesDirectoryError`** (a `ValueError`) if a
+  directory holding a listed series also holds another image series.
+  Non-image objects and the phases of one 4DCT may share a directory. Off by
+  default; `MultiplePatientError` is still checked first.
+
+### Changed
+
+- `_build_series_info` takes the matched REG matrix instead of the tree scan
+  (internal).
+
 ## [2.1.2]
 
 A review pass: behaviour fixes with no API break, a shared implementation for
