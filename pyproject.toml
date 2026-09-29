@@ -3,15 +3,8 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-# Distribution name: "tk-rt-viewer" (renamed from "dicom-rt-viewer" in 1.1.0;
-# see CHANGELOG). "dicom-rt-viewer" said what file formats this library reads
-# but not what makes it embeddable as-is: it is a Tkinter widget, not a
-# standalone application or another framework's plugin, and the old name was
-# also close enough to several unrelated DICOM-tooling projects on PyPI to be
-# mistaken for one of them. The import package is "tk_rt_viewer" — hyphens
-# are not valid in Python identifiers, so the import name mirrors the
-# distribution name with underscores in place of hyphens, keeping the two
-# names aligned.
+# Renamed from "dicom-rt-viewer" in 1.1.0 (see CHANGELOG). The import
+# package is "tk_rt_viewer".
 name = "tk-rt-viewer"
 dynamic = ["version"]
 description = "SimpleITK-based DICOM-RT MPR viewer widget for Tkinter (CT, RT-DOSE, RT-STRUCT, DVH)"
@@ -48,13 +41,10 @@ classifiers = [
 dependencies = [
     "SimpleITK>=2.3",
     "contourpy>=1.2",
-    # 3.10 added MouseEvent.buttons (plural), which the lost-drag-release
-    # recovery in event_controllers.viewer_events relies on to tell whether
-    # a mouse button is currently held; see that module for why the older
-    # singular `button` attribute cannot be used for this check.
+    # 3.10 added MouseEvent.buttons, used to detect a lost button release
+    # (see event_controllers.viewer_events).
     "matplotlib>=3.10",
-    # 1.26 is the first release supporting Python 3.12, which this
-    # package requires; anything lower could never be installed here.
+    # First release supporting Python 3.12.
     "numpy>=1.26",
     "pydicom>=2.4",
     "rt-utils>=1.2",
@@ -73,28 +63,21 @@ Changelog = "https://github.com/oki1002/DICOM_RT_Viewer/blob/main/CHANGELOG.md"
 dev = [
     "pytest>=7",
     "mypy>=1.0",
-    # Ruff replaces black + isort + flake8: one tool, one config, and it
-    # formats and lints the same source in a single pass.
     "ruff>=0.6",
 ]
 
 [tool.hatch.version]
-# __init__.py's __version__ is the single source of truth; pyproject.toml
-# no longer duplicates it, so the two can no longer drift apart.
+# __init__.__version__ is the single source of truth.
 path = "src/tk_rt_viewer/__init__.py"
 
 [tool.hatch.build.targets.wheel]
-# src layout: only the package under src/ is included in the wheel.
-# py.typed is picked up automatically because it lives inside the package.
+# src layout; py.typed ships inside the package.
 packages = ["src/tk_rt_viewer"]
 
 [tool.mypy]
 python_version = "3.12"
-# Realistic baseline: full --strict requires annotating every Tk/Matplotlib
-# event-handler signature, which adds noise without catching real bugs in
-# this codebase. The flags below keep the valuable checks (untyped-def
-# bodies are still checked, Any-returns flagged) while allowing untyped
-# callback parameters. Tightening back to strict is tracked in CHANGELOG.
+# Not --strict: Tk / Matplotlib event-handler parameters stay unannotated,
+# but untyped bodies are still checked.
 check_untyped_defs = true
 warn_redundant_casts = true
 warn_unused_ignores = true
@@ -112,8 +95,8 @@ src = ["src", "tests"]
 select = ["E", "F", "I", "UP", "B", "C4", "SIM"]
 
 [tool.ruff.lint.per-file-ignores]
-# Tests reach into private attributes to pin optimisations that have no
-# public surface (buffer reuse, cache identity); that is the point of them.
+# Tests reach into private attributes to pin optimisations (buffer reuse,
+# cache identity) that have no public surface.
 "tests/*" = ["SLF001"]
 
 [tool.pytest.ini_options]

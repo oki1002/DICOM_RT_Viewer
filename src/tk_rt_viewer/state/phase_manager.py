@@ -1,21 +1,13 @@
 """phase_manager.py — 4DCT phase storage and lazy resampling for SliceViewerState.
 
-A 4DCT study contributes one volume per respiratory phase, and every phase
-has to be resampled onto the primary CT grid before it can be blended over
-it. Resampling all of them up front costs one primary-grid volume per phase
-(a ten-phase study on a 512x512x200 grid is roughly 1 GB), even though only
-one phase is displayed at a time.
+Resampling every phase onto the primary grid up front would cost one
+primary-grid volume per phase (about 1 GB for ten phases at 512x512x200),
+while only one is displayed at a time. :class:`PhaseManager` keeps the raw
+phases and resamples each on first activation into a small LRU cache, so
+memory scales with the number of recently viewed phases.
 
-:class:`PhaseManager` therefore stores the phases as handed in — raw and
-un-resampled — and resamples a phase the first time it is activated,
-keeping the result in a small LRU cache so that cycling back and forth
-between recently viewed phases stays cheap. Peak memory is bound by the
-number of *recently viewed* phases rather than the total phase count.
-
-The manager is a plain collaborator: it holds no observable state and emits
-no events. :class:`~tk_rt_viewer.state.viewer_state.SliceViewerState`
-owns an instance, delegates its phase API to it, and is solely responsible
-for firing ``phases_data_loaded`` / ``phase_changed``.
+It emits no events; ``SliceViewerState`` delegates to it and fires
+``phases_data_loaded`` / ``phase_changed``.
 """
 
 import logging
@@ -33,15 +25,10 @@ class PhaseManager:
     """Store 4DCT phase volumes and resample them to the primary grid on demand.
 
     Args:
-        resample: Callable that resamples a phase image onto the primary
-            grid, applying the phase's registration transform when one is
-            present. ``SliceViewerState`` passes its own
-            ``get_resampled_image`` so the manager needs no reference back
-            to the state (and no knowledge of the primary image).
-        max_cached: Callable returning the maximum number of resampled
-            volumes to keep. Read on every insertion rather than captured
-            once, so a host application that adjusts the limit at runtime
-            takes effect on the next activation.
+        resample: Resamples ``(image, transform)`` onto the primary grid.
+        max_cached: Returns the maximum number of resampled volumes to keep.
+            Read on every insertion, so a runtime change takes effect on the
+            next activation.
     """
 
     def __init__(
@@ -52,31 +39,19 @@ class PhaseManager:
         self._resample = resample
         self._max_cached = max_cached
         self._phases: dict[str, dict[str, Any]] = {}
-        # Read-only view over _phases, rebuilt whenever the phases change.
-        # Held rather than built per access so that reading all_phases stays
-        # allocation-free; see that property for why a view is handed out.
+        # Read-only view over _phases, rebuilt whenever the phases change
         self._phases_view: Mapping[str, Mapping[str, Any]] = MappingProxyType({})
         self._current_phase: str | None = None
-        # Resampled volumes keyed by phase name, ordered most-recently-used
-        # last so the least-recently-used entry is evicted first.
+        # Resampled volumes, least-recently-used first
         self._resampled: OrderedDict[str, sitk.Image] = OrderedDict()
 
     @property
     def all_phases(self) -> Mapping[str, Mapping[str, Any]]:
         """The stored phase entries, keyed by phase name.
 
-        The images inside are the raw, un-resampled ones passed to
-        :meth:`set_all`. Callers that need primary-grid geometry must
-        resample explicitly.
-
-        Returned as a read-only view — of both the outer mapping and each
-        phase entry — rather than the stored dictionaries themselves. Handing
-        out the internals would let anything that reads this property, or
-        that receives it with a ``phases_data_loaded`` notification, replace
-        a phase's image or drop a phase without the resampled-volume cache
-        being invalidated, leaving a cached volume that no longer
-        corresponds to the phase it is keyed by. Build a plain ``dict`` from
-        it when a mutable copy is wanted.
+        Holds the raw images passed to :meth:`set_all`, not resampled ones.
+        Read-only (outer mapping and each entry), so the resampled cache
+        cannot be bypassed; build a ``dict`` from it for a mutable copy.
         """
         return self._phases_view
 
@@ -87,20 +62,14 @@ class PhaseManager:
 
     @property
     def cached_phase_names(self) -> tuple[str, ...]:
-        """Names of the phases currently held resampled, least-recently-used first.
-
-        Reflects only which volumes are resident in the LRU cache, not
-        which phases are loaded (:attr:`all_phases`) or displayed
-        (:attr:`current_phase`).
-        """
+        """Names of the phases currently held resampled, least-recently-used first."""
         return tuple(self._resampled)
 
     def set_all(self, phases_data: Mapping[str, Mapping[str, Any]]) -> None:
         """Replace the stored phases and drop every resampled volume.
 
-        Each entry is shallow-copied so that a caller mutating its own
-        dict afterwards (for example replacing ``"sitk_image"``) cannot
-        silently change what this manager holds.
+        Each entry is shallow-copied, so later changes to the caller's dicts
+        do not leak in.
 
         Args:
             phases_data: ``{phase_name: {"sitk_image": ..., "transform": ...}}``.
@@ -120,11 +89,7 @@ class PhaseManager:
         self._current_phase = None
 
     def _rebuild_view(self) -> None:
-        """Refresh the read-only view after :attr:`_phases` has been replaced.
-
-        Each entry is wrapped as well as the outer mapping, so a caller
-        cannot reach through the view to swap a phase's image.
-        """
+        """Refresh the read-only view after :attr:`_phases` has been replaced."""
         self._phases_view = MappingProxyType(
             {
                 phase: MappingProxyType(series_dict)
@@ -161,19 +126,15 @@ class PhaseManager:
         """
         cached = self._resampled.get(phase_name)
         if cached is not None:
-            self._resampled.move_to_end(phase_name)  # mark as most-recently-used
+            self._resampled.move_to_end(phase_name)
             return cached
 
         series_dict = self._phases[phase_name]
         resampled = self._resample(
             series_dict["sitk_image"], series_dict.get("transform")
         )
-        # OrderedDict appends new keys at the end already, so no move_to_end
-        # is needed here (unlike the cache-hit path above, which has to
-        # promote an existing entry).
         self._resampled[phase_name] = resampled
-        # Read the limit once: evaluating it per iteration would repeat the
-        # out-of-range warning for every entry a single insertion evicts.
+        # Read once so an out-of-range limit is warned about once
         limit = self._effective_max_cached()
         while len(self._resampled) > limit:
             evicted, _ = self._resampled.popitem(last=False)
@@ -181,14 +142,9 @@ class PhaseManager:
         return resampled
 
     def _effective_max_cached(self) -> int:
-        """Return the cache limit, clamped to at least one entry.
+        """Return the cache limit, clamped (with a warning) to at least one entry.
 
-        The limit is read through a callable so a host application can
-        adjust it at runtime, which means it can also be set to a value
-        that would evict the phase currently being displayed. Clamping is
-        reported rather than applied silently, to match the warning
-        :class:`~tk_rt_viewer.state.viewer_state.SliceViewerState` emits
-        when the same value is out of range at construction time.
+        A limit of zero would evict the phase being displayed.
         """
         limit = self._max_cached()
         if limit < 1:

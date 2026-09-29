@@ -49,55 +49,27 @@ logger = logging.getLogger(__name__)
 class RtStructLoadError(Exception):
     """Raised when an RT-STRUCT file cannot be parsed at all.
 
-    Distinguishes "the file could not be read" from "the file was read
-    and legitimately contains zero ROIs" — both of which previously
-    returned the same empty ``{}`` from :func:`load_rt_struct`, leaving
-    callers unable to tell a load failure from an empty structure set.
+    Distinguishes a load failure from a file that legitimately contains zero
+    ROIs, for which :func:`load_rt_struct` returns ``{}``.
     """
 
 
-# Default number of worker threads for parallel ROI mask retrieval.
-# Each ROI can be decoded independently via RTStructBuilder.
-# NOTE: rt-utils does not document thread safety; this parallelism relies on
-# each call constructing independent intermediate NumPy arrays. The default
-# is kept at 1 (sequential) because that lack of a documented guarantee
-# makes concurrent execution an opt-in choice for callers who have verified
-# it's safe with their rt-utils version, not something safe to default to
-# for a public library. Pass a higher ``max_workers`` to load_rt_struct
-# to opt in.
+#: Default worker count for ROI mask retrieval. Sequential, because rt-utils
+#: does not document thread safety; callers may opt in to more workers.
 _DEFAULT_ROI_LOAD_MAX_WORKERS: int = 1
 
-# Module-level RNG reused for random fallback colours. Allocating a fresh
-# RNG per ROI (as the previous implementation did) has noticeable overhead
-# for structures with many ROIs.
+#: Shared RNG for random fallback colours.
 _COLOR_RNG: np.random.Generator = np.random.default_rng()
 
-#: rt-utils' ``RTStruct.save()`` silently appends this suffix to any path
-#: that does not already end with it. Every call site here that checks
-#: whether a path exists, logs it, or reports it back to a caller has to
-#: agree with rt-utils on the path it will actually end up writing —
-#: otherwise ``exists()`` checks the wrong file, a log line names a file
-#: that was never created, and a caller reading the path back afterwards
-#: gets ``FileNotFoundError``. See :func:`_resolved_rtss_path`.
+#: Suffix rt-utils' ``RTStruct.save()`` silently appends to any path lacking it.
 _RTSTRUCT_SUFFIX = ".dcm"
 
 
 def _resolved_rtss_path(rtss_path: pathlib.Path) -> pathlib.Path:
     """Return the path rt-utils will actually write *rtss_path* to.
 
-    ``rt_utils.RTStruct.save`` appends ``".dcm"`` to any path that does not
-    already end with it, with no way to opt out. Every caller here that
-    needs to know whether the destination file exists, or wants to log or
-    report the path it wrote, must resolve against this first — comparing
-    against the path as given would silently diverge from reality for any
-    caller that passed one without the suffix.
-
-    Args:
-        rtss_path: The path as supplied by the caller.
-
-    Returns:
-        *rtss_path* unchanged if it already ends with ``.dcm``
-        (case-insensitively), otherwise *rtss_path* with ``.dcm`` appended.
+    Existence checks, logs and the returned path must all agree with the
+    file rt-utils really creates, which always ends with ``.dcm``.
     """
     if rtss_path.suffix.lower() == _RTSTRUCT_SUFFIX:
         return rtss_path
@@ -118,7 +90,7 @@ class RoiInfo(TypedDict):
 
 
 # ---------------------------------------------------------------------------
-# Resampling
+# Saving a structure set
 # ---------------------------------------------------------------------------
 def save_structure_set(
     structure_set: "StructureSet",
@@ -129,34 +101,21 @@ def save_structure_set(
 ) -> int:
     """Write every ROI of *structure_set* to an RT-STRUCT file.
 
-    Saving a :class:`~tk_rt_viewer.state.viewer_state.StructureSet`
-    otherwise requires the caller to bridge two mismatches on its own: the
-    masks are held in the LPS-aligned space the viewer works in and have to
-    be resampled back to the geometry the RT-STRUCT will reference, and each
-    mask has to be converted from a ``sitk.Image`` to the ``(D, H, W)``
-    boolean array :func:`mask2rtstruct` takes. This function owns both, so
-    that "save the structure set I have been editing" is one call.
-
-    ROIs whose mask is missing are skipped with a warning rather than
-    aborting the whole save: a partially populated structure set is still
-    worth writing, and losing the rest of the ROIs to one bad entry is the
-    more damaging outcome.
+    Resamples each mask from the viewer's LPS-aligned space back to the
+    geometry the RT-STRUCT references and converts it to the array layout
+    :func:`mask2rtstruct` expects. ROIs without a mask are skipped with a
+    warning rather than aborting the save.
 
     Args:
-        structure_set: The ROIs to write. Only the accessors
-            ``get_roi_numbers`` / ``get_name`` / ``get_mask`` / ``get_color``
-            are used.
+        structure_set: The ROIs to write.
         ct_dir: Directory of the reference CT series.
-        rtss_path: Destination path. An existing file is fully rebuilt so it
-            ends up containing exactly *structure_set*'s ROIs and nothing
-            else (see :func:`mask2rtstruct`'s ``replace_existing``).
-        lps_image: The LPS-aligned CT the masks share their geometry with —
-            i.e. ``SliceViewerState.primary_image``.
-        original_image: The CT as loaded before LPS alignment
-            (``SeriesInfo["original_sitk_image"]``), which the RT-STRUCT
-            must reference. Pass ``None`` when the series needed no
-            reorientation, in which case *lps_image* is used and the masks
-            are written without a coordinate change.
+        rtss_path: Destination path. An existing file is rebuilt so it holds
+            exactly *structure_set*'s ROIs.
+        lps_image: The LPS-aligned CT the masks share their geometry with
+            (``SliceViewerState.primary_image``).
+        original_image: The CT before LPS alignment
+            (``SeriesInfo["original_sitk_image"]``). ``None`` when the series
+            needed no reorientation; the masks are then written as they are.
 
     Returns:
         The number of ROIs written.
@@ -173,10 +132,6 @@ def save_structure_set(
         if mask is None:
             logger.warning(f"ROI {roi_number} has no mask; skipping it.")
             continue
-        # Resampling onto lps_image's own grid would be a no-op, so it is
-        # skipped entirely when there is no separate original geometry to
-        # return to (otherwise a whole-volume nearest-neighbour resample
-        # would run once per ROI).
         resampled = (
             mask
             if original_image is None
@@ -185,8 +140,7 @@ def save_structure_set(
         structures[roi_number] = {
             "name": structure_set.get_name(roi_number),
             "mask": sitk.GetArrayFromImage(resampled).astype(bool),
-            # rt-utils accepts a "#rrggbb" string directly, so the hex
-            # colour StructureSet stores needs no conversion here.
+            # rt-utils accepts a "#rrggbb" string directly
             "color": structure_set.get_color(roi_number),
         }
 
@@ -203,22 +157,17 @@ def resample_mask_to_original_space(
     original_image: sitk.Image,
     lps_mask: sitk.Image,
 ) -> sitk.Image:
-    """Resample *lps_mask* from the LPS-aligned space back to *original_image* space.
+    """Resample *lps_mask* from the LPS-aligned space onto *original_image*'s grid.
 
-    Required before writing an RT-STRUCT when the CT was reoriented during
-    loading: the mask is in LPS coordinates but the RT-STRUCT must
-    reference the original DICOM geometry.
+    Needed before writing an RT-STRUCT for a CT that was reoriented on load.
 
     Args:
-        _lps_image: LPS-aligned CT image. Reserved for API symmetry; not
-            used in the current implementation.
-        original_image: Original CT image before LPS alignment (resampling
-            target).
-        lps_mask: Binary mask in LPS coordinate space.
+        _lps_image: LPS-aligned CT image. Unused; kept for API compatibility.
+        original_image: The CT before LPS alignment (resampling target).
+        lps_mask: Binary mask in LPS space.
 
     Returns:
-        Mask resampled to the geometry of *original_image*, using
-        nearest-neighbour interpolation to preserve binary values.
+        The mask on *original_image*'s grid (nearest-neighbour).
     """
     return resample_binary_mask(lps_mask, original_image)
 
@@ -232,34 +181,22 @@ def load_rt_struct(
     progress_callback: Callable[[int, int], None] | None = None,
     max_workers: int = _DEFAULT_ROI_LOAD_MAX_WORKERS,
 ) -> dict[int, RoiInfo]:
-    """Parse an RT-STRUCT file and return ROI masks indexed by ROI number.
+    """Parse an RT-STRUCT file and return ROI masks keyed by ROI number.
 
-    Uses a ``ThreadPoolExecutor`` to fetch ROI masks, optionally in
-    parallel (see *max_workers*).
-
-    Each ROI mask is transposed from the rt-utils ``(H, W, D)`` convention
-    to ``(D, H, W)`` before being returned.
+    Masks are transposed from rt-utils' ``(H, W, D)`` to ``(D, H, W)``.
 
     Args:
-        ct_dir: Directory of the CT series referenced by the RT-STRUCT file.
-        rtstruct_path: Path to the RT-STRUCT DICOM file.
-        progress_callback: Optional callback invoked as ``(completed, total)``
-            each time one ROI mask finishes loading. *completed* counts
-            finished ROIs regardless of completion order, so it can be used
-            to drive a determinate progress indicator. Safe to call from a
-            background thread; this function does not touch any UI itself.
-        max_workers: Number of worker threads used to fetch ROI masks.
-            Defaults to 1 (sequential) because rt-utils does not document
-            thread safety for concurrent ``get_roi_mask_by_name`` calls;
-            pass a higher value only after verifying it's safe for the
-            rt-utils version in use.
+        ct_dir: Directory of the CT series the RT-STRUCT references.
+        rtstruct_path: Path to the RT-STRUCT file.
+        progress_callback: Called as ``(completed, total)`` after each ROI,
+            from the calling or a worker thread; suitable for a determinate
+            progress bar.
+        max_workers: Worker threads for mask retrieval. Keep the default of
+            1 unless concurrent rt-utils calls are verified safe for the
+            installed version.
 
     Returns:
-        ``{roi_number: RoiInfo}`` mapping. An RT-STRUCT that was read
-        successfully but legitimately contains zero ROI entries returns
-        an empty dict; a file that could not be parsed at all raises
-        :class:`RtStructLoadError` instead, so callers can tell the two
-        cases apart.
+        ``{roi_number: RoiInfo}``; empty when the file holds no ROIs.
 
     Raises:
         RtStructLoadError: If *rtstruct_path* cannot be parsed (missing
@@ -277,13 +214,8 @@ def load_rt_struct(
             rt_struct_path=str(rtstruct_path),
         )
         ds = pydicom.dcmread(str(rtstruct_path))
-        # Both sequences are read inside this guard, and through ``getattr``
-        # with an empty default. ``ROIContourSequence`` is conditional: a
-        # structure set that holds no contours at all may legitimately omit
-        # it, and ``ds.ROIContourSequence`` then raises a bare
-        # ``AttributeError`` — neither the empty dict nor the
-        # RtStructLoadError this function documents, leaving a caller with a
-        # third failure shape to handle.
+        # ROIContourSequence is conditional: a structure set without contours
+        # may omit it, which must yield {} rather than AttributeError
         roi_name_map: dict[int, str] = {
             int(roi.ROINumber): str(roi.ROIName)
             for roi in getattr(ds, "StructureSetROISequence", [])
@@ -294,7 +226,6 @@ def load_rt_struct(
             f"Failed to create RTStructBuilder from '{rtstruct_path}': {exc}"
         ) from exc
 
-    # Build a list of (roi_number, roi_name, color_hex) tuples for each ROI.
     roi_tasks: list[tuple[int, str, str]] = []
     for roi_contour in roi_contours:
         roi_number = int(roi_contour.ReferencedROINumber)
@@ -306,32 +237,16 @@ def load_rt_struct(
         logger.info("RTSTRUCT contains no ROI entries.")
         return structures
 
-    # rt-utils resolves a mask by name (get_roi_mask_by_name), matching the
-    # *first* StructureSetROISequence entry with that name. Two ROIs sharing
-    # a name is not invalid DICOM — TPS exports do it — so without this,
-    # every ROI in a same-named group would silently receive whichever mask
-    # belongs to the first one, for as many ROIs as share the name.
-    #
-    # This resolves the ambiguity by temporarily renaming each ROI in a
-    # duplicate-name group to a name unique to its ROINumber on rtstruct's
-    # own dataset (the same ``rtstruct.ds`` instance get_roi_mask_by_name
-    # reads), and looking each one up by that unique name instead of the
-    # shared one. The public RoiInfo the caller receives still carries the
-    # original (shared) name; only the internal lookup key changes.
+    # rt-utils looks masks up by name and returns the *first* match, so ROIs
+    # sharing a name (valid DICOM; some TPS exports do it) would all receive
+    # the same mask. Each duplicate is temporarily renamed to a name unique to
+    # its ROINumber for the lookup; the returned RoiInfo keeps the original.
     name_counts = Counter(name for _, name, _ in roi_tasks)
     duplicate_names = {name for name, count in name_counts.items() if count > 1}
     lookup_name_by_number: dict[int, str] = {}
-    # Original ROIName values for every entry renamed below, paired with the
-    # entry itself so they can be restored once loading finishes. The pairing
-    # is by dataset object, not by ROINumber: a file with two entries sharing
-    # a ROINumber is malformed but does occur, and a number-keyed map would
-    # then restore one entry's name onto the other and lose the second
-    # original entirely. rtstruct.ds is the same dataset object
-    # RTStructBuilder.create_from returned and that this function's caller
-    # may still hold a reference to (or that a future change here might pass
-    # on to a save path); leaving the temporary names in place after this
-    # function returns would let them leak into anything that reads
-    # ROIName off that dataset afterwards.
+    # (dataset item, original name) pairs, restored in the finally below so the
+    # temporary names never leak. Keyed by item rather than ROINumber because
+    # malformed files can repeat a ROINumber.
     renamed_original: list[tuple[Any, str]] = []
     if duplicate_names:
         logger.warning(
@@ -387,15 +302,7 @@ def load_rt_struct(
 # Colour utilities
 # ---------------------------------------------------------------------------
 def random_hex_color() -> str:
-    """Return a random display colour as a hex string, e.g. ``"#a1b2c3"``.
-
-    Draws from the module-level RNG shared by this module's own
-    RT-STRUCT fallback colour (see :func:`_extract_roi_color`) and by
-    external callers that add ROIs without a caller-supplied colour.
-
-    Returns:
-        A ``"#rrggbb"`` hex colour string.
-    """
+    """Return a random display colour as a ``"#rrggbb"`` hex string."""
     r, g, b = (int(c * 255) for c in _COLOR_RNG.random(3))
     return f"#{r:02x}{g:02x}{b:02x}"
 
@@ -421,38 +328,21 @@ def mask2rtstruct(
     *,
     replace_existing: bool = True,
 ) -> pathlib.Path:
-    """Write mask arrays to an RT-STRUCT DICOM file.
-
-    Mask arrays must have shape ``(D, H, W)`` and are transposed to
-    rt-utils' expected ``(H, W, D)`` convention internally.
-
-    Note:
-        *rtss_path* must not be ``None``. Callers are responsible for
-        resolving a concrete output path before calling this function.
+    """Write ``(D, H, W)`` mask arrays to an RT-STRUCT DICOM file.
 
     Args:
         ct_dir: Directory of the reference CT series.
-        rtss_path: Destination path for the RT-STRUCT file. Resolved
-            through :func:`_resolved_rtss_path` before use, so a path
-            without a ``.dcm`` suffix is handled the same way rt-utils
-            itself handles it internally, rather than diverging from it.
+        rtss_path: Destination path; ``.dcm`` is appended when missing, as
+            rt-utils does. Must not be ``None``.
         structures: ``{roi_number: {"name": str, "mask": np.ndarray,
-            "color": list | str}}`` mapping.
-        replace_existing: When ``True`` (the default) and *rtss_path*
-            already exists, the file is rebuilt from scratch so it ends up
-            containing exactly *structures* and nothing else. rt-utils'
-            ``add_roi`` only appends to ``ROIContourSequence`` /
-            ``StructureSetROISequence``; loading the existing file with
-            :meth:`RTStructBuilder.create_from` and adding *structures* to
-            it (the previous, and still available, behaviour) does not
-            remove what was already there, so every ROI in *structures*
-            would be duplicated on a second save to the same path. Pass
-            ``False`` to opt into that append-only behaviour when adding
-            ROIs to a file this function did not itself just write.
+            "color": list | str}}``.
+        replace_existing: When ``True`` (default) an existing file is
+            rebuilt so it holds exactly *structures*. ``False`` appends to the
+            existing file instead; rt-utils cannot remove ROIs, so saving the
+            same ROIs twice that way duplicates them.
 
     Returns:
-        The path the RT-STRUCT was actually written to (*rtss_path* with
-        a ``.dcm`` suffix appended, if it did not already have one).
+        The path actually written.
 
     Raises:
         ValueError: If *rtss_path* is ``None``.
@@ -462,9 +352,6 @@ def mask2rtstruct(
         raise ValueError("rtss_path must not be None; provide a concrete output path.")
 
     ct_dir = pathlib.Path(ct_dir)
-    # Resolved once, up front, so every exists()/log/return below agrees
-    # with the path rt-utils' own save() will end up writing to (see
-    # _resolved_rtss_path).
     rtss_path = _resolved_rtss_path(pathlib.Path(rtss_path))
 
     logger.info("Converting masks to RTSTRUCT.")

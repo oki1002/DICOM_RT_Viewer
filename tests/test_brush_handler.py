@@ -428,3 +428,28 @@ class TestScrollHonoursTheStateMinimum:
         handler.handle_scroll(_Event(xdata=None, ydata=None, button=None, step=-1.0))
 
         assert state.brush_size_mm == MIN_BRUSH_SIZE_MM
+
+
+class TestStrokeAcrossAnImageSwitch:
+    def test_a_stroke_is_not_committed_onto_a_new_image(self) -> None:
+        """ROI numbers restart per image, so ROI 1 of the new image must not
+        receive a stroke that was painted on ROI 1 of the previous one."""
+        state, roi_number = _make_state_with_roi()
+        hover = _FakeHover()
+        hover.current_axis = "axial"
+        handler = BrushEventHandler(state, _FakeViewer(), hover)
+
+        x_min, x_max, y_min, y_max = state.get_extent("axial")
+        cx, cy = (x_min + x_max) / 2, (y_min + y_max) / 2
+        handler.handle_press(_Event(xdata=cx, ydata=cy))
+
+        # Same geometry, new image, new ROI that happens to get the same number
+        new_image = sitk.GetImageFromArray(np.zeros((4, 8, 8), dtype=np.int16))
+        state.set_primary_image_data(new_image)
+        new_roi = state.add_contour("Other", _make_mask(new_image), "#00ff00")
+        assert new_roi == roi_number
+
+        handler.handle_release(_Event(xdata=cx, ydata=cy))
+
+        assert not sitk.GetArrayFromImage(state.structure_set.get_mask(new_roi)).any()
+        assert handler.is_dragging is False

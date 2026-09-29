@@ -1,16 +1,10 @@
 """protocols.py — The narrow view of the viewer that its event handlers use.
 
-The event controllers under :mod:`tk_rt_viewer.event_controllers` need a few
-things from the widget they serve: the Axes of the current layout, a way to
-ask for a redraw, the toolbar's current mode, and the Tk scheduler. Taking the
-whole ``DicomViewer`` to get at them made the two mutually dependent — only
-breakable with a ``TYPE_CHECKING`` import — let handlers reach into private
-methods, and meant no handler could be exercised without constructing a real
-Tk widget.
-
-:class:`ViewerHost` states that dependency explicitly instead. ``DicomViewer``
-satisfies it structurally (``Protocol`` needs no inheritance and no
-registration), and a test can satisfy it with a small stand-in.
+The event controllers need only a few things from the widget they serve: the
+current Axes, redraw requests, the toolbar mode and the Tk scheduler.
+:class:`ViewerHost` states exactly that, so handlers never depend on
+``DicomViewer`` itself and can be tested with a small stand-in.
+``DicomViewer`` satisfies the protocol structurally.
 """
 
 from collections.abc import Callable, Mapping
@@ -75,8 +69,8 @@ class ViewerHost(Protocol):
     def cancel_scheduled(self, handle: str | None) -> None:
         """Cancel a handle from :meth:`schedule`, tolerating an unknown one.
 
-        Swallowing the "no such callback" case here is what keeps every
-        handler free of ``tkinter`` imports.
+        Swallowing the "no such callback" case here keeps every handler free
+        of ``tkinter`` imports.
         """
         ...
 

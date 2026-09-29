@@ -21,7 +21,10 @@ from matplotlib.figure import Figure
 from tk_rt_viewer.isodose_levels import DEFAULT_ISODOSE_LEVELS, to_gy_pairs
 from tk_rt_viewer.rendering.blit_compositor import BlitCompositor
 from tk_rt_viewer.rendering.contour_overlay import ContourOverlay
-from tk_rt_viewer.rendering.drawing_manager import DrawingManager
+from tk_rt_viewer.rendering.drawing_manager import (
+    ContourRedrawCoalescer,
+    DrawingManager,
+)
 from tk_rt_viewer.rendering.dvh import DvhPanel
 from tk_rt_viewer.rendering.image_layer import ImageLayer
 from tk_rt_viewer.rendering.isodose import IsoDoseOverlay
@@ -698,3 +701,106 @@ class TestDvhPanelSkipLogging:
         assert len(ax.get_lines()) == 0
         assert "skipped in DVH" in caplog.text
         assert "Broken" in caplog.text
+
+
+class TestCompositorRestoresOverlaysOnFailure:
+    def test_overlays_are_visible_again_after_a_failed_render(
+        self, monkeypatch
+    ) -> None:
+        fig = Figure()
+        canvas = FigureCanvasAgg(fig)
+        ax = fig.add_subplot(111)
+        line = ax.axhline(0.5)
+        scheduler = _FakeScheduler()
+        compositor = BlitCompositor(
+            canvas=canvas,
+            axes_map=lambda: {"axial": ax},
+            blit_artists=lambda _axis: [line],
+            overlay_artists=lambda _axis: [line],
+            transient_artists=lambda _axis: [],
+            schedule=scheduler.schedule,
+            cancel=scheduler.cancel,
+        )
+
+        def failing_draw(_canvas):
+            raise RuntimeError("render failed")
+
+        monkeypatch.setattr(FigureCanvasAgg, "draw", failing_draw)
+        with pytest.raises(RuntimeError):
+            compositor.cache_backgrounds()
+        assert line.get_visible() is True
+
+
+class TestIsoDoseUnsortedCustomLevels:
+    def test_custom_levels_are_sorted_by_dose(self) -> None:
+        state = _loaded_state()
+        overlay = IsoDoseOverlay(state, on_artists_changed=lambda _axis: None)
+        overlay.set_custom_levels([(60.0, "#ff0000"), (20.0, "#0000ff")])
+        # The band norm needs ascending boundaries; unsorted input would
+        # silently paint every band in the wrong colour
+        assert overlay._resolve_levels() == [(20.0, "#0000ff"), (60.0, "#ff0000")]
+
+
+class TestContourRedrawCoalescer:
+    @staticmethod
+    def _coalescer(active=(1, 2, 3)):
+        scheduler = _FakeScheduler()
+        redraws: list[None] = []
+        coalescer = ContourRedrawCoalescer(
+            schedule=scheduler.schedule,
+            cancel=scheduler.cancel,
+            redraw=lambda: redraws.append(None),
+            active_rois=lambda: active,
+        )
+        return coalescer, scheduler, redraws
+
+    def test_many_finished_builds_cause_one_redraw(self) -> None:
+        coalescer, scheduler, redraws = self._coalescer()
+        for roi in (1, 2, 3):
+            coalescer.notify_built(roi)
+        assert len(scheduler.pending) == 1
+        scheduler.run_all()
+        assert len(redraws) == 1
+
+    def test_a_build_after_the_flush_schedules_a_new_one(self) -> None:
+        coalescer, scheduler, redraws = self._coalescer()
+        coalescer.notify_built(1)
+        scheduler.run_all()
+        coalescer.notify_built(2)
+        scheduler.run_all()
+        assert len(redraws) == 2
+
+    def test_builds_of_hidden_rois_do_not_redraw(self) -> None:
+        coalescer, scheduler, redraws = self._coalescer(active=(5,))
+        coalescer.notify_built(1)
+        scheduler.run_all()
+        assert redraws == []
+
+    def test_cancel_drops_the_pending_flush(self) -> None:
+        coalescer, scheduler, redraws = self._coalescer()
+        coalescer.notify_built(1)
+        coalescer.cancel()
+        assert scheduler.pending == {}
+        scheduler.run_all()
+        assert redraws == []
+
+    def test_a_failed_schedule_allows_a_retry(self) -> None:
+        handles: list[str | None] = [None, "h1"]
+        callbacks = []
+
+        def schedule(_delay, callback):
+            callbacks.append(callback)
+            return handles.pop(0)
+
+        redraws: list[None] = []
+        coalescer = ContourRedrawCoalescer(
+            schedule=schedule,
+            cancel=lambda _h: None,
+            redraw=lambda: redraws.append(None),
+            active_rois=lambda: (1,),
+        )
+        coalescer.notify_built(1)  # scheduling fails (teardown race)
+        coalescer.notify_built(1)  # must try again rather than stay stuck
+        assert len(callbacks) == 2
+        callbacks[-1]()
+        assert len(redraws) == 1

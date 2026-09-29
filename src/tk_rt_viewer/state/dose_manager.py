@@ -1,19 +1,12 @@
 """dose_manager.py — RT-DOSE storage and geometry lookups for SliceViewerState.
 
-An RT-DOSE volume is used in two different geometries at once: the raw
-LPS-oriented grid it was exported on, which is what the isodose overlay must
-be drawn with so the display extent is physically correct, and a copy
-resampled onto the primary CT grid, which is what the DVH needs so that dose
-voxels line up with ROI mask voxels. Keeping both, deriving Dmax once, and
-resolving "which dose slice corresponds to the current CT slice" is a
-self-contained job with no observable state of its own.
+An RT-DOSE volume is kept in two geometries: its own LPS grid (the source of
+Dmax and of :meth:`DoseManager.get_slice`) and a copy resampled onto the
+primary CT grid, which the isodose overlay and the DVH use so dose voxels
+line up with the CT and the ROI masks.
 
-:class:`DoseManager` owns it. As with
-:class:`~tk_rt_viewer.state.phase_manager.PhaseManager`, it holds no
-observable state and emits no events;
-:class:`~tk_rt_viewer.state.viewer_state.SliceViewerState` owns an instance,
-delegates its dose API to it, and is solely responsible for firing
-``rt_dose_changed``.
+:class:`DoseManager` emits no events; ``SliceViewerState`` delegates to it
+and fires ``rt_dose_changed``.
 """
 
 import logging
@@ -31,14 +24,10 @@ class DoseManager:
     """Store an RT-DOSE volume in both its own and the primary CT geometry.
 
     Args:
-        resample_to_primary: Callable that resamples the dose onto the
-            primary CT grid, or returns ``None`` when no primary image is
-            loaded. ``SliceViewerState`` passes a thin wrapper around its own
-            ``get_resampled_image`` so this class needs no reference back to
-            the state and no knowledge of the primary image.
+        resample_to_primary: Resamples the dose onto the primary CT grid, or
+            returns ``None`` when no primary image is loaded.
         publish_volume: Called with the resampled volume (or ``None``)
-            whenever it changes, so the owner can refresh the array cache the
-            renderer and DVH read from.
+            whenever it changes, so the owner can refresh its array cache.
     """
 
     def __init__(
@@ -54,21 +43,19 @@ class DoseManager:
 
     @property
     def image(self) -> sitk.Image | None:
-        """The dose on its own LPS grid, used for display with a correct extent."""
+        """The dose on its own LPS grid."""
         return self._image
 
     @property
     def resampled(self) -> sitk.Image | None:
-        """The dose resampled onto the primary CT grid, used for DVH computation."""
+        """The dose resampled onto the primary CT grid (isodose display, DVH)."""
         return self._resampled
 
     @property
     def fallback_ref_gy(self) -> float | None:
         """Dmax of the loaded dose, or ``None`` when no positive dose is present.
 
-        Computed once in :meth:`set_image` and returned from the cache
-        afterwards, so reading it on every prescription-dose change does not
-        rescan every voxel.
+        Computed once in :meth:`set_image`.
         """
         return self._fallback_ref_gy
 
@@ -91,8 +78,7 @@ class DoseManager:
     def _compute_dmax(image: sitk.Image | None) -> float | None:
         """Return the maximum dose in *image*, or ``None`` when not positive.
 
-        Taken from the original (pre-resample) volume so the reference is not
-        affected by interpolation onto the CT grid.
+        Read from the original grid so interpolation cannot lower it.
         """
         if image is None:
             return None
@@ -103,27 +89,23 @@ class DoseManager:
         return max_val if max_val > 0 else None
 
     def get_extent(self, axis: str) -> tuple[float, float, float, float]:
-        """Return ``(left, right, bottom, top)`` for the dose image along *axis*.
-
-        Uses the dose image's own geometry, not the primary CT geometry.
-        """
+        """Return ``(left, right, bottom, top)`` of the dose's own grid along *axis*."""
         if self._image is None:
             return (0.0, 1.0, 0.0, 1.0)
         return compute_extent(self._image, axis)
 
     def get_slice(self, axis: str, physical_coord: float) -> np.ndarray:
-        """Return the dose slice nearest *physical_coord* along *axis*.
+        """Return the slice of the dose's own grid nearest *physical_coord*.
 
         Args:
-            axis: One of ``"axial"``, ``"coronal"``, or ``"sagittal"``.
-            physical_coord: The LPS coordinate of the current CT slice along
+            axis: View axis.
+            physical_coord: LPS coordinate of the current CT slice along
                 *axis*.
 
         Returns:
-            A zero-copy 2-D view into the dose volume, or an empty array when
-            no dose is loaded or the CT slice lies outside the dose grid. The
-            view is valid only while this manager keeps the same image; a
-            caller that retains the slice past that must copy it.
+            A zero-copy 2-D view (copy it to keep it past an image change),
+            or an empty array when no dose is loaded or the coordinate lies
+            outside the dose grid.
         """
         dose = self._image
         if dose is None:
@@ -135,7 +117,6 @@ class DoseManager:
         size = dose.GetSize()[sitk_dim]
 
         index_f = (physical_coord - origin) / spacing
-        # CT slice is outside the dose volume; skip the overlay.
         if index_f < -0.5 or index_f >= size - 0.5:
             return np.array([])
 

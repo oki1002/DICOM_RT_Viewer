@@ -106,7 +106,7 @@ tk_rt_viewer/
     ├── viewer_events.py        # ViewerEventHandler (dispatcher + hover state)
     ├── crosshair_handler.py
     ├── brush_handler.py
-    ├── rect_drag.py            # Rectangle create / move / resize geometry
+    ├── rect_drag.py            # Rectangle geometry + shared box drag gestures
     ├── bbox_handler.py
     └── bbox3d_handler.py
 ```
@@ -664,10 +664,11 @@ field and belongs to a different IOD, so `transform_to_matrix` raises
 A registration written this way is read back by
 `tk_rt_viewer.io.find_reg_matrices` (and therefore applied automatically by
 `load_all_series` / `load_dcm_series`) when the file sits anywhere under the
-scanned directory. The reader takes the references from either
-`ReferencedImageSequence` or `ReferencedSeriesSequence`, and skips the
-identity item that names the fixed image's own frame of reference, so the
-fixed series is not handed a transform meaning "do not move".
+scanned directory. Any referenced slice is enough: references are resolved
+to their whole series. The reader also accepts the item-level
+`ReferencedSeriesSequence` written by 2.1.x, and skips the identity item that
+names the fixed image's own frame of reference, so the fixed series is not
+handed a transform meaning "do not move".
 
 ## Layout modes
 

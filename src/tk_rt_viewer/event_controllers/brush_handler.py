@@ -1,11 +1,11 @@
 """brush_handler.py — Brush tool for RT-STRUCT mask editing.
 
-Left-click drag paints into the selected ROI mask; right-click drag erases.
-The brush is an ellipse whose radii are derived from the physical voxel
-spacing so that a given ``brush_size_mm`` corresponds to the same physical
-size regardless of slice orientation.
+Left-drag paints into the selected ROI, right-drag erases. The brush is an
+ellipse in pixels so that ``brush_size_mm`` (a radius) is the same physical
+size on every view. The wheel resizes the brush in 1 mm steps.
 
-Mouse-wheel while the brush is active adjusts the brush size (1 mm steps).
+A stroke is painted into a copy of the mask volume and committed to the state
+on release, so live feedback costs no ``sitk`` round-trip or notification.
 """
 
 from typing import TYPE_CHECKING
@@ -21,8 +21,7 @@ from ..state.viewer_state import MIN_BRUSH_SIZE_MM, SliceViewerState
 if TYPE_CHECKING:
     from .viewer_events import ViewerEventHandler
 
-# Matplotlib mouse-button numbers the brush responds to. Any other button
-# is ignored entirely rather than being treated as an erase.
+# Mouse buttons the brush responds to; any other button is ignored
 _PAINT_BUTTON = 1
 _ERASE_BUTTON = 3
 
@@ -50,25 +49,21 @@ class BrushEventHandler:
         self.is_active: bool = False
         self.brush_circle: Circle | None = None
         self._is_dragging: bool = False
-        self._button: int | None = None  # 1 = paint, 3 = erase
-        self._active_axis: str | None = None  # axis on which the stroke was started
-        self._last_pos_px: tuple[int, int] | None = None
-        self._stroke_mask: np.ndarray | None = None
-        self._stroke_radii_px: tuple[float, float] | None = None
-        # 2-D (rows, cols) shape of the slice being painted, cached once at
-        # press time (like _stroke_radii_px) so _physical_to_slice_pixel
-        # does not re-slice the mask volume on every motion event during
-        # a stroke.
-        self._stroke_slice_shape: tuple[int, int] | None = None
-        # Slice index the stroke is painting into, captured at press time.
-        self._stroke_index: int | None = None
 
+        # Per-stroke state, all pinned at press time
+        self._button: int | None = None
+        self._active_axis: str | None = None
+        self._stroke_index: int | None = None
+        self._stroke_image: sitk.Image | None = None
+        self._stroke_slice_shape: tuple[int, int] | None = None
+        self._stroke_radii_px: tuple[float, float] | None = None
+        self._stroke_mask: np.ndarray | None = None
+        self._last_pos_px: tuple[int, int] | None = None
         self._cached_mask_volume: np.ndarray | None = None
         self._cached_roi_number: int | None = None
 
-        # The cursor circle is shown only after the first mouse-move that
-        # carries data coordinates, preventing a stale circle from appearing at
-        # activation time.
+        # The cursor appears only after a move with data coordinates, so no
+        # stale circle shows at activation
         self._cursor_ready: bool = False
 
     # ------------------------------------------------------------------
@@ -76,12 +71,7 @@ class BrushEventHandler:
     # ------------------------------------------------------------------
     @property
     def is_dragging(self) -> bool:
-        """``True`` while a paint/erase stroke is in progress.
-
-        Mirrors ``CrosshairEventHandler.is_dragging`` /
-        ``BboxEventHandler.is_dragging`` so ``ViewerEventHandler`` can check
-        all three drag flags uniformly (see ``_any_drag_in_progress``).
-        """
+        """``True`` while a paint / erase stroke is in progress."""
         return self._is_dragging
 
     def activate(self) -> None:
@@ -90,17 +80,10 @@ class BrushEventHandler:
         self._cursor_ready = False
 
     def deactivate(self) -> None:
-        """Disable the brush tool, remove the cursor, and abandon any stroke.
+        """Disable the brush tool, remove the cursor, and discard any stroke.
 
-        A stroke in progress must be abandoned here, not merely left for
-        ``handle_release`` to clean up: the host application can flip
-        ``brush_tool_active`` off while the mouse button is still held
-        (e.g. leaving the edit tab mid-drag), and ``ViewerEventHandler.
-        on_release`` only routes to ``handle_release`` while the brush is
-        still active. Without this, ``_is_dragging`` stays ``True`` and the
-        cached mask volume stays allocated; re-activating the brush later
-        then finds ``_is_dragging`` still set and starts painting on the
-        very next mouse hover, with no button held at all.
+        The host may deactivate the brush while the button is held; the
+        release would then never reach :meth:`handle_release`.
         """
         self.is_active = False
         self._cursor_ready = False
@@ -109,15 +92,10 @@ class BrushEventHandler:
         self.viewer.refresh_canvas()
 
     def _abandon_stroke(self) -> None:
-        """Clear the in-progress-drag flags and discard any painted stroke.
+        """Discard the in-progress stroke without committing it.
 
-        Called from :meth:`deactivate` only. This *discards* the
-        in-progress stroke, which is why it is not shared with the
-        lost-release recovery in ``ViewerEventHandler._recover_lost_drag``:
-        that path calls :meth:`handle_release` instead, which *commits* the
-        stroke — losing paint the user watched land on screen would be
-        worse than the (harmless) commit of an in-progress edit. The two
-        paths differ in outcome on purpose; do not merge them.
+        Deliberately different from the lost-release recovery, which commits
+        the stroke via :meth:`handle_release`.
         """
         if not self._is_dragging:
             return
@@ -126,18 +104,10 @@ class BrushEventHandler:
         self._reset_stroke()
 
     def reset(self) -> None:
-        """Drop the cursor artist reference after the owning Axes were cleared.
+        """Drop the cursor reference after ``Axes.clear()`` / a layout rebuild.
 
-        Call this after ``ax.clear()`` / a layout rebuild (see
-        ``DicomViewer._reset_artists``). At that point ``brush_circle`` is
-        already gone from the Axes — matplotlib's ``cla()`` discards the
-        artist bookkeeping without calling ``Artist.remove()`` on each
-        child — so ``_remove_brush_cursor`` calling ``.remove()`` on the
-        stale reference would raise ``NotImplementedError: cannot remove
-        artist``. Only the reference is released here; the cursor circle
-        is recreated lazily on the next mouse-move via
-        ``_update_brush_cursor``, mirroring ``ContourOverlay.reset`` /
-        ``IsodoseOverlay.reset``.
+        The artist is already detached (calling ``remove()`` on it would
+        raise); it is recreated on the next mouse move.
         """
         self.brush_circle = None
 
@@ -145,20 +115,10 @@ class BrushEventHandler:
     # Event handlers
     # ------------------------------------------------------------------
     def handle_press(self, event) -> None:
-        """Begin a paint or erase stroke on left / right button press.
-
-        Any other button (middle-click, or the extra buttons some mice
-        expose) is ignored. ``_apply_stroke_to_mask_cached`` treats
-        "not the paint button" as erase, so without this guard a stray
-        middle-click would silently subtract from the mask.
-        """
+        """Begin a paint (left) or erase (right) stroke; other buttons are ignored."""
         if event.button not in (_PAINT_BUTTON, _ERASE_BUTTON):
             return
 
-        # Guard against a press landing outside any view (e.g. the figure
-        # margin): current_axis is "" there and event.xdata/ydata are None,
-        # so falling through would slice with an empty axis name and raise
-        # KeyError from state.indices[""] a few lines below.
         axis = self._hover.current_axis
         if not axis or event.xdata is None or event.ydata is None:
             return
@@ -169,34 +129,21 @@ class BrushEventHandler:
 
         mask_image = self.state.structure_set.get_mask(roi_number)
         if mask_image is None:
-            # __contains__ was checked above, but the entry could in theory
-            # be removed between the check and here; guard rather than crash.
             return
 
         self._is_dragging = True
         self._button = event.button
         self._active_axis = axis
-        # Pinned for the whole stroke, like _stroke_radii_px below. Reading
-        # state.indices afresh on every write meant a slice change mid-drag
-        # — an arrow key, or a host widget moving the slice from elsewhere —
-        # silently redirected the rest of the stroke, and the final commit,
-        # onto a slice the user never painted on.
+        # Pinned so a slice change mid-drag cannot redirect the stroke
         self._stroke_index = self.state.indices[axis]
+        # Pinned so a stroke is never committed onto a different image
+        self._stroke_image = self.state.primary_image
 
-        mask_slice = self.state.get_slice_data(mask_image, self._active_axis)
+        mask_slice = self.state.get_slice_data(mask_image, axis)
         self._stroke_mask = np.zeros_like(mask_slice, dtype=bool)
-        # Cached alongside _stroke_radii_px below: the in-plane shape is
-        # fixed for the duration of the stroke, so _physical_to_slice_pixel
-        # can reuse it instead of re-slicing the mask on every motion event.
         self._stroke_slice_shape = mask_slice.shape
-
         self._cached_mask_volume = sitk.GetArrayFromImage(mask_image)
         self._cached_roi_number = roi_number
-        # The physical extent and in-plane shape only depend on the image
-        # geometry and axis, both fixed for the duration of a stroke, so
-        # the radius-in-pixels conversion is computed once here instead of
-        # on every motion event (previously re-sliced state.primary_image
-        # on every mouse-move during a drag).
         self._stroke_radii_px = self._compute_brush_radii_px(self._active_axis)
 
         self._last_pos_px = None
@@ -209,18 +156,6 @@ class BrushEventHandler:
                 self._remove_brush_cursor()
             return
 
-        # The cursor is drawn only once a motion event carries valid data
-        # coordinates. That is what suppresses the spurious event Matplotlib
-        # can deliver at activation time, before the pointer has moved inside
-        # a view: such an event has no data coordinates, so it cannot place a
-        # circle anywhere meaningful.
-        #
-        # A previous version also tracked the last hovered view here and
-        # cleared the flag when it changed — on the line immediately before an
-        # unconditional re-set of the same flag, so the clear could never be
-        # observed by anything. The tracking existed only to feed that dead
-        # branch, and both are gone: a move into a different view carries valid
-        # coordinates for that view, so there is nothing to wait for.
         current = self._hover.current_axis
         if event.xdata is not None and event.ydata is not None:
             self._cursor_ready = True
@@ -229,63 +164,39 @@ class BrushEventHandler:
             self._update_brush_cursor(event)
 
         if self._is_dragging:
-            # A stroke never crosses view boundaries: _stroke_mask and
-            # _cached_mask_volume were built for self._active_axis, so
-            # painting with a different axis' pixel coordinates would
-            # corrupt the mask if the pointer drifts into another view
-            # mid-drag.
+            # A stroke never crosses into another view
             if current != self._active_axis:
                 return
             pos_px = self._physical_to_slice_pixel(current, (event.xdata, event.ydata))
             if pos_px is None or pos_px == self._last_pos_px:
                 return
-            # Pass the pixel position already computed above into
-            # _paint_at instead of letting it recompute the same
-            # physical-to-pixel conversion a second time for this event.
             self._paint_at(event, interpolate=True, center_px=pos_px)
 
     def handle_release(self, event) -> None:
-        """Commit the completed stroke to the ROI mask volume."""
+        """Commit the completed stroke to the ROI it was painted into.
+
+        The stroke is discarded when the ROI was deleted or the primary image
+        was replaced mid-stroke (ROI numbers restart per image, so the number
+        alone could match an unrelated ROI of the new image).
+        """
         if not self._is_dragging:
             return
         self._is_dragging = False
-
         axis = self._active_axis
         self._active_axis = None
 
-        if not axis:
-            self._reset_stroke()
-            return
-
-        # Commit to the ROI the stroke was actually painted into
-        # (self._cached_roi_number, captured in handle_press), not
-        # state.selected_roi_number as it stands now. If the selected ROI
-        # changes mid-drag (e.g. the host application switches it from
-        # another widget while the mouse button is still held), reading
-        # selected_roi_number here would write this stroke's mask volume
-        # into the *new* ROI's entry, silently overwriting its mask with
-        # the one that was painted for the ROI active at press time.
+        # The ROI pinned at press time, not the selection as it is now
         roi_number = self._cached_roi_number
-        if roi_number is None or roi_number not in self.state.structure_set:
-            self._reset_stroke()
-            return
-
-        # Apply hole-filling on the final 2-D slice if requested, then commit.
         mask_volume = self._cached_mask_volume
-        if mask_volume is None:
-            # A press that failed its guards never populated the cache, so
-            # there is nothing to commit.
-            self._reset_stroke()
-            return
-
-        # The primary image can be cleared mid-stroke (e.g. a host
-        # application calls state.set_primary_image_data(None) from an
-        # unrelated event while the mouse button is still held). The
-        # cached mask volume was built for an image that no longer
-        # exists, so committing it here would call
-        # ``new_mask.CopyInformation(None)`` and raise. Discard the
-        # in-progress stroke instead of committing stale geometry.
-        if self.state.primary_image is None:
+        primary_image = self.state.primary_image
+        if (
+            not axis
+            or roi_number is None
+            or roi_number not in self.state.structure_set
+            or mask_volume is None
+            or primary_image is None
+            or primary_image is not self._stroke_image
+        ):
             self._reset_stroke()
             return
 
@@ -295,19 +206,13 @@ class BrushEventHandler:
             mask_volume[slobj] = binary_fill_holes(mask_volume[slobj])
 
         new_mask = sitk.GetImageFromArray(mask_volume.astype(np.uint8))
-        new_mask.CopyInformation(self.state.primary_image)
+        new_mask.CopyInformation(primary_image)
         self.state.update_contour_properties(roi_number, {"mask": new_mask})
 
         self._reset_stroke()
 
     def handle_scroll(self, event) -> None:
-        """Adjust the brush size by 1 mm per scroll step.
-
-        The floor is the state's own :data:`MIN_BRUSH_SIZE_MM` rather than a
-        number of this module's choosing: a second, larger floor here made
-        the smallest reachable brush depend on whether the user got there by
-        scrolling or through a host's size control.
-        """
+        """Adjust the brush size by 1 mm per scroll step."""
         if not self._hover.current_axis or not self.is_active:
             return
         new_size = self.state.brush_size_mm + 1.0 * np.sign(event.step)
@@ -354,12 +259,7 @@ class BrushEventHandler:
         self.viewer.request_redraw(axis)
 
     def remove_cursor(self) -> None:
-        """Remove the brush cursor circle from the canvas.
-
-        Public entry point for callers outside this class (e.g.
-        ``ViewerEventHandler.on_leave_axes``) that need to hide the cursor
-        without reaching into a private method.
-        """
+        """Remove the brush cursor circle from the canvas."""
         self._remove_brush_cursor()
 
     def _remove_brush_cursor(self) -> None:
@@ -388,20 +288,14 @@ class BrushEventHandler:
         interpolate: bool = False,
         center_px: tuple[int, int] | None = None,
     ) -> None:
-        """Apply the brush at the current event position.
-
-        When *interpolate* is True, intermediate positions between the
-        previous and current pixel are also painted to avoid gaps in the stroke.
+        """Apply the brush at the event position and refresh the live contour.
 
         Args:
-            event: The originating matplotlib mouse event.
-            interpolate: See above.
-            center_px: Pixel position already converted from
-                ``(event.xdata, event.ydata)`` by the caller (e.g.
-                ``handle_motion``, which needs the same conversion to
-                decide whether to paint at all). When ``None``, this method
-                computes it itself — used by ``handle_press``, which has
-                no prior conversion to reuse.
+            event: The originating mouse event.
+            interpolate: Also paint the positions between the previous and
+                the current pixel, so fast strokes have no gaps.
+            center_px: The event position in pixels, when the caller has
+                already computed it.
         """
         axis = self._hover.current_axis
         if not (axis and event.xdata is not None and event.ydata is not None):
@@ -418,17 +312,13 @@ class BrushEventHandler:
         self._draw_brush_on_stroke_mask(axis, center_px)
         self._apply_stroke_to_mask_cached()
         self._last_pos_px = center_px
-
-        # Render the contour from the cached slice so the outline reflects the
-        # latest paint state without a sitk round-trip or a State notification.
         self._draw_axis_contours_from_cache(axis)
         self.viewer.request_redraw(axis)
 
     def _interpolate_and_draw_stroke(
         self, axis: str, start_px: tuple[int, int], end_px: tuple[int, int]
     ) -> None:
-        """Linearly interpolate brush positions between *start_px* and *end_px*
-        to produce a continuous stroke without gaps."""
+        """Paint brush positions interpolated between *start_px* and *end_px*."""
         if self._stroke_mask is None:
             return
         dist = np.linalg.norm(np.array(end_px) - np.array(start_px))
@@ -458,15 +348,7 @@ class BrushEventHandler:
         self._stroke_mask[row_min:row_max, col_min:col_max][ellipse] = True
 
     def _apply_stroke_to_mask_cached(self) -> None:
-        """Write the current stroke mask into the cached NumPy volume in-place.
-
-        No ``sitk`` conversion or State notification is performed; the result
-        stays in ``_cached_mask_volume`` until ``handle_release`` commits it.
-
-        Both buttons are matched explicitly so that an unexpected value in
-        ``_button`` leaves the mask untouched rather than falling through
-        to the erase branch.
-        """
+        """Paint (or erase) the stroke mask into the cached volume in place."""
         if self._stroke_mask is None or self._cached_mask_volume is None:
             return
 
@@ -485,15 +367,7 @@ class BrushEventHandler:
             )
 
     def _draw_axis_contours_from_cache(self, axis: str) -> None:
-        """Re-render the contour for the edited ROI using the cached slice.
-
-        During dragging the cached volume reflects the latest paint but has
-        not yet been written back to State. This method extracts the current
-        2-D slice from ``_cached_mask_volume`` and passes it to the viewer's
-        public contour renderer via the ``override_mask`` parameter, bypassing
-        ``state.structure_set`` for the active ROI. The outline therefore
-        updates in real time without a sitk round-trip or a State notification.
-        """
+        """Redraw *axis*' contours with the uncommitted stroke as an override mask."""
         if self._cached_mask_volume is None or self._cached_roi_number is None:
             self.viewer.draw_contours_with_override(axis, override_mask=None)
             return
@@ -510,14 +384,10 @@ class BrushEventHandler:
     # Cache helpers
     # ------------------------------------------------------------------
     def _make_slobj(self, axis: str) -> tuple:
-        """Return a 3-D index tuple selecting this stroke's slice along *axis*.
+        """Return the ``(z, y, x)`` index selecting the stroke's slice along *axis*.
 
-        Equivalent to ``[slice(None), slice(None), slice(None)]`` with the
-        dimension for *axis* replaced by the slice index.
-
-        The index is the one pinned at press time whenever a stroke is in
-        progress (see :meth:`handle_press`), and the current one otherwise —
-        so a caller outside a stroke still gets the slice on screen.
+        Uses the index pinned at press time, or the displayed one outside a
+        stroke.
         """
         index = (
             self._stroke_index
@@ -529,24 +399,14 @@ class BrushEventHandler:
         return tuple(slobj)
 
     def _reset_stroke(self) -> None:
-        """Clear every piece of per-stroke state, including the mask cache.
-
-        ``handle_release`` leaves a stroke through several paths (committed
-        normally, or abandoned because the axis, ROI or primary image went
-        away mid-drag). Each has to clear the same set of attributes, so
-        they are cleared here in one place instead of being repeated — and
-        occasionally missed — at each exit.
-        """
+        """Clear every piece of per-stroke state, including the mask copy."""
         self._stroke_mask = None
         self._stroke_radii_px = None
         self._stroke_slice_shape = None
         self._stroke_index = None
+        self._stroke_image = None
         self._last_pos_px = None
         self._button = None
-        self._discard_cache()
-
-    def _discard_cache(self) -> None:
-        """Release the cached NumPy volume and associated metadata."""
         self._cached_mask_volume = None
         self._cached_roi_number = None
 
@@ -554,22 +414,15 @@ class BrushEventHandler:
     # Coordinate helpers
     # ------------------------------------------------------------------
     def _get_brush_radii_px(self, axis: str) -> tuple[float, float]:
-        """Return the current stroke's cached brush radius in pixel units ``(ry, rx)``.
-
-        Falls back to computing fresh if called outside an active stroke
-        (e.g. for cursor-preview rendering before the first press).
-        """
+        """Return the brush radii in pixels ``(ry, rx)``, pinned during a stroke."""
         if self._stroke_radii_px is not None:
             return self._stroke_radii_px
         return self._compute_brush_radii_px(axis)
 
     def _compute_brush_radii_px(self, axis: str) -> tuple[float, float]:
-        """Convert the brush radius from mm to pixel units ``(ry, rx)``.
+        """Convert the brush radius from mm to pixels ``(ry, rx)`` on *axis*.
 
-        The conversion accounts for the physical extent of the current slice
-        so the brush appears isotropic in physical space. With the
-        pixel-center extent convention, pixels-per-mm along each axis is
-        ``shape / (extent span)`` (i.e. ``1 / spacing``).
+        Pixels per mm is ``shape / extent span`` (``1 / spacing``).
         """
         slice_shape = self.state.get_slice_data(self.state.primary_image, axis).shape
         extent = self.state.get_extent(axis)
@@ -585,30 +438,20 @@ class BrushEventHandler:
     def _physical_to_slice_pixel(
         self, axis: str, phys_pos: tuple[float, float]
     ) -> tuple[int, int] | None:
-        """Map a physical coordinate pair to the nearest pixel in the slice.
+        """Map a physical ``(x, y)`` on *axis* to the nearest ``(row, col)`` pixel.
 
-        Returns ``None`` if no ROI is selected or the slice is degenerate.
-
-        During an active stroke on *axis*, the in-plane shape cached at
-        press time (``_stroke_slice_shape``) is reused instead of
-        re-slicing the mask volume via ``get_slice_data`` on every call —
-        this is invoked on every motion event of a drag, so avoiding a
-        fresh ``sitk`` slice extraction there matters the same way it does
-        for ``_get_brush_radii_px``. Outside an active stroke (e.g. a
-        cursor-preview lookup before the first press) the shape is still
-        read fresh, since no stroke-scoped cache is guaranteed valid then.
+        Returns ``None`` without a selected ROI or for a degenerate slice.
         """
-        roi_number = self.state.selected_roi_number
-        if roi_number is None:
-            return None
-
         if (
             self._is_dragging
             and axis == self._active_axis
-            and (self._stroke_slice_shape is not None)
+            and self._stroke_slice_shape is not None
         ):
             slice_shape = self._stroke_slice_shape
         else:
+            roi_number = self.state.selected_roi_number
+            if roi_number is None:
+                return None
             mask_image = self.state.structure_set.get_mask(roi_number)
             if mask_image is None:
                 return None
@@ -616,11 +459,7 @@ class BrushEventHandler:
         if slice_shape[0] < 2 or slice_shape[1] < 2:
             return None
         x_min, x_max, y_min, y_max = self.state.get_extent(axis)
-        # Pixel-center convention (see geometry.compute_extent): pixel i's
-        # center sits at x_min + (i + 0.5) * sx, so the inverse mapping is
-        # (phys - x_min) / sx - 0.5. Using (shape - 1) here previously
-        # compressed the mapping by up to one pixel at the far edge,
-        # painting strokes slightly off from the cursor position.
+        # Pixel i's centre is at x_min + (i + 0.5) * sx (pixel-centre extent)
         sx = (x_max - x_min) / slice_shape[1]
         sy = (y_max - y_min) / slice_shape[0]
         col = (phys_pos[0] - x_min) / sx - 0.5

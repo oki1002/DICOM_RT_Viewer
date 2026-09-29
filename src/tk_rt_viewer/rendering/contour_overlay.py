@@ -1,21 +1,9 @@
-"""contour_overlay.py — ROI contour rendering collaborator.
+"""contour_overlay.py — ROI contour rendering.
 
-Design:
-    All active ROI contour paths for an axis are funnelled into a single
-    ``PathCollection`` instead of one ``PathPatch`` per ROI, so the blit
-    layer issues a single ``draw_artist`` call per axis regardless of how
-    many ROIs are active.
-
-    Paths themselves are persisted in ``SliceViewerState.contour_path_cache``
-    and are not recomputed when the same (roi_number, axis, slice_index) is
-    revisited. Override masks supplied during brush painting bypass the
-    cache and are recomputed on every call.
-
-Coupling:
-    Like IsoDoseOverlay, this class receives the state object and an
-    ``on_artists_changed`` callback via constructor injection and never
-    touches the viewer. The target ``Axes`` is passed per call so the
-    overlay is unaffected by layout rebuilds.
+All active ROI paths of an axis go into one ``PathCollection``, so the blit
+layer draws one artist per axis however many ROIs are active. Paths are
+cached in ``SliceViewerState.contour_path_cache``; override masks from an
+in-progress brush stroke bypass the cache.
 """
 
 import logging
@@ -36,13 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 class ContourOverlay:
-    """Owns and renders the ROI contour (PathCollection) artists for all axes.
-
-    Blit integration: artists created here live in the viewer's blit layer.
-    ``on_artists_changed`` fires only when a PathCollection is newly
-    created (pure path / colour updates mutate the existing collection and
-    do not fire it).
-    """
+    """Owns and renders the ROI contour ``PathCollection`` of every axis."""
 
     def __init__(
         self,
@@ -52,11 +34,9 @@ class ContourOverlay:
         """Initialise the overlay.
 
         Args:
-            state: The shared viewer state. Read-only access
-                (contour_path_cache, mask_slice_cache, structure_set, etc.).
-            on_artists_changed: Called with the axis name whenever a
-                PathCollection is newly created, so the owner can
-                invalidate any cached blit-artist list.
+            state: The shared viewer state (read only, plus path caching).
+            on_artists_changed: Called with an axis name when its collection
+                is created (not on content updates).
         """
         self._state = state
         self._on_artists_changed = on_artists_changed
@@ -73,27 +53,14 @@ class ContourOverlay:
     ) -> None:
         """Render every active ROI's contour on *axis* into one PathCollection.
 
-        ROIs present in *override_mask* bypass the cache and are recomputed
-        on every call (transient brush-dragging state must not be
-        persisted).
-
-        ROIs are visited in ``roi_number`` order rather than
-        ``state.active_contours``' own iteration order: that attribute is a
-        ``frozenset``, whose iteration order is a function of hash-table
-        size and is therefore not stable across a change to *which* ROIs
-        are active (adding or removing an unrelated ROI can resize the
-        table and reorder every other member). Since later entries here are
-        drawn on top, an unstable order means the stacking of overlapping
-        filled contours would shuffle itself on every unrelated ROI
-        activation/deactivation. Sorting fixes the paint order to ROI
-        number regardless of activation history.
+        ROIs are drawn in ``roi_number`` order (the ``frozenset`` order is not
+        stable), so overlapping fills stack consistently.
 
         Args:
-            axis: One of ``"axial"``, ``"coronal"``, or ``"sagittal"``.
-            ax: Target Axes to render into.
-            override_mask: Optional ``{roi_number: 2-D numpy array}`` that
-                takes precedence over ``state.structure_set`` for the given
-                ROIs.
+            axis: View axis.
+            ax: Target Axes.
+            override_mask: ``{roi_number: 2-D mask}`` used instead of the
+                stored mask (an in-progress brush stroke); never cached.
         """
         state = self._state
         effective_override = override_mask or {}
@@ -108,8 +75,6 @@ class ContourOverlay:
 
         for roi_number in sorted(state.active_contours):
             using_override = roi_number in effective_override
-
-            # Paths are never cached for override data (transient brush state).
             paths = (
                 None if using_override else cache.get(roi_number, axis, current_index)
             )
@@ -118,8 +83,6 @@ class ContourOverlay:
                 if using_override:
                     mask_slice = effective_override[roi_number]
                 else:
-                    # Retrieve the slice from mask_slice_cache to avoid a
-                    # sitk round-trip; fall back to the sitk mask when absent.
                     cached_slice = state.mask_slice_cache.get_slice(
                         roi_number, axis, current_index
                     )
@@ -158,8 +121,6 @@ class ContourOverlay:
             )
             ax.add_collection(collection, autolim=False)
             self._collections[axis] = collection
-            # The artist composition changed only here; content updates below
-            # mutate the existing collection and keep the blit cache valid.
             self._on_artists_changed(axis)
         else:
             collection.set_paths(all_paths)
@@ -167,12 +128,7 @@ class ContourOverlay:
             collection.set_facecolor(face_colors)
 
     def draw_all(self, axs: dict[str, Axes]) -> None:
-        """Redraw contours for every axis currently present in *axs*.
-
-        Iterates over *axs* rather than the fixed ``AXES`` tuple so that
-        layout modes with fewer panels (e.g. ``"single"``) do not raise a
-        ``KeyError`` for axes that were never built.
-        """
+        """Redraw contours for every axis present in *axs* (the current layout)."""
         for axis in axs:
             self.draw(axis, axs[axis])
 
@@ -192,10 +148,5 @@ class ContourOverlay:
     # Reset
     # ------------------------------------------------------------------
     def reset(self) -> None:
-        """Discard the PathCollection reference for every axis.
-
-        ``ax.clear()`` removes every artist from the Axes, so this only
-        resets the reference to avoid touching an already-removed artist
-        after a layout rebuild.
-        """
+        """Drop the collection references after ``Axes.clear()`` / a layout rebuild."""
         self._collections = dict.fromkeys(AXES)

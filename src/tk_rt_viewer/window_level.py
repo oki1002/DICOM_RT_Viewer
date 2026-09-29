@@ -1,11 +1,7 @@
 """window_level.py — Display windows: CT presets and a window derived from data.
 
-A viewer needs two things a host would otherwise re-invent: the handful of
-window widths and levels CT is conventionally read at, and a way to produce a
-usable window for an image that has no conventional one. MR intensities carry
-no standard scale — the same sequence on the same scanner lands in a different
-range from one patient to the next — so a fixed preset cannot work there, and
-an image displayed with the wrong one looks blank.
+CT has conventional windows; MR and other modalities have no standard
+intensity scale, so their window has to be derived from the image itself.
 
 Windows are ``(window_width, window_level)`` pairs, matching
 ``SliceViewerState.window_level``.
@@ -31,28 +27,22 @@ CT_WINDOW_PRESETS: dict[str, tuple[float, float]] = {
 #: the entries of :data:`CT_WINDOW_PRESETS`.
 AUTO_WINDOW_PRESET: str = "Auto"
 
-#: Percentiles bounding the automatic window. Using the full range instead
-#: would let a handful of outliers — a metal artefact, an MR spike — stretch
-#: the window until real contrast disappears.
+#: Percentiles bounding the automatic window. The full range would let a few
+#: outliers (metal, MR spikes) stretch the window until contrast disappears.
 AUTO_WINDOW_PERCENTILES: tuple[float, float] = (1.0, 99.0)
 
-#: Upper bound on the voxels sampled when deriving a window from image
-#: statistics. ``np.percentile`` sorts its input, so running it over a full
-#: volume costs O(N log N) on tens of millions of voxels; a strided sample of
-#: this size yields percentiles that agree to well within one display step.
+#: Upper bound on the voxels sampled for percentile statistics. A strided
+#: sample of this size agrees with the full volume to within one display step
+#: at a fraction of the O(N log N) sorting cost.
 WINDOW_PERCENTILE_SAMPLE_TARGET: int = 2_000_000
 
 
 def strided_sample(array: np.ndarray, target_voxels: int) -> np.ndarray:
-    """Return a strided view of *array* holding at most *target_voxels* voxels.
-
-    A uniform stride preserves the intensity distribution closely enough for a
-    display window, which a UI quantises to integer units anyway.
-    """
+    """Return a strided view of *array* holding at most *target_voxels* voxels."""
     if array.size <= target_voxels:
         return array
     # The stride applies to every dimension, so the sample shrinks by
-    # step ** ndim; take the ndim-th root of the required reduction.
+    # step ** ndim; take the ndim-th root of the required reduction
     step = max(1, math.ceil((array.size / target_voxels) ** (1.0 / array.ndim)))
     return array[(slice(None, None, step),) * array.ndim]
 

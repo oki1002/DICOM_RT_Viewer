@@ -4,6 +4,63 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.1.2]
+
+A review pass: behaviour fixes with no API break, a shared implementation for
+the two bounding-box handlers, and comments trimmed to what the code needs
+(change history lives here, not in docstrings).
+
+### Fixed
+
+- **A saved registration now applies to the whole moving series on reload.**
+  `load_all_series` matched a REG object only through the SOP Instance UID
+  of each series' *first* file, so a registration written by
+  `save_registration` from any other slice was silently ignored. REG
+  references are now also resolved to their series.
+- **`save_registration` writes references where the standard puts them**:
+  `ReferencedImageSequence` inside each Registration Sequence item and the
+  series in the top-level `ReferencedSeriesSequence` (Common Instance
+  Reference Module). Files written by 2.1.x are still read.
+- **`save_registration` rejects reflections.** An orthonormal matrix with
+  determinant -1 passed the rigidity check and was written as `RIGID`.
+- **A bounding-box edge is only grabbable along its own span.** A press
+  level with an edge but far outside the box started a resize instead of a
+  new box (2-D and 3-D boxes).
+- **Deleting the selected ROI clears the selection** (and fires
+  `selected_roi_changed`), so the brush no longer targets a deleted ROI.
+- **A brush stroke is discarded when the primary image is replaced
+  mid-stroke.** ROI numbers restart per image, so the stroke could be
+  committed into an unrelated ROI of the new image.
+- **Custom isodose levels are sorted by dose.** Unsorted input to
+  `set_isodose_lines` painted every band in the wrong colour.
+- **A flat non-CT series gets a usable initial window** instead of a zero
+  width.
+- **`BlitCompositor.cache_backgrounds` restores overlay visibility even if
+  the render fails**, instead of leaving crosshairs and contours hidden.
+- `set_secondary_image_data` rebuilds the secondary array cache before
+  changing the blend, so blend listeners never render the previous overlay.
+- **Loading a new primary image notifies the fields it resets.**
+  `selected_roi_changed`, `blend_alpha_changed`,
+  `secondary_window_level_changed`, `bounding_boxes_changed` and
+  `bounding_box_3d_changed` now fire (once, and only for fields whose value
+  changed) before `primary_image_data_changed`, so host UIs such as the
+  blend slider no longer keep showing pre-reset values.
+- `smooth_contour` rejects a negative `sigma_mm`; `StructureSet.update`
+  validates field names even for an unknown ROI number.
+
+### Changed
+
+- **Background contour builds trigger one coalesced redraw** instead of one
+  full contour redraw per finished ROI (an N-ROI RT-STRUCT redrew N times),
+  and none at all when no finished ROI is displayed. See
+  `rendering.drawing_manager.ContourRedrawCoalescer`.
+- `BboxEventHandler` and `Bbox3dEventHandler` share
+  `event_controllers.rect_drag.RectDragHandler`; both now also ignore
+  non-left presses themselves.
+- `window_level_changed` is notified with the stored float values.
+- `registration.rigid` no longer re-exports `moving_chain` (import it from
+  `tk_rt_viewer.registration`).
+
 ## [2.1.1] — 2026
 
 A patch release from a review of the 2.1.0 tree. The headline is that

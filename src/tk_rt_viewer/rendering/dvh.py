@@ -1,9 +1,7 @@
-"""dvh.py — Cumulative DVH (Dose Volume Histogram) panel rendering.
+"""dvh.py — Cumulative DVH (dose-volume histogram) panel.
 
-DvhPanel renders one cumulative DVH curve per active ROI into a dedicated
-Matplotlib Axes. It depends only on SliceViewerState (read-only) and the
-Axes passed to update(); it never imports or touches DicomViewer, matching
-the constructor-injection style used by IsoDoseOverlay.
+One cumulative curve per active ROI, computed from the dose resampled onto
+the CT grid so dose voxels line up with the ROI masks.
 """
 
 import logging
@@ -22,20 +20,15 @@ logger = logging.getLogger(__name__)
 class DvhPanel:
     """Renders the cumulative DVH panel for the currently active ROIs."""
 
-    # Number of histogram bins used to build each cumulative DVH curve.
-    # A fixed bin count keeps the plotted line at a few hundred vertices
-    # regardless of ROI size; plotting one vertex per voxel (a sort-based
-    # approach) produces multi-million-point lines that take hundreds of
-    # milliseconds to draw for large ROIs.
+    #: Histogram bins per curve; keeps the line at a few hundred vertices
+    #: regardless of ROI size.
     _DVH_BINS: int = 512
 
     def __init__(self, state: "SliceViewerState") -> None:
         """Initialise the panel.
 
         Args:
-            state: The shared viewer state. Read-only access: rt_dose_resampled,
-                active_contours, structure_set, mask_slice_cache,
-                get_dose_volume_cached().
+            state: The shared viewer state (read only).
         """
         self._state = state
 
@@ -43,13 +36,8 @@ class DvhPanel:
     def _dose_voxels_in_roi(dose_arr: np.ndarray, mask_arr: np.ndarray) -> np.ndarray:
         """Return the dose values inside *mask_arr* as a 1-D array.
 
-        The mask is reduced to its bounding box before the values are
-        extracted. Boolean-indexing the whole volume allocates a full-volume
-        temporary for the comparison and scans every voxel, which is paid once
-        per active ROI on every DVH update — and a brush stroke triggers one
-        of those on release. An ROI typically occupies a few percent of the
-        grid, so cropping first turns that into a small fraction of the work
-        while producing exactly the same set of values.
+        Cropping to the mask's bounding box first avoids scanning the whole
+        volume for a typically small ROI.
         """
         occupied = [
             np.flatnonzero(mask_arr.any(axis=axes)) for axes in ((1, 2), (0, 2), (0, 1))
@@ -63,12 +51,7 @@ class DvhPanel:
         return np.asarray(dose_arr[box][mask_box != 0])
 
     def style_axes(self, ax: Axes) -> None:
-        """Apply dark-theme styling to the DVH axes.
-
-        Called both when the axes are first created (by LayoutManager) and
-        on every :meth:`update` call, so the two call sites always agree on
-        the panel's appearance.
-        """
+        """Apply dark-theme styling to the DVH axes (on creation and every update)."""
         ax.set_facecolor((0.05, 0.05, 0.05))
         ax.tick_params(colors="white", labelsize=7)
         for spine in ax.spines.values():
@@ -92,14 +75,7 @@ class DvhPanel:
         ax.figure.canvas.draw_idle()
 
     def update(self, ax: Axes) -> None:
-        """Render the DVH for all active contours into *ax*.
-
-        ROIs are visited in ``roi_number`` order (see ``ContourOverlay.draw``
-        for why iterating the ``active_contours`` frozenset directly is not
-        stable): here that keeps the legend entries and plotted curves in a
-        consistent order across redraws, instead of reshuffling whenever an
-        unrelated ROI is activated or deactivated.
-        """
+        """Render the DVH of every active ROI into *ax*, in ``roi_number`` order."""
         ax.clear()
         self.style_axes(ax)
         ax.set_xlabel("Dose (Gy)", fontsize=8)
@@ -107,7 +83,6 @@ class DvhPanel:
         ax.set_title("DVH", fontsize=9)
         ax.grid(True, alpha=0.3, color="gray")
 
-        # Use the dose resampled to the CT grid so voxel shapes match ROI masks.
         dose = self._state.rt_dose_resampled
         if dose is None:
             self.draw_placeholder(ax, "RT-DOSE not loaded")
@@ -118,8 +93,6 @@ class DvhPanel:
             self.draw_placeholder(ax, "No contours selected")
             return
 
-        # Reuse the pre-cast float32 array from the dose array cache to avoid a
-        # full sitk.GetArrayFromImage conversion on every DVH update.
         dose_arr = self._state.get_dose_volume_cached()
         if dose_arr is None:
             dose_arr = sitk.GetArrayFromImage(dose).astype(np.float32)
@@ -128,16 +101,10 @@ class DvhPanel:
         for roi_number in sorted(active):
             name = self._state.structure_set.get_name(roi_number) or str(roi_number)
             color = self._state.structure_set.get_color(roi_number) or "white"
-            # Prefer the uint8 volume already held by the mask cache; fall
-            # back to a zero-copy sitk view when the cache is not built yet.
             mask_arr = self._state.mask_slice_cache.get_volume(roi_number)
             if mask_arr is None:
                 mask_sitk = self._state.structure_set.get_mask(roi_number)
                 if mask_sitk is None:
-                    # A structure the user asked to see in the DVH is
-                    # missing from it entirely; logging why is the only way
-                    # to distinguish that from "the ROI simply has no dose
-                    # coverage" (the voxels.size == 0 case below).
                     logger.warning(
                         f"ROI {roi_number} ('{name}') skipped in DVH: no mask."
                     )
@@ -154,10 +121,6 @@ class DvhPanel:
             if voxels.size == 0:
                 continue
 
-            # Cumulative DVH from a fixed-bin histogram. Plotting one vertex
-            # per voxel (sort-based) produced multi-million-point lines that
-            # took hundreds of milliseconds to draw for large ROIs; 512 bins
-            # are visually indistinguishable at panel size.
             dose_max = max(float(voxels.max()), 1e-6)
             hist, edges = np.histogram(voxels, bins=self._DVH_BINS, range=(0, dose_max))
             volume_pct = (voxels.size - np.cumsum(hist)) / voxels.size * 100.0

@@ -1,11 +1,7 @@
 """crosshair_handler.py — Crosshair drag event handler.
 
-Design:
-    - The crosshair position is owned by :class:`SliceViewerState` as physical
-      LPS coordinates; this class only converts mouse events to index updates
-      via :meth:`SliceViewerState.set_index`.
-    - Rendering is handled by :class:`DicomViewer` through the
-      ``"crosshair_changed"`` listener — this class never draws anything.
+Converts drags of the crosshair lines into slice-index updates; the state
+derives the crosshair position and the viewer draws it.
 """
 
 from typing import TYPE_CHECKING
@@ -17,10 +13,8 @@ if TYPE_CHECKING:
     from .viewer_events import ViewerEventHandler
 
 
-# Per-view mapping of (drag direction) -> (target axis, event-coord attribute).
-# Used to translate a drag into one or two slice-index updates.
-#     "v" = vertical crosshair line   (drag left/right, uses event.xdata)
-#     "h" = horizontal crosshair line (drag up/down,    uses event.ydata)
+# Per view: dragged line -> (axis whose index it sets, event coordinate).
+# "v" is the vertical line (moves with xdata), "h" the horizontal one (ydata)
 _DRAG_TARGETS: dict[str, dict[str, tuple[str, str]]] = {
     "axial": {"v": ("sagittal", "xdata"), "h": ("coronal", "ydata")},
     "coronal": {"v": ("sagittal", "xdata"), "h": ("axial", "ydata")},
@@ -62,27 +56,16 @@ class CrosshairEventHandler:
         return self._is_dragging
 
     def cancel(self) -> None:
-        """Abandon an in-progress crosshair drag without applying it.
-
-        Call this when another interaction mode (e.g. the brush tool) is
-        activated while a crosshair drag is in progress. Without this, the
-        drag flags stay set and ``handle_motion`` keeps moving the crosshair
-        on later mouse events that have nothing to do with the drag that was
-        interrupted, since ``on_release`` only routes to this handler when
-        no other mode has claimed the mouse.
-        """
+        """Abandon an in-progress drag (another mode took over, or a lost release)."""
         self._is_dragging = False
         self._active_axis = None
         self._drag_target = None
 
     def handle_press(self, event) -> bool:
-        """Detect a click on the crosshair and begin a drag.
-
-        A click is considered "on" the crosshair when the cursor is within
-        ``TOLERANCE_PIXELS`` pixels of a crosshair line in display coordinates.
+        """Begin a drag when the left button is pressed on a crosshair line.
 
         Returns:
-            ``True`` if a crosshair drag was initiated; ``False`` otherwise.
+            ``True`` if a drag was started.
         """
         if event.button != 1 or not self.state.crosshair_visible:
             return False
@@ -96,10 +79,9 @@ class CrosshairEventHandler:
 
         ax = self.viewer.axes_map.get(axis)
         if ax is None:
-            # current_axis can name a view that the active layout does not
-            # build (e.g. "coronal" after switching to "single").
+            # current_axis may name a view the layout does not build
             return False
-        # Convert data coordinates to display pixels for hit-testing.
+        # Hit-test in display pixels
         px, py = ax.transData.transform((event.xdata, event.ydata))
         cx, cy = ax.transData.transform(pos)
         tol = self.TOLERANCE_PIXELS
@@ -137,8 +119,7 @@ class CrosshairEventHandler:
         else:
             targets = []
 
-        # Batch-update all affected indices before triggering a single
-        # crosshair recompute.
+        # Update every affected index, then recompute the crosshair once
         for target_axis, coord_attr in targets:
             coord = getattr(event, coord_attr)
             idx = self.state.physical_to_index(target_axis, coord)

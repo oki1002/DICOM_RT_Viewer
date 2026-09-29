@@ -1,32 +1,14 @@
-"""isodose.py — IsoDose overlay renderer (fill bands + contour lines).
+"""isodose.py — Isodose overlay (band fills + contour lines).
 
-Design:
-    The fill is one persistent ``AxesImage`` per axis whose colours come
-    from a ``ListedColormap`` + ``BoundaryNorm`` pair: dose values are
-    discretised into isodose bands directly, so a slice change reduces to a
-    single ``set_data`` call. Compared with the previous ``contourf``-based
-    implementation this removes the per-slice polygon tessellation (~15 ms
-    per newly visited slice at 256x256) and, more importantly, the artist
-    cache that had to retain one QuadContourSet per visited slice per axis
-    for the lifetime of the dose volume. Rendering cost is now a flat
-    ~6 ms ``set_data`` (256x256) per slice change with no memory growth.
+Fill: one persistent ``AxesImage`` per axis coloured by a ``ListedColormap``
++ ``BoundaryNorm`` pair, so a slice change is a single ``set_data`` with no
+per-slice tessellation or artist growth.
 
-    Contour lines are generated with contourpy (~2 ms for 7 levels at
-    256x256) and funnelled into a single persistent ``LineCollection`` per
-    axis, mirroring the single-PathCollection strategy used for ROI
-    contours.
+Lines: generated with contourpy into one persistent ``LineCollection`` per
+axis.
 
-Alpha handling:
-    The fill alpha is baked into the colormap entries rather than set on
-    the artist. An artist-level ``set_alpha`` would replace the alpha
-    channel of every pixel — including the fully transparent
-    below-threshold band, which would then become visible.
-
-Coupling:
-    The class receives the state object and an ``on_artists_changed``
-    callback via constructor injection; it never imports or touches the
-    viewer. The target ``Axes`` is passed per call so the overlay stays
-    agnostic of layout rebuilds.
+The fill alpha is baked into the colormap: an artist-level ``set_alpha``
+would also make the transparent below-threshold band visible.
 """
 
 import logging
@@ -51,18 +33,10 @@ logger = logging.getLogger(__name__)
 
 
 def _format_fill_cursor_data(value) -> str:
-    """Format the raw dose value under the cursor for the status bar.
+    """Format the dose under the cursor for the toolbar readout.
 
-    Matplotlib's default cursor-data formatter special-cases
-    ``BoundaryNorm`` by taking ``np.diff`` of the two boundaries nearest
-    the cursor value. The fill norm appends a trailing ``np.inf``
-    boundary (see :meth:`_fill_norm`) so any cursor position in the
-    highest isodose band computes a diff against that ``inf``, which
-    then overflows inside Matplotlib's internal ``_g_sig_digits``
-    (``math.floor(math.log10(inf))``). ``format_cursor_data`` is
-    replaced with this simple, fixed-precision formatter to sidestep
-    that path entirely rather than relying on Matplotlib's generic
-    implementation.
+    Replaces Matplotlib's ``BoundaryNorm`` formatter, which fails on the
+    trailing ``inf`` boundary of the fill norm (see :meth:`_fill_norm`).
     """
     if value is None or not np.isfinite(value):
         return ""
@@ -72,29 +46,15 @@ def _format_fill_cursor_data(value) -> str:
 class IsoDoseOverlay:
     """Owns and renders the isodose fill / line artists for all axes.
 
-    Blit integration: artists created here live in the viewer's blit layer.
-    Whenever an artist is created or its visibility toggles, the
-    ``on_artists_changed`` callback fires with the axis name so the viewer
-    can invalidate its cached blit-artist list. Pure content updates
-    (``set_data`` / ``set_segments``) keep the cached list valid and do not
-    fire the callback.
+    ``on_artists_changed`` fires with the axis name when an artist is created
+    or toggled, not on content updates.
     """
 
-    #: Stride used to downsample the dose slice before rendering. Dose
-    #: distributions are spatially smooth, so dropping to 1/4 of the pixels
-    #: preserves visual quality on a fine grid while quartering both the
-    #: BoundaryNorm mapping and the contourpy line-generation cost.
+    #: Stride applied to large dose slices before rendering (dose is smooth).
     _DOWNSAMPLE_STEP: int = 2
 
-    #: Smallest in-plane dimension for which downsampling is applied. Dose
-    #: grids are commonly exported at 2-3 mm, which on a body-sized field
-    #: leaves slices well under a hundred samples across; striding those
-    #: displaces every isodose line by up to one dose voxel — several
-    #: millimetres — which is not an acceptable trade for a rendering cost
-    #: that is already negligible at that size. Downsampling therefore only
-    #: applies once a slice is large enough for the saving to matter and for
-    #: the positional error to be sub-voxel on the CT grid the lines are read
-    #: against.
+    #: Smallest in-plane size that is downsampled. Smaller slices (coarse
+    #: dose grids) would shift the lines by millimetres for no real saving.
     _DOWNSAMPLE_MIN_EXTENT: int = 128
 
     #: The fill opacity is (1 - blend_alpha) * this factor; lines stay opaque.
@@ -108,23 +68,20 @@ class IsoDoseOverlay:
         """Initialise the overlay.
 
         Args:
-            state: The shared viewer state. Read-only access: slice indices,
-                dose slices, extents, blend alpha and prescription dose.
-            on_artists_changed: Called with the axis name whenever an artist
-                is created or toggled visible/hidden, so the owner can
-                invalidate any cached artist lists.
+            state: The shared viewer state (read only).
+            on_artists_changed: See the class docstring.
         """
         self._state = state
         self._on_artists_changed = on_artists_changed
 
         self._fill: dict[str, AxesImage | None] = dict.fromkeys(AXES)
         self._lines: dict[str, LineCollection | None] = dict.fromkeys(AXES)
-        # Same-slice early-exit marker; None forces the next update() to render.
+        # Last rendered slice per axis; None forces the next update() to render
         self._rendered_index: dict[str, int | None] = dict.fromkeys(AXES)
 
-        # None = use _DEFAULT_LEVELS_PCT; empty list = hide all isodose display.
+        # None = default percentage ladder; [] = hide everything
         self._custom_levels_gy: list[tuple[float, str]] | None = None
-        # Dmax of the original RT-DOSE volume, used when no prescription is set.
+        # Dmax, the reference when no prescription is set
         self._fallback_ref_dose: float | None = None
 
     # ------------------------------------------------------------------
@@ -134,11 +91,13 @@ class IsoDoseOverlay:
         """Override the isodose level definitions.
 
         Args:
-            gy_pairs: ``(dose_gy, colour)`` pairs sorted ascending. An empty
-                list hides all isodose display; ``None`` restores the
-                percentage-based defaults.
+            gy_pairs: ``(dose_gy, colour)`` pairs in any order (sorted by dose
+                here, as the band norm requires). An empty list hides all
+                isodose display; ``None`` restores the percentage defaults.
         """
-        self._custom_levels_gy = list(gy_pairs) if gy_pairs is not None else None
+        self._custom_levels_gy = (
+            None if gy_pairs is None else sorted(gy_pairs, key=lambda pair: pair[0])
+        )
         self.refresh_style()
 
     def set_fallback_ref_dose(self, dose_gy: float | None) -> None:
@@ -166,9 +125,9 @@ class IsoDoseOverlay:
             ref_dose = self.reference_dose()
             if ref_dose is None or ref_dose <= 0:
                 return []
-            # to_gy_pairs already drops hidden and non-positive levels.
+            # to_gy_pairs already drops hidden and non-positive levels
             return to_gy_pairs(DEFAULT_ISODOSE_LEVELS, ref_dose)
-        # Non-positive levels would collapse the lowest band; drop them.
+        # Non-positive levels would swallow the lowest band
         return [(gy, color) for gy, color in self._custom_levels_gy if gy > 0]
 
     def _fill_alpha(self) -> float:
@@ -187,9 +146,8 @@ class IsoDoseOverlay:
     def _fill_norm(pairs: list[tuple[float, str]]) -> BoundaryNorm:
         """Build the band norm: [0, l1) transparent, [l_i, l_i+1) colour i.
 
-        The trailing ``inf`` boundary paints everything at or above the
-        highest level with the highest colour, matching the behaviour of
-        the previous ``contourf(..., extend="max")`` implementation.
+        The trailing ``inf`` paints everything above the highest level with
+        its colour.
         """
         boundaries = [0.0] + [gy for gy, _ in pairs] + [np.inf]
         return BoundaryNorm(boundaries, len(pairs) + 1)
@@ -198,11 +156,7 @@ class IsoDoseOverlay:
     # Lifecycle
     # ------------------------------------------------------------------
     def reset(self) -> None:
-        """Drop all artist references after the owning Axes were cleared.
-
-        Call this after ``ax.clear()`` / figure rebuild; the artists are
-        already gone from the Axes, so only the references are released.
-        """
+        """Drop all artist references after ``Axes.clear()`` / a layout rebuild."""
         self._fill = dict.fromkeys(AXES)
         self._lines = dict.fromkeys(AXES)
         self._rendered_index = dict.fromkeys(AXES)
@@ -213,11 +167,9 @@ class IsoDoseOverlay:
         self._rendered_index[axis] = None
 
     def refresh_style(self) -> None:
-        """Re-apply level colours/boundaries and force a re-render per axis.
+        """Re-apply level colours / boundaries and force the next render.
 
-        Call after the reference dose, prescription or level definitions
-        change. Content (slice data / line segments) is regenerated by the
-        next :meth:`update` call for each axis.
+        Call after the reference dose, prescription or levels change.
         """
         pairs = self._resolve_levels()
         for axis in AXES:
@@ -244,8 +196,7 @@ class IsoDoseOverlay:
     def update(self, axis: str, ax: Axes) -> None:
         """Render the isodose display for the current slice of *axis*.
 
-        No-op when the slice index has not changed since the last render
-        (``refresh_style`` / ``clear`` reset that marker to force one).
+        No-op when the slice has not changed since the last render.
         """
         if self._state.rt_dose_resampled is None:
             self.clear(axis)
@@ -262,8 +213,7 @@ class IsoDoseOverlay:
 
         full = self._state.get_dose_slice_cached(axis)
         if full.size == 0 or full.shape[0] < 2 or full.shape[1] < 2:
-            # CT slice lies outside the dose grid: hide, but remember the
-            # index so revisiting the same slice stays a cheap early-exit.
+            # Outside the dose grid: hide, and remember the index
             self._set_visible(axis, False)
             self._rendered_index[axis] = current_index
             return
@@ -275,15 +225,8 @@ class IsoDoseOverlay:
         )
         raw = full[::step, ::step]
 
-        # Physical sample-centre coordinates of the strided grid. Stride
-        # slicing keeps samples at indices 0, step, 2*step, ..., so the
-        # grid must not be stretched to the full extent — that would shift
-        # the overlay by up to (step - 1) voxels at the high-index side.
-        # get_extent() uses the pixel-center convention (see geometry.py):
-        # x0/y0 are the *edge* of pixel 0, half a native pixel outside its
-        # center. dx/dy below are native (pre-downsample) pixel spacing;
-        # the +0.5 term recovers the physical center of raw pixel 0 before
-        # striding by `step` native pixels per downsampled sample.
+        # Physical centres of the strided samples (indices 0, step, ...).
+        # x0 / y0 are pixel *edges*, hence the + 0.5 native pixel
         x0, x1, y0, y1 = self._state.get_extent(axis)
         full_h, full_w = full.shape
         h, w = raw.shape
@@ -308,7 +251,7 @@ class IsoDoseOverlay:
         pairs: list[tuple[float, str]],
     ) -> None:
         """Create or update the band-fill image for *axis*."""
-        # Half-cell margins align each rendered cell centre with its sample.
+        # Half-cell margins align each rendered cell centre with its sample
         extent = (
             float(xs[0] - cell_w / 2),
             float(xs[-1] + cell_w / 2),
@@ -326,10 +269,7 @@ class IsoDoseOverlay:
                 extent=extent,
                 zorder=2,
             )
-            # Per-instance override of AxesImage.format_cursor_data is a
-            # documented matplotlib pattern for customising the toolbar
-            # readout; mypy flags any assignment to a method, hence the
-            # targeted ignore.
+            # Per-instance override (documented Matplotlib pattern)
             fill.format_cursor_data = _format_fill_cursor_data  # type: ignore[method-assign,assignment]
             self._fill[axis] = fill
             self._on_artists_changed(axis)
@@ -356,9 +296,7 @@ class IsoDoseOverlay:
         segments: list[np.ndarray] = []
         colors: list[str] = []
         for level_gy, color in pairs:
-            # With LineType.Separate, lines() returns a flat list of (N, 2)
-            # vertex arrays; the stub's return type is a union over every
-            # LineType, so narrow it explicitly for the type checker.
+            # LineType.Separate: a flat list of (N, 2) vertex arrays
             level_lines = [np.asarray(line) for line in generator.lines(level_gy)]
             segments.extend(level_lines)
             colors.extend([color] * len(level_lines))
@@ -392,11 +330,7 @@ class IsoDoseOverlay:
         return artists
 
     def all_artists(self, axis: str) -> list[Artist]:
-        """Return every existing artist for *axis*, visible or not.
-
-        Used by the background cache to hide blit-layer artists before the
-        background bitmap is rendered.
-        """
+        """Return every existing artist for *axis*, visible or not."""
         return [a for a in (self._fill[axis], self._lines[axis]) if a is not None]
 
     # ------------------------------------------------------------------

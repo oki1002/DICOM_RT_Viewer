@@ -1,15 +1,10 @@
-"""structure_set.py — the ROI container backing SliceViewerState.
+"""structure_set.py — The ROI container backing SliceViewerState.
 
 An ROI is a named, coloured binary mask over the primary image, addressed by
-an integer ROI number. :class:`StructureSet` owns that mapping and nothing
-else: it holds no image of its own, emits no events, and knows nothing about
-slices, caches or rendering. Keeping it free of those concerns is what lets
-it be built and inspected outside a viewer — when importing an RT-STRUCT
-before any image is displayed, or when writing one out.
-
-:class:`~tk_rt_viewer.state.viewer_state.SliceViewerState` owns an
-instance, delegates ROI storage to it, and is responsible for turning every
-mutation into the matching notification.
+an integer ROI number. :class:`StructureSet` holds only that mapping — no
+events, caches or rendering — so it can be built and inspected outside a
+viewer. :class:`~tk_rt_viewer.state.viewer_state.SliceViewerState` owns an
+instance and turns every mutation into the matching notification.
 """
 
 import dataclasses
@@ -27,20 +22,9 @@ logger = logging.getLogger(__name__)
 class RoiEntry:
     """A single ROI's stored properties inside :class:`StructureSet`.
 
-    Replaces the previous ``dict[str, Any]`` entry shape so that field
-    names and types (``name: str``, ``mask: sitk.Image``, ``color: str``)
-    are checked statically instead of relying on string keys that a typo
-    could silently miss.
-
-    Frozen so that a caller holding a reference obtained through
-    :meth:`StructureSet.get_all` cannot mutate a field in place. An
-    in-place mutation would change the mask :class:`StructureSet` returns
-    from :meth:`~StructureSet.get_mask` without going through
-    :meth:`StructureSet.update`, which is what
-    :class:`~tk_rt_viewer.state.viewer_state.SliceViewerState` relies on to
-    invalidate ``MaskSliceCache`` / ``ContourPathCache`` and to fire the
-    matching notification — silently leaving those caches serving the
-    previous mask.
+    Frozen: changing a mask must go through :meth:`StructureSet.update` (via
+    the state) so the mask / contour caches are invalidated and listeners
+    notified.
     """
 
     name: str
@@ -49,10 +33,9 @@ class RoiEntry:
 
 
 class StructureSet:
-    """Container for RT-STRUCT ROI masks, keyed by integer ROI number.
+    """Container for ROI masks (``sitk.Image``), keyed by integer ROI number.
 
-    Masks are stored as ``sitk.Image`` objects.  ROI numbers are assigned
-    automatically starting from 1 and never reused within an instance.
+    ROI numbers are assigned from 1 and never reused within an instance.
 
     Example::
 
@@ -92,15 +75,12 @@ class StructureSet:
     def update(self, roi_number: int, props: dict[str, Any]) -> None:
         """Update properties (``name``, ``mask``, ``color``) for *roi_number*.
 
+        No-op for an unknown ROI number.
+
         Raises:
             ValueError: If *props* contains a key that is not a field of
-                :class:`RoiEntry` — this used to update a plain dict with
-                no feedback, so a typo'd key (e.g. ``"colour"``) would be
-                silently stored and never actually applied.
+                :class:`RoiEntry` (e.g. a misspelt ``"colour"``).
         """
-        entry = self._data.get(roi_number)
-        if entry is None:
-            return
         valid_fields = {f.name for f in dataclasses.fields(RoiEntry)}
         unknown = props.keys() - valid_fields
         if unknown:
@@ -108,6 +88,9 @@ class StructureSet:
                 f"Unknown RoiEntry field(s) {sorted(unknown)}; "
                 f"expected one of {sorted(valid_fields)}."
             )
+        entry = self._data.get(roi_number)
+        if entry is None:
+            return
         self._data[roi_number] = dataclasses.replace(entry, **props)
 
     def get_name(self, roi_number: int) -> str | None:
@@ -120,19 +103,13 @@ class StructureSet:
     ) -> str:
         """Return a name that does not collide with any existing ROI name.
 
-        When *base_name* is already taken, ``"base_name(2)"``,
-        ``"base_name(3)"``, ... is tried until a free name is found.
-        Centralising this rule here ensures every ROI-creation call site
-        (manual addition, RT-STRUCT import, inference results, ...)
-        resolves name collisions the same way.
+        When *base_name* is taken, ``"base_name(2)"``, ``"base_name(3)"``,
+        ... is tried until a free name is found.
 
         Args:
             base_name: The desired ROI name.
-            reserved: Additional names to treat as taken. Needed when
-                several ROIs are named in one batch before any of them has
-                been added: without it, two incoming ROIs sharing a name
-                would both resolve to the same free name, since neither is
-                in this container yet to be seen by the other.
+            reserved: Extra names to treat as taken, for naming a batch of
+                ROIs before any of them has been added.
 
         Returns:
             A name colliding with neither an existing ROI name nor *reserved*.
@@ -164,17 +141,10 @@ class StructureSet:
         return list(self._data.keys())
 
     def get_all(self) -> dict[int, RoiEntry]:
-        """Return a shallow copy of the internal ``{roi_number: RoiEntry}`` mapping.
+        """Return a shallow copy of the ``{roi_number: RoiEntry}`` mapping.
 
-        The copy is of the outer dict only; ``RoiEntry`` instances (and the
-        ``sitk.Image`` masks they hold) are shared with the internal
-        storage. This is safe because ``RoiEntry`` is frozen: a caller can
-        read a returned entry's mask, or pop/replace an entry in its own
-        copy of the outer dict, but cannot reassign a field on the shared
-        entry to swap out a mask behind :meth:`update`'s back (which is what
-        invalidates the mask/contour caches and fires the change
-        notification). Popping an entry from the returned dict likewise
-        cannot remove it here; use :meth:`remove` for that.
+        The (frozen) entries are shared; changing the returned dict does not
+        affect this container.
         """
         return dict(self._data)
 

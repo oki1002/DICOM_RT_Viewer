@@ -1,18 +1,9 @@
 """roi_manager.py — ROI lifecycle management for SliceViewerState.
 
-Adding, replacing or removing an ROI is never just a dictionary write: the
-mask has to be registered with the mask-volume cache, a background
-contour-path build has to be scheduled or cancelled, and — when the ROIs come
-from an RT-STRUCT — NumPy masks have to be validated against the primary
-image, wrapped into ``sitk.Image`` objects and given collision-free names.
-That whole sequence is one cohesive responsibility with no observable state
-of its own.
-
-:class:`RoiManager` owns it. As with
-:class:`~tk_rt_viewer.state.phase_manager.PhaseManager` and
-:class:`~tk_rt_viewer.state.dose_manager.DoseManager`, it emits no events;
-:class:`~tk_rt_viewer.state.viewer_state.SliceViewerState` owns an instance,
-delegates its ROI API to it, and is solely responsible for firing
+Adding, replacing or removing an ROI also means validating the mask against
+the primary image, registering it with the mask-volume cache and scheduling
+(or cancelling) its background contour build. :class:`RoiManager` owns that
+sequence. It emits no events; ``SliceViewerState`` delegates to it and fires
 ``all_contours_changed``.
 """
 
@@ -85,17 +76,7 @@ class RoiManager:
         Raises:
             RuntimeError: If no primary image is loaded.
             ValueError: If any mask's size does not match the primary
-                image's. Every mask is checked before any ROI is added, so a
-                mismatch leaves the structure set untouched rather than
-                half-populated. Unlike :meth:`add_from_rt_struct` (which
-                validates NumPy array shape before wrapping it into a
-                ``sitk.Image``), the masks here already arrive as
-                ``sitk.Image``, so ``GetSize()`` is compared directly rather
-                than reversing a ``(D, H, W)`` array shape into ``(x, y, z)``.
-                A mismatch previously went uncaught here: the mask still got
-                registered into the mask-volume / contour-path caches, which
-                then silently returned slices at the wrong physical scale
-                for that ROI on every subsequent redraw.
+                image's. All masks are checked before any is added.
         """
         primary_image = self._primary_image()
         if primary_image is None:
@@ -114,8 +95,7 @@ class RoiManager:
         roi_numbers: list[int] = []
         for name, mask, color in rois:
             roi_number = self._structure_set.add(name, mask, color)
-            # Cache the mask as a NumPy view so scroll updates never make a
-            # sitk round-trip, then pre-compute its contour paths off-thread.
+            # NumPy view for fast slicing, then contour paths off-thread
             self._cache.register_mask_volume(roi_number, mask)
             self._cache.schedule_contour_build(roi_number, primary_image)
             roi_numbers.append(roi_number)
@@ -129,36 +109,23 @@ class RoiManager:
     ) -> list[int]:
         """Add the ROIs returned by :func:`~tk_rt_viewer.rtstruct_io.load_rt_struct`.
 
-        ``load_rt_struct`` yields masks as NumPy arrays keyed by the ROI
-        number recorded in the file, while :meth:`add_many` takes
-        ``sitk.Image`` masks and assigns its own ROI numbers. Bridging the
-        two — wrapping each array with the primary image's geometry and
-        resolving names that collide with ROIs already loaded — is the same
-        work for every caller, so it is done here.
+        Wraps each NumPy mask with the primary image's geometry and resolves
+        names that collide with ROIs already loaded.
 
         Args:
             rois: The mapping returned by ``load_rt_struct``. Its keys are not
-                preserved; this manager assigns its own, which is what the
-                returned list reports.
-            resolve_name_collisions: When ``True``, a name already used by an
-                existing ROI is suffixed via
-                :meth:`StructureSet.generate_unique_name`. Pass ``False`` to
-                keep the names exactly as recorded in the file, at the cost of
-                allowing duplicates.
+                preserved; new ROI numbers are assigned.
+            resolve_name_collisions: Suffix names already in use (see
+                :meth:`StructureSet.generate_unique_name`). ``False`` keeps
+                the names from the file, allowing duplicates.
 
         Returns:
-            The ROI numbers assigned by this manager, one per entry in *rois*
-            and in its iteration order. Empty when *rois* is empty.
+            The assigned ROI numbers, in *rois*' iteration order.
 
         Raises:
-            RuntimeError: If no primary image is loaded, since the masks have
-                no geometry to be interpreted against.
-            ValueError: If any mask's shape does not match the primary image.
-                Every mask is checked before a single ROI is added, so a
-                mismatch leaves the structure set untouched rather than
-                half-populated — which matters because the usual cause is an
-                RT-STRUCT belonging to a different series, where none of the
-                ROIs are wanted.
+            RuntimeError: If no primary image is loaded.
+            ValueError: If any mask's shape does not match the primary image
+                (typically an RT-STRUCT of another series). Nothing is added.
         """
         primary_image = self._primary_image()
         if primary_image is None:
@@ -171,10 +138,7 @@ class RoiManager:
         expected_shape = tuple(reversed(primary_image.GetSize()))
 
         entries: list[tuple[str, sitk.Image, str]] = []
-        # Names resolved so far in this batch. generate_unique_name only sees
-        # ROIs already added, and nothing is added until add_many below, so
-        # without this two incoming ROIs sharing a name would both be given
-        # the same one.
+        # Names already given within this batch (nothing is added until the end)
         assigned_names: set[str] = set()
         for source_number, roi in rois.items():
             mask = roi["mask"]
@@ -207,30 +171,14 @@ class RoiManager:
     def update(self, roi_number: int, props: dict[str, Any]) -> None:
         """Update properties (``name``, ``mask``, ``color``) for *roi_number*.
 
+        No-op for an unknown ROI number, so no cache entry or background
+        build is created for it.
+
         Raises:
             ValueError: If *props* contains a ``mask`` whose size does not
-                match the primary image's. ``add_many`` /
-                ``add_from_rt_struct`` already reject a mismatched mask
-                before it reaches the caches (see their docstrings for the
-                silent-wrong-scale failure that guards against); this is
-                the far more frequently exercised path — every brush-stroke
-                commit and every contour-editing result flows through here
-                — so leaving it unguarded reopened the same failure mode
-                through the one entry point most likely to hit it. A
-                mismatched mask that reaches ``MaskSliceCache`` /
-                ``get_slice_data`` either returns slices at the wrong
-                physical scale or, once the current slice index falls
-                outside the mismatched mask's own extent, raises an
-                uncaught ``IndexError`` from a caller with no reason to
-                expect one (``get_slice_data`` has no bounds check of its
-                own; only the cache-backed internal render path does).
+                match the primary image's.
         """
         if roi_number not in self._structure_set:
-            # StructureSet.update() is a no-op for an unknown roi_number, so
-            # without this guard the cache work below would run for an ROI
-            # that was never added (or was already removed), leaving a
-            # mask-volume cache entry and a scheduled background build for
-            # an ROI number the structure set has no record of.
             return
         if "mask" in props:
             primary_image = self._primary_image()
@@ -245,8 +193,6 @@ class RoiManager:
                 )
         self._structure_set.update(roi_number, props)
         if "mask" in props:
-            # On mask change, invalidate the contour paths, refresh the mask
-            # volume, then rebuild in the background.
             self._cache.invalidate_contour_paths(roi_number)
             self._cache.register_mask_volume(roi_number, props["mask"])
             self._cache.schedule_contour_build(roi_number, self._primary_image())

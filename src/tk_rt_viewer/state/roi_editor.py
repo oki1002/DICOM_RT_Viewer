@@ -1,18 +1,12 @@
 """roi_editor.py — Contour editing by ROI number.
 
-:mod:`tk_rt_viewer.roi_operations` works on masks: pass a mask in, get a mask
-back. Every host application that exposes those operations in a UI ends up
-writing the same layer on top — look the mask up by ROI number, run the
-operation, turn any failure into something it can show the user, and name the
-result after the ROI it came from. :class:`RoiEditor` is that layer.
+:class:`RoiEditor` runs :mod:`tk_rt_viewer.roi_operations` against masks
+looked up by ROI number, wraps failures in :class:`RoiOperationError`, and
+names results after their source ROI.
 
-Computation and commitment are deliberately separate. The methods here only
-*read* the structure set, so they are safe to run on a worker thread; adding
-the result (``SliceViewerState.add_contour``) or replacing an existing mask
-(``SliceViewerState.update_contour_properties``) stays with the caller, on
-whichever thread its UI requires. A library that resampled the whole mask and
-then wrote to observable state from the same call would force its own
-threading model onto every host.
+The methods only *read* the structure set, so they may run on a worker
+thread. Committing the result (``SliceViewerState.add_contour`` /
+``update_contour_properties``) stays with the caller, on the UI thread.
 """
 
 import logging
@@ -48,11 +42,8 @@ class RoiEditor:
     """Run :mod:`tk_rt_viewer.roi_operations` against a structure set by ROI number.
 
     Args:
-        structure_set: Callable returning the structure set to read masks,
-            names and colours from. It is a callable rather than the set
-            itself because loading a new primary image replaces the set
-            wholesale; an editor holding the old one would then quietly
-            operate on ROIs that are no longer displayed.
+        structure_set: Returns the current structure set. A callable because
+            loading a new primary image replaces the set wholesale.
     """
 
     def __init__(self, structure_set: Callable[[], StructureSet]) -> None:
@@ -83,9 +74,8 @@ class RoiEditor:
         """Return a unique name for a result derived from *roi_number*.
 
         ``"GTV"`` with suffix ``"margin"`` yields ``"GTV_margin"``, or
-        ``"GTV_margin_1"`` when that name is taken. Naming follows
-        :meth:`StructureSet.generate_unique_name`, so results added this way
-        collide with nothing already in the set.
+        ``"GTV_margin(2)"`` when that name is taken (see
+        :meth:`StructureSet.generate_unique_name`).
         """
         structure_set = self._structure_set()
         base = structure_set.get_name(roi_number) or f"roi_{roi_number}"
@@ -159,7 +149,12 @@ class RoiEditor:
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
-    def _run(self, roi_number: int, label: str, op) -> sitk.Image:
+    def _run(
+        self,
+        roi_number: int,
+        label: str,
+        op: Callable[[sitk.Image], sitk.Image],
+    ) -> sitk.Image:
         """Look up a mask, apply *op*, and wrap any failure as an operation error."""
         mask = self.get_mask(roi_number)
         try:

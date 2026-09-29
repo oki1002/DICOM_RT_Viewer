@@ -1,10 +1,4 @@
-"""layout.py — MPR / DVH figure layout (GridSpec axes) construction.
-
-LayoutManager builds the matplotlib Axes for each supported layout mode.
-It depends only on a Figure and a DVH-axes styling callback supplied at
-construction (typically DvhPanel.style_axes), so it never imports or
-touches DicomViewer.
-"""
+"""layout.py — Builds the Matplotlib Axes for each layout mode."""
 
 from collections.abc import Callable
 
@@ -32,12 +26,9 @@ class LayoutManager:
         """Initialise the layout manager.
 
         Args:
-            fig: The Figure that Axes are added to. The caller is
-                responsible for calling ``fig.clear()`` before :meth:`build`
-                when replacing an existing layout.
-            style_dvh_axes: Callback applying dark-theme styling to a
-                newly-created DVH Axes (typically ``DvhPanel.style_axes``).
-                Injected so this class never needs to depend on DvhPanel.
+            fig: The Figure to add Axes to. Clear it before :meth:`build`
+                when replacing a layout.
+            style_dvh_axes: Styles a new DVH Axes (``DvhPanel.style_axes``).
         """
         self._fig = fig
         self._style_dvh_axes = style_dvh_axes
@@ -67,7 +58,6 @@ class LayoutManager:
             }
             dvh_ax = None
         elif mode == "mpr":
-            # 2x2 grid — top row (Axial + DVH), bottom row (Coronal + Sagittal)
             gs = gridspec.GridSpec(2, 2, figure=self._fig)
             axs = {
                 "axial": self._fig.add_subplot(gs[0, 0]),
@@ -77,9 +67,6 @@ class LayoutManager:
             dvh_ax = self._fig.add_subplot(gs[0, 1])
             self._style_dvh_axes(dvh_ax)
         else:
-            # A silent fallback to "mpr" would mask a typo'd mode name as a
-            # different-looking-but-valid layout, which is far harder to
-            # notice than an immediate error.
             raise ValueError(
                 f"Unknown layout mode: {mode!r}. Expected one of: {LAYOUT_MODES}."
             )

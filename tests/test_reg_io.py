@@ -106,9 +106,23 @@ class TestSaveRegistration:
             .FrameOfReferenceTransformationMatrix
         ).reshape(4, 4)
         assert written == pytest.approx(matrix)
-        assert second.ReferencedSeriesSequence[0].SeriesInstanceUID == (
-            moving.SeriesInstanceUID
+        # Instance references live in the item, as the standard defines them
+        assert second.ReferencedImageSequence[0].ReferencedSOPInstanceUID == (
+            moving.SOPInstanceUID
         )
+        # Series references live in the Common Instance Reference Module
+        assert [s.SeriesInstanceUID for s in ds.ReferencedSeriesSequence] == [
+            fixed.SeriesInstanceUID,
+            moving.SeriesInstanceUID,
+        ]
+
+    def test_rejects_a_reflection(self, tmp_path) -> None:
+        matrix = np.eye(4)
+        matrix[0, 0] = -1.0  # orthonormal, but det == -1
+        with pytest.raises(RegistrationExportError, match="reflection"):
+            save_registration(
+                tmp_path / "reg.dcm", matrix, make_reference(), make_reference()
+            )
 
     def test_rejects_a_non_rigid_matrix(self, tmp_path) -> None:
         matrix = np.eye(4)
@@ -126,14 +140,7 @@ class TestSaveRegistration:
 
 
 class TestRoundTripThroughFindRegMatrices:
-    """What this module writes, io.find_reg_matrices must be able to read.
-
-    save_registration records its references under
-    ``ReferencedSeriesSequence``; the reader only looked at
-    ``ReferencedImageSequence`` and accessed it unguarded, so scanning a
-    folder holding a registration written here raised ``AttributeError``
-    and took the whole series load with it.
-    """
+    """What this module writes, io.find_reg_matrices must be able to read."""
 
     @staticmethod
     def _written_reg(tmp_path) -> tuple[Dataset, np.ndarray]:

@@ -201,3 +201,25 @@ class TestBbox3dHandler:
 
         assert handler.is_dragging is False
         assert state.bounding_box_3d is None
+
+
+class TestHandleSpan:
+    def test_the_extension_of_an_edge_is_not_a_handle(self) -> None:
+        """Only the edge itself resizes, not the line it lies on."""
+        rect = (0.0, 0.0, 10.0, 10.0)
+        # Level with the left edge, far below the box
+        assert rect_drag.detect_handle(rect, 0.0, -50.0, 0.5, 0.5) is None
+        # Level with the top edge, far to the right
+        assert rect_drag.detect_handle(rect, 50.0, 10.0, 0.5, 0.5) is None
+
+    def test_a_press_level_with_an_edge_starts_a_new_box(self, setup) -> None:
+        state, handler, _hover = setup
+        drag(handler, (-20.0, -20.0), (0.0, 0.0))
+        first = state.bounding_box_3d
+        assert first is not None
+
+        # x == left edge of the box, but well below it: a new box, not a resize
+        drag(handler, (-20.0, 60.0), (10.0, 80.0))
+        second = state.bounding_box_3d
+        assert second is not None
+        assert second.project("axial") == pytest.approx((-20.0, 60.0, 30.0, 20.0))

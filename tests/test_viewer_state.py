@@ -77,20 +77,50 @@ class TestSetattrGuard:
         with pytest.raises(ValueError, match="Unknown layout mode"):
             state.layout_mode = "bogus"
 
-    def test_internal_reset_does_not_renotify(self) -> None:
-        """set_primary_image_data resets observable fields internally;
-        those writes must not re-enter the setters (which would fire a
-        storm of change events mid-reset)."""
+    def test_internal_reset_notifies_each_changed_field_once(self) -> None:
+        """A host mirroring reset fields must hear about the reset, once each."""
         state = make_state_with_image()
+        mask = sitk.GetImageFromArray(
+            np.zeros(sitk.GetArrayViewFromImage(state.primary_image).shape, np.uint8)
+        )
+        mask.CopyInformation(state.primary_image)
+        state.set_selected_roi(state.add_contour("PTV", mask, "#ff0000"))
         state.set_blend_alpha(0.5)
-        blend_events: list[float] = []
-        state.add_listener(events.BLEND_ALPHA_CHANGED, blend_events.append)
-        # Loading a new image resets blend_alpha to 1.0 internally. The
-        # coordinated reset notifies via its own dedicated events, not via
-        # a blend_alpha_changed re-entry.
+        state.set_secondary_window_level(400.0, 40.0)
+        state.set_bounding_box("axial", (0.0, 0.0, 5.0, 5.0))
+
+        fired: list[tuple] = []
+        for name in (
+            events.SELECTED_ROI_CHANGED,
+            events.BLEND_ALPHA_CHANGED,
+            events.SECONDARY_WINDOW_LEVEL_CHANGED,
+            events.BOUNDING_BOXES_CHANGED,
+            events.PRIMARY_IMAGE_DATA_CHANGED,
+        ):
+            state.add_listener(name, lambda *args, n=name: fired.append((n, args)))
+
         arr = np.zeros((5, 5, 5), dtype=np.int16)
         state.set_primary_image_data(sitk.GetImageFromArray(arr))
-        assert state.blend_alpha == 1.0
+
+        names = [name for name, _ in fired]
+        assert names == [
+            events.SELECTED_ROI_CHANGED,
+            events.BLEND_ALPHA_CHANGED,
+            events.SECONDARY_WINDOW_LEVEL_CHANGED,
+            events.BOUNDING_BOXES_CHANGED,
+            events.PRIMARY_IMAGE_DATA_CHANGED,
+        ]
+        assert fired[0][1] == (None,)
+        assert fired[1][1] == (1.0,)
+        assert fired[3][1] == ("axial", None)
+
+    def test_unchanged_fields_are_not_renotified(self) -> None:
+        state = make_state_with_image()
+        blend_events: list[float] = []
+        state.add_listener(events.BLEND_ALPHA_CHANGED, blend_events.append)
+        arr = np.zeros((5, 5, 5), dtype=np.int16)
+        state.set_primary_image_data(sitk.GetImageFromArray(arr))
+        # blend_alpha was already 1.0, so there is nothing to report
         assert blend_events == []
 
 
@@ -694,3 +724,35 @@ class TestResampleRequiresAPrimaryImage:
         state = SliceViewerState()
         state.set_secondary_image_data(None)  # must not raise
         assert state.secondary_image is None
+
+
+class TestDeletingTheSelectedRoi:
+    def test_deleting_the_selected_roi_clears_the_selection(self) -> None:
+        state = make_state_with_image()
+        mask = sitk.GetImageFromArray(
+            np.zeros(sitk.GetArrayViewFromImage(state.primary_image).shape, np.uint8)
+        )
+        mask.CopyInformation(state.primary_image)
+        roi = state.add_contour("PTV", mask, "#ff0000")
+        state.set_selected_roi(roi)
+        selected: list[int | None] = []
+        state.add_listener(events.SELECTED_ROI_CHANGED, selected.append)
+
+        state.delete_contour(roi)
+
+        assert state.selected_roi_number is None
+        assert selected == [None]
+
+    def test_deleting_another_roi_keeps_the_selection(self) -> None:
+        state = make_state_with_image()
+        mask = sitk.GetImageFromArray(
+            np.zeros(sitk.GetArrayViewFromImage(state.primary_image).shape, np.uint8)
+        )
+        mask.CopyInformation(state.primary_image)
+        keep = state.add_contour("PTV", mask, "#ff0000")
+        other = state.add_contour("CTV", mask, "#00ff00")
+        state.set_selected_roi(keep)
+
+        state.delete_contour(other)
+
+        assert state.selected_roi_number == keep

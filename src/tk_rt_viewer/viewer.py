@@ -1,14 +1,11 @@
 """viewer.py — DicomViewer: Tkinter-embeddable MPR viewer widget.
 
 Architecture:
-    ``DicomViewer`` is a wiring layer. It builds the Tk widgets and the
-    Matplotlib figure, constructs the collaborators that do the actual work,
-    subscribes to ``SliceViewerState``, and translates each state event into
-    calls on those collaborators. It holds no rendering algorithm of its own.
-
-    Collaborators (all under ``tk_rt_viewer.rendering`` unless noted, all
-    constructed here with the state / figure / callbacks they need, none of
-    them importing this module):
+    ``DicomViewer`` is a wiring layer: it builds the Tk widgets and the
+    figure, constructs the collaborators, subscribes to ``SliceViewerState``
+    and translates each state event into collaborator calls. None of the
+    collaborators (under ``tk_rt_viewer.rendering`` unless noted) imports
+    this module:
 
     - ``LayoutManager``   — builds the Axes for the active layout mode.
     - ``ImageLayer``      — the primary / secondary base-image artists.
@@ -18,12 +15,9 @@ Architecture:
     - ``BlitCompositor``  — background bitmaps, the blit pass, and the
       artist-list cache.
     - ``DrawingManager``  — coalesces redraw requests into one idle callback.
-    - ``ViewerEventHandler`` (``event_controllers``) — routes canvas events,
-      and owns the pointer-hover state.
-
-    The event controllers see this widget only through
-    :class:`~tk_rt_viewer.protocols.ViewerHost`, so the dependency runs one
-    way and every handler is exercisable without a live Tk widget.
+    - ``ViewerEventHandler`` (``event_controllers``) — routes canvas events
+      and owns the pointer-hover state. It sees this widget only through
+      :class:`~tk_rt_viewer.protocols.ViewerHost`.
 
 Slice navigation:
     - Drag a crosshair line.
@@ -31,34 +25,14 @@ Slice navigation:
     - Up / Down / PageUp / PageDown keys.
 
 Window / level:
-    Right-click drag: horizontal -> window width, vertical -> window centre.
-    The drag adjusts whichever image ``state.window_level_target`` names;
-    holding Shift targets the other one for that drag, when a secondary image
-    is loaded. The primary and secondary images carry independent windows —
-    see ``SliceViewerState`` — with the secondary following the primary until
-    an override is set.
+    Right-click drag: horizontal -> width, vertical -> centre, applied to
+    ``state.window_level_target``; Shift targets the other image for that
+    drag.
 
-Secondary image & blend:
-    When a secondary image is loaded (a 4DCT phase, a MAR-corrected volume, a
-    fusion series), it is displayed as a semi-transparent overlay controlled
-    by a blend slider embedded below the canvas. The slider maps to
-    ``SliceViewerState.blend_alpha`` (1.0 = primary only, 0.0 = secondary
-    only) and is hidden when neither a secondary image nor a dose is loaded.
-
-IsoDose display:
-    Rendered by ``IsoDoseOverlay``: band fills come from a persistent per-axis
-    AxesImage driven by ListedColormap + BoundaryNorm, and contour lines from
-    a persistent per-axis LineCollection fed by contourpy. Contour lines are
-    always opaque; the fill alpha is ``(1 - blend_alpha) * 0.4``, baked into
-    the colormap.
-
-Performance notes:
-    The costly paths are documented on the collaborators that own them —
-    idle-driven redraw coalescing on ``DrawingManager``, background bitmaps
-    and the artist-list cache on ``BlitCompositor``, RGBA pre-composition on
-    ``ImageLayer`` / ``render``, the contour path cache on
-    ``ViewerCacheManager``, band fills on ``IsoDoseOverlay``, and histogram
-    DVH curves on ``DvhPanel``.
+Blend slider:
+    Shown below the canvas while a secondary image or a dose is loaded; maps
+    to ``SliceViewerState.blend_alpha`` (1.0 = primary only). The isodose
+    fill opacity is ``(1 - blend_alpha) * 0.4``; its lines stay opaque.
 """
 
 import contextlib
@@ -101,7 +75,7 @@ from .geometry import AXES, Box3D
 from .io import load_dcm_series
 from .rendering.blit_compositor import BlitCompositor
 from .rendering.contour_overlay import ContourOverlay
-from .rendering.drawing_manager import DrawingManager
+from .rendering.drawing_manager import ContourRedrawCoalescer, DrawingManager
 from .rendering.dvh import DvhPanel
 from .rendering.image_layer import ImageLayer
 from .rendering.isodose import IsoDoseOverlay
@@ -128,19 +102,12 @@ class DicomViewer(ttk.Frame):
         viewer.load_ct("/path/to/dicom")
 
     Note:
-        The shared :class:`SliceViewerState` is exposed as
-        :attr:`viewer_state`, not ``state``. ``ttk.Frame`` already defines a
-        ``state()`` method (used to query/set Tk widget states such as
-        ``"disabled"``); an attribute literally named ``state`` would shadow
-        it, so host code calling ``viewer.state()`` for the inherited Tk
-        behaviour would break with a confusing ``TypeError``.
+        The state is exposed as :attr:`viewer_state`, because ``state`` would
+        shadow ``ttk.Frame.state()``.
     """
 
-    # Idle time (ms) before the background cache is rebuilt after scrolling
-    # stops. Must comfortably exceed the scroll debounce window in
-    # viewer_events.py so the rebuild only fires after the user has fully
-    # stopped interacting; otherwise a heavy full-figure render can land
-    # mid-scroll and cause a visible stall.
+    # Idle time (ms) before the background is rebuilt after interaction;
+    # must exceed the scroll debounce so a full render never lands mid-scroll
     _CACHE_REBUILD_IDLE_MS: int = 150
 
     def __init__(
@@ -153,15 +120,11 @@ class DicomViewer(ttk.Frame):
         self.rowconfigure(0, weight=1)
         self.columnconfigure(0, weight=1)
 
-        # Whether this instance created its own state (and therefore owns its
-        # lifecycle) or received one via dependency injection. Only an owned
-        # state is closed in destroy() — closing an injected state would stop
-        # its thread pool out from under whatever else holds a reference to it.
+        # Only a state created here is closed in destroy(); an injected one
+        # belongs to the host
         self._owns_state = state is None
         if state is None:
             state = SliceViewerState()
-        # Named "viewer_state" (not "state") so this attribute never shadows
-        # the inherited ``ttk.Frame.state()`` method; see the class docstring.
         self.viewer_state: SliceViewerState = state
 
         self._build_widgets(fig_kwargs)
@@ -189,8 +152,7 @@ class DicomViewer(ttk.Frame):
         self.toolbar.update()
         self.toolbar.pack(side=tk.BOTTOM, fill=tk.X)
 
-        # Set before the Scale exists: ttk.Scale.set below fires the command
-        # immediately, so the flag has to be readable from the first callback.
+        # Must exist before the Scale: Scale.set() fires its command at once
         self._syncing_blend_slider: bool = False
         self._blend_frame = ttk.Frame(self)
         ttk.Label(self._blend_frame, text="Blend Alpha").pack(side=tk.LEFT, padx=5)
@@ -207,12 +169,9 @@ class DicomViewer(ttk.Frame):
 
     def _build_collaborators(self) -> None:
         """Construct and wire every rendering / event collaborator."""
-        # DvhPanel is created before LayoutManager because LayoutManager needs
-        # a DVH-axes styling callback to apply when it creates the DVH Axes.
         self.dvh_panel = DvhPanel(self.viewer_state)
         self.layout = LayoutManager(self.fig, style_dvh_axes=self.dvh_panel.style_axes)
-        # Honour the layout mode already present on an injected state rather
-        # than silently overriding it with a hardcoded default.
+        # Honour the layout mode of an injected state
         self._layout_mode: str = self.viewer_state.layout_mode
         self.axs, self._dvh_ax = self.layout.build(self._layout_mode)
 
@@ -241,12 +200,17 @@ class DicomViewer(ttk.Frame):
         self.contours = ContourOverlay(
             self.viewer_state, on_artists_changed=self._compositor.invalidate
         )
+        self._contour_redraws = ContourRedrawCoalescer(
+            schedule=self._schedule_from_worker,
+            cancel=self._safe_after_cancel,
+            redraw=self._update_all_contours,
+            active_rois=lambda: self.viewer_state.active_contours,
+        )
         self.isodose = IsoDoseOverlay(
             self.viewer_state, on_artists_changed=self._compositor.invalidate
         )
 
-        # Crosshair lines and bounding-box patches are simple enough to own
-        # directly; everything heavier lives in a collaborator above.
+        # Crosshair lines and box patches are simple enough to own directly
         self.crosshairs: dict[str, dict[str, Any]] = {
             axis: {"h": None, "v": None} for axis in AXES
         }
@@ -256,7 +220,7 @@ class DicomViewer(ttk.Frame):
         # Host-application overlay artists registered via add_overlay_artist.
         self._extra_blit_artists: dict[str, list] = {axis: [] for axis in AXES}
 
-        # Same-slice early-exit: the last rendered slice index per axis.
+        # Last rendered slice per axis (several viewers may share one state)
         self._last_rendered_index: dict[str, int] = dict.fromkeys(AXES, -1)
 
         self.event_handler = ViewerEventHandler(self.viewer_state, self)
@@ -264,9 +228,7 @@ class DicomViewer(ttk.Frame):
     def _bind_events(self) -> None:
         """Connect canvas events and subscribe to the state."""
         eh = self.event_handler
-        # Connection ids are kept so destroy() can mpl_disconnect them all;
-        # see the comment on self._state_listeners below for why leaving
-        # a subscription live past teardown matters for an injected state.
+        # Kept so destroy() can disconnect everything
         self._mpl_cids: list[int] = [
             self.canvas.mpl_connect("axes_enter_event", eh.on_enter_axes),
             self.canvas.mpl_connect("axes_leave_event", eh.on_leave_axes),
@@ -278,21 +240,13 @@ class DicomViewer(ttk.Frame):
             self.canvas.mpl_connect("draw_event", self._compositor.on_draw),
         ]
 
-        # Tk only delivers key events to the widget that currently holds
-        # keyboard focus. Without this, "key_press_event" (arrow-key slice
-        # navigation, and any modifier a host application tracks) silently
-        # never fires until the canvas happens to already have focus for some
-        # unrelated reason. Grabbing focus on hover means a key works as soon
-        # as the mouse is over the plot, with no separate click required.
+        # Tk sends key events only to the focused widget: take focus on hover
+        # so arrow-key navigation works without a click
         self.canvas.get_tk_widget().bind(
             "<Enter>", lambda _event: self.canvas.get_tk_widget().focus_set()
         )
 
-        # Every (event, callback) pair is recorded so destroy() can unregister
-        # them all. Without this, a destroyed viewer sharing an injected state
-        # would stay subscribed forever — the state would keep invoking
-        # callbacks on dead Tk widgets (TclError spam) and the viewer object
-        # could never be garbage collected.
+        # Kept so destroy() can unsubscribe from a (possibly shared) state
         self._state_listeners: list[tuple[str, Callable]] = [
             (PRIMARY_IMAGE_DATA_CHANGED, self._on_primary_image_data_changed),
             (SECONDARY_IMAGE_DATA_CHANGED, self._on_secondary_image_data_changed),
@@ -360,11 +314,7 @@ class DicomViewer(ttk.Frame):
         self.axs[axis].add_artist(artist)
 
     def _safe_after_cancel(self, handle: str | None) -> None:
-        """Cancel a scheduled callback, ignoring one Tk has already forgotten.
-
-        Every collaborator that schedules work cancels through this, which is
-        what lets them stay free of ``tkinter`` imports and be tested headless.
-        """
+        """Cancel a scheduled callback, ignoring one Tk has already forgotten."""
         if handle is None:
             return
         with contextlib.suppress(tk.TclError, ValueError):
@@ -374,10 +324,9 @@ class DicomViewer(ttk.Frame):
     # Artist collection for the blit layer
     # ------------------------------------------------------------------
     def _build_blit_artists(self, axis: str) -> list[Artist]:
-        """Return the artists to draw on top of *axis*' background, in order.
+        """Return the visible artists to draw over *axis*' background, in order.
 
-        The brush cursor is excluded; it is supplied per frame through
-        :meth:`_transient_artists` because it moves on every frame.
+        The brush cursor is supplied separately (:meth:`_transient_artists`).
         """
         artists: list[Artist] = list(self.image_layer.blit_artists(axis))
         artists.extend(self.isodose.blit_artists(axis))
@@ -401,12 +350,10 @@ class DicomViewer(ttk.Frame):
         return artists
 
     def _overlay_artists(self, axis: str) -> list[Artist]:
-        """Return every blit-layer artist for *axis*, visible or not.
+        """Return every overlay artist for *axis*, visible or not.
 
-        The compositor hides these while it renders the background bitmap, so
-        none of them is baked into it. The base images are deliberately absent:
-        they belong *in* the background, which is why a slice change alone does
-        not require a rebuild.
+        Hidden while the background renders. The base images are not listed:
+        they are part of the background.
         """
         artists: list[Artist] = [
             line for line in self.crosshairs[axis].values() if line is not None
@@ -471,9 +418,8 @@ class DicomViewer(ttk.Frame):
     ) -> None:
         """Position (or hide) the crosshair lines for *axis*.
 
-        The desired visibility is computed once and the lines are only toggled
-        when it actually changes, so a plain crosshair drag reuses the cached
-        blit list instead of invalidating it on every frame.
+        Visibility is toggled only on change, so a drag keeps the cached
+        artist list.
         """
         ax = self.axs.get(axis)
         if ax is None:
@@ -516,13 +462,10 @@ class DicomViewer(ttk.Frame):
     ) -> None:
         """Redraw *axis*' ROI contours, optionally from caller-supplied masks.
 
-        Used by the brush during live painting so contours reflect the
-        in-progress stroke without committing it to the state.
-
         Args:
-            axis: One of ``"axial"``, ``"coronal"``, or ``"sagittal"``.
-            override_mask: Optional ``{roi_number: 2-D numpy array}`` that
-                takes precedence over ``state.structure_set`` for those ROIs.
+            axis: View axis.
+            override_mask: ``{roi_number: 2-D mask}`` drawn instead of the
+                stored masks (the brush's uncommitted stroke).
         """
         ax = self.axs.get(axis)
         if ax is None:
@@ -542,12 +485,10 @@ class DicomViewer(ttk.Frame):
     # Artist reset
     # ------------------------------------------------------------------
     def _reset_artists(self) -> None:
-        """Clear every Axes and drop all artist references.
+        """Clear every Axes and tell each owner to drop its artist references.
 
-        ``Axes.clear()`` detaches every artist without calling ``remove()`` on
-        it, so each owner is told to release its references rather than to
-        remove artists that are already gone — calling ``remove()`` on one of
-        those raises ``NotImplementedError``.
+        ``Axes.clear()`` already detached the artists; calling ``remove()``
+        on them would raise.
         """
         for ax in self.axs.values():
             ax.clear()
@@ -563,8 +504,6 @@ class DicomViewer(ttk.Frame):
         self.bbox_3d_patches = dict.fromkeys(AXES)
         self._extra_blit_artists = {axis: [] for axis in AXES}
         self._compositor.reset()
-        # Reset the same-slice early-exit counters so the first slice of the
-        # new image is always rendered.
         self._last_rendered_index = dict.fromkeys(AXES, -1)
 
     # ------------------------------------------------------------------
@@ -578,13 +517,8 @@ class DicomViewer(ttk.Frame):
             self._on_bounding_box_3d_changed(self.viewer_state.bounding_box_3d)
             self.viewer_state.refresh_crosshair()
             self._compositor.cache_backgrounds()
-        # A full canvas.draw() rather than the partial blit path: with
-        # constrained_layout enabled, swapping to an image of a different
-        # aspect ratio changes each axes' bbox, and blit() only ever touches
-        # pixels inside the *current* bbox. Any screen region the old, larger
-        # bbox occupied would keep showing remnants of the previous image. This
-        # runs once per image load, not per scroll step, so the cost is
-        # negligible.
+        # Full draw: a new aspect ratio moves the Axes, and a blit would leave
+        # the previous image outside the new boxes
         self.canvas.draw()
 
     def _on_secondary_image_data_changed(self, image: sitk.Image | None) -> None:
@@ -593,21 +527,14 @@ class DicomViewer(ttk.Frame):
         self._compositor.schedule_rebuild()
 
     def _on_blend_alpha_changed(self, alpha: float) -> None:
-        # ttk.Scale.set fires the widget's own command, which calls back into
-        # set_blend_alpha. The value survives the round trip through Tk as a
-        # string, so it usually compares equal there and the echo stops of its
-        # own accord — but a value that does not round-trip exactly (a drag
-        # delta such as 0.3333333) writes back a hair-different alpha,
-        # rebuilds both LUTs a second time and re-windows every slice for
-        # nothing. The flag ends the echo at the first hop instead of relying
-        # on float equality to end it at the second.
+        # Scale.set() fires the slider command; the flag stops that echo
+        # (a float that does not round-trip through Tk would re-render twice)
         self._syncing_blend_slider = True
         try:
             self.blend_slider.set(alpha)
         finally:
             self._syncing_blend_slider = False
-        # The blend alpha is baked into the secondary LUT and the isodose fill
-        # colormap; rebuild both, then re-window the current slices.
+        # The alpha is baked into the secondary LUT and the isodose colormap
         self.image_layer.rebuild_secondary_lut()
         self.isodose.on_blend_alpha_changed()
         self._update_all_slice_displays()
@@ -620,27 +547,15 @@ class DicomViewer(ttk.Frame):
     def _on_secondary_window_level_changed(
         self, window_level: tuple[float, float] | None
     ) -> None:
-        """Re-window the secondary image after its own window changed.
-
-        Only the secondary artist's data changes, but it is re-composed
-        through the same path as the primary; ``ImageLayer`` issues the
-        immediate blit request, so a secondary W/L drag updates in real time.
-        """
+        """Re-window the secondary image after its own window changed."""
         self._update_all_slice_displays()
         self._compositor.schedule_rebuild()
 
     def _on_index_changed(self, axis: str, new_idx: int) -> None:
+        """Render the new slice of *axis* (blit layer only; no background rebuild)."""
         if axis not in self.axs:
-            # Not rendered in the current layout mode (e.g. "single").
-            # set_index() also updates the other MPR axes for crosshair
-            # alignment and notifies for each of them regardless of which axes
-            # are actually built, so this guard is required even though the
-            # caller only ever scrolls the visible axis.
+            # Not built in the current layout (e.g. "single")
             return
-
-        # Skip redundant redraws of the same slice. set_index only notifies on
-        # a real change, but several viewers can share one state, so a viewer
-        # may already be showing the index it is being told about.
         if self._last_rendered_index.get(axis) == new_idx:
             return
         self._last_rendered_index[axis] = new_idx
@@ -650,23 +565,9 @@ class DicomViewer(ttk.Frame):
         self.contours.draw(axis, self.axs[axis])
         if self.viewer_state.rt_dose_resampled is not None:
             self.isodose.update(axis, self.axs[axis])
-        # NOTE: no background rebuild is scheduled here. Slice scrolling only
-        # updates artists that already live in the blit layer (AxesImage via
-        # set_data, contour paths, isodose artists), so the cached background
-        # bitmap stays valid. Calling canvas.draw() on every scroll caused
-        # visible stalls at ~150 ms intervals. Events that DO require a
-        # rebuild (window/level, layout, ROI edits, limit changes) schedule one
-        # from their own listeners.
 
     def _on_window_level_changed(self, window: float, level: float) -> None:
-        """Re-window the displayed slices through the RGBA LUT.
-
-        With pre-composed RGBA data there is no ``set_clim`` shortcut; the
-        current slices are pushed through the LUT again. ``ImageLayer`` issues
-        the immediate blit request, so a right-click W/L drag updates in real
-        time; the debounced background rebuild only refreshes the baked-in
-        bitmap afterwards.
-        """
+        """Re-window the displayed slices; the background is rebuilt later."""
         self._update_all_slice_displays()
         self._compositor.schedule_rebuild()
 
@@ -675,9 +576,6 @@ class DicomViewer(ttk.Frame):
             self._update_crosshairs_display(
                 axis, self.viewer_state.crosshair_pos.get(axis)
             )
-        # Crosshairs live in the blit layer so they always update immediately,
-        # even while a background rebuild is pending. Skip the redraw request
-        # when the crosshair is hidden to avoid unnecessary blits.
         if not self.viewer_state.crosshair_visible:
             return
         for axis in self.axs:
@@ -734,17 +632,12 @@ class DicomViewer(ttk.Frame):
     def _update_bbox_3d_patch(self, axis: str, box: Box3D | None = None) -> None:
         """Position (or hide) *axis*' projection of the 3-D bounding box.
 
-        The projection is drawn solid while the displayed slice cuts through
-        the box and dashed while it does not. Without that cue the box looks
-        identical on every slice, and nothing on screen would say how deep it
-        reaches — the one thing a volumetric selection has to communicate and
-        a per-view box never had to.
+        Drawn solid while the displayed slice cuts through the box and dashed
+        otherwise, which is what shows the box's depth.
 
         Args:
             axis: The view to update.
-            box:  The box to draw. Defaults to the current state value; the
-                listener passes the notified box so a clear (``None``) is not
-                re-read as the stale one.
+            box: The box to draw; ``None`` reads the current state value.
         """
         ax = self.axs.get(axis)
         if ax is None:
@@ -797,33 +690,30 @@ class DicomViewer(ttk.Frame):
         self._update_all_contours()
 
     def _on_contour_cache_built(self, roi_number: int) -> None:
-        """Redraw all axes when a background contour cache build completes.
+        """Queue one coalesced contour redraw for finished background builds.
 
-        This callback originates on a background worker thread (the
-        contour-build thread pool owned by the state), so it must not touch Tk
-        or Matplotlib directly. It marshals the redraw onto the Tk main loop
-        with ``after(0, ...)``.
+        Called on a worker thread; see :class:`ContourRedrawCoalescer`.
+        """
+        self._contour_redraws.notify_built(roi_number)
 
-        Note: ``Tk.after`` is only documented as thread-safe on a Tcl
-        interpreter built with threads enabled (the default for CPython's
-        bundled Tk on all mainstream platforms). This viewer relies on that
-        assumption; see the "Threading model" note in the README.
+    def _schedule_from_worker(
+        self, delay_ms: int, callback: Callable[[], None]
+    ) -> str | None:
+        """Schedule *callback* on the Tk main loop from a worker thread.
+
+        ``after`` is thread-safe with a threaded Tcl (CPython's default; see
+        the README's "Threading model").
         """
         try:
-            self.after(0, self._update_all_contours)
-        except RuntimeError:
-            # "main thread is not in main loop": the mainloop has already
-            # exited (application shutdown) while a background contour build
-            # was still finishing. The redraw is moot at that point, so the
-            # race is benign and intentionally swallowed.
-            logger.debug("Contour cache built after mainloop exit; redraw skipped.")
+            return self.after(delay_ms, callback)
+        except (RuntimeError, tk.TclError):
+            # The main loop has exited or the widget is gone: nothing to redraw
+            logger.debug("Contour cache built after teardown; redraw skipped.")
+            return None
 
     def _on_rt_dose_changed(self, image) -> None:
         """Update the dose overlay and DVH panel when the RT-DOSE changes."""
         self._update_blend_slider_visibility()
-
-        # Dmax was already computed once in state.set_rt_dose_image(), so only
-        # the cached value is read here.
         self.isodose.set_fallback_ref_dose(self.viewer_state.get_dose_fallback_ref_gy())
 
         if self.viewer_state.rt_dose_resampled is None:
@@ -834,8 +724,7 @@ class DicomViewer(ttk.Frame):
             for axis in self.axs:
                 self.isodose.update(axis, self.axs[axis])
             self.viewer_state.refresh_crosshair()
-            # Deferred scheduling suppresses a full re-render on rapid updates
-            # such as prescription-dose changes.
+            # Deferred: prescription changes can arrive in quick succession
             self._compositor.schedule_rebuild()
             for axis in self.axs:
                 self.drawing_manager.add_request(axis)
@@ -859,13 +748,7 @@ class DicomViewer(ttk.Frame):
         if self._layout_mode == mode:
             return
 
-        # A rebuild scheduled just before this call (e.g. a scroll or W/L
-        # drag that just ended) would otherwise fire after _reset_artists
-        # below with an axes_filter naming the *old* layout's axis names.
-        # cache_backgrounds tolerates that silently (the names simply match
-        # nothing in the new self.axs), so nothing breaks, but it is a
-        # redundant full-figure render on every layout switch that a
-        # cancel here avoids.
+        # A pending rebuild would name the old layout's axes; this one renders
         self._compositor.cancel_pending()
 
         self.fig.clear()
@@ -885,13 +768,7 @@ class DicomViewer(ttk.Frame):
 
         self._update_blend_slider_visibility()
         self._update_dvh_panel()
-
-        # Axes were just added, removed, or resized, so their bboxes no longer
-        # match the previous layout. The per-axis partial blit only repaints
-        # pixels inside the *current* bboxes, so any screen region belonging to
-        # a now-removed or now-shrunk axis (e.g. the DVH panel when switching
-        # to the wide MPR layout) would keep showing stale pixels. A full
-        # canvas draw repaints every pixel, so no remnants can remain.
+        # Full draw: blits would leave remnants of removed or shrunk Axes
         self.canvas.draw()
 
     # ------------------------------------------------------------------
@@ -904,17 +781,11 @@ class DicomViewer(ttk.Frame):
     ) -> None:
         """Load a DICOM CT series from *ct_dir* and display it.
 
-        Window / level is taken from the DICOM metadata via
-        :func:`~tk_rt_viewer.io.load_dcm_series`. Pass *window* to override.
-
         Args:
-            ct_dir: Path to the DICOM folder.
-            window: Optional ``(window_width, window_level)`` override.
+            ct_dir: Path to the DICOM folder (one series).
+            window: ``(window_width, window_level)``; defaults to the window
+                from the DICOM metadata.
         """
-        # Normalised here rather than passed through as given: the state
-        # stores it as ``primary_image_dir``, typed as a Path, and a host
-        # that hands in a plain string should not be the reason that field
-        # holds one of two different types depending on the caller.
         ct_dir = pathlib.Path(ct_dir)
         info = load_dcm_series(ct_dir)
         self.viewer_state.set_primary_image_data(info["sitk_image"], image_dir=ct_dir)
@@ -928,12 +799,9 @@ class DicomViewer(ttk.Frame):
     def set_secondary_window(
         self, vmin: float | None, vmax: float | None = None
     ) -> None:
-        """Set the secondary display window using vmin / vmax, or clear it.
+        """Set the secondary display window from vmin / vmax, or clear it.
 
-        The counterpart of :meth:`set_window` for the overlay image, for
-        callers that think in bounds ("show 0-60 Gy") rather than in
-        width/level. Pass ``None`` to drop the override so the secondary image
-        follows the primary window again.
+        ``None`` drops the override so the secondary follows the primary.
 
         Args:
             vmin: Lower bound, or ``None`` to clear the override.
@@ -950,19 +818,12 @@ class DicomViewer(ttk.Frame):
         self.viewer_state.set_secondary_window_level(clim_to_window_level((vmin, vmax)))
 
     def set_isodose_lines(self, gy_pairs: list[tuple[float, str]] | None) -> None:
-        """Dynamically update IsoDose level definitions and trigger a redraw.
-
-        Intended to be called as a callback from an IsoDose settings dialog.
+        """Replace the isodose levels and redraw.
 
         Args:
-            gy_pairs: A list of (Gy value, hex colour string) tuples, sorted
-                ascending. An empty list hides all IsoDose display; ``None``
-                restores the percentage-based default ladder
+            gy_pairs: ``(dose_gy, "#rrggbb")`` pairs in any order. ``[]`` hides
+                all isodose display; ``None`` restores the default ladder
                 (:data:`~tk_rt_viewer.isodose_levels.DEFAULT_ISODOSE_LEVELS`).
-                The two are kept distinct because collapsing them — as an
-                earlier version did by testing the list's truthiness — left a
-                host that had once set custom levels with no way back to the
-                defaults through the public API at all.
         """
         self.isodose.set_custom_levels(None if gy_pairs is None else list(gy_pairs))
 
@@ -979,20 +840,12 @@ class DicomViewer(ttk.Frame):
         return self.viewer_state.get_slice_data(self.viewer_state.primary_image, view)
 
     def add_overlay_artist(self, axis: str, artist: Artist) -> None:
-        """Register a host-application artist to survive the blit cycle.
+        """Register a host artist so it survives the blit cycle.
 
-        Each axis is repainted by restoring a cached background bitmap and
-        redrawing only a fixed set of known artists (images, contours, isodose,
-        bounding box, crosshairs) on top of it. Any artist a host application
-        adds directly to ``viewer.axs[axis]`` — a manual point marker, a
-        measurement line — is invisible to that bookkeeping: the very next blit
-        restore, which something as small as a one-pixel window/level drag can
-        trigger, repaints from the stale background and erases it.
-
-        Call this once right after adding *artist* to ``self.axs[axis]`` so it
-        is included in every future blit pass, and excluded from the background
-        bitmap the next time it is rebuilt (so it is never baked in at a stale
-        position). Call :meth:`remove_overlay_artist` when the artist goes.
+        An artist added directly to ``viewer.axs[axis]`` (a marker, a
+        measurement line) would be erased by the next blit, which restores a
+        cached background. Call this right after adding it, and
+        :meth:`remove_overlay_artist` when it goes.
 
         Args:
             axis: The axis the artist was added to.
@@ -1015,12 +868,7 @@ class DicomViewer(ttk.Frame):
 
     @property
     def metadata(self) -> dict[str, Any]:
-        """Return the primary image geometry as a fixed-key dict.
-
-        Always exposes the same keys (``spacing`` / ``origin`` / ``size``) so
-        callers can index them unconditionally; each is ``None`` when no
-        primary image is loaded, rather than the key being absent.
-        """
+        """Return the primary image's spacing / origin / size (``None`` without one)."""
         img = self.viewer_state.primary_image
         if img is None:
             return {"spacing": None, "origin": None, "size": None}
@@ -1031,43 +879,20 @@ class DicomViewer(ttk.Frame):
         }
 
     def destroy(self) -> None:
-        """Cancel every pending callback and background task, then destroy.
+        """Cancel pending callbacks, unsubscribe from the state, then destroy.
 
-        Without this, a callback scheduled by the drawing manager, the
-        background-cache debounce, or the scroll debounce could fire after the
-        underlying Tk widget is gone and raise ``TclError``.
-
-        The contour-build thread pool is shut down here too, but only when this
-        viewer created its own ``state``. "Whoever creates a resource is
-        responsible for releasing it": an injected state may still be
-        referenced by whatever constructed it, so closing its thread pool here
-        would break that owner even though this viewer is done with it.
-
-        Consequence for host applications: when a state is injected, the host
-        owns it and must call :meth:`SliceViewerState.close` itself (typically
-        from its window-close handler). Skipping that leaves the contour-build
-        thread pool running; because its workers are non-daemon threads, the
-        interpreter waits for any queued task to finish before the process can
-        exit.
+        The state's thread pool is closed only when this viewer created the
+        state. A host that injected a state owns it and must call
+        :meth:`SliceViewerState.close` itself; its non-daemon workers
+        otherwise delay interpreter exit.
         """
         self.drawing_manager.cancel()
+        self._contour_redraws.cancel()
         self._compositor.cancel_pending()
         self.event_handler.cancel_pending()
-        # Disconnect every canvas callback registered in _bind_events. The
-        # Tk widget is about to be destroyed by super().destroy() below, but
-        # the FigureCanvasTkAgg / mpl connection registry is a separate
-        # object from it and does not know that; leaving these connected
-        # has no functional effect once the canvas itself is gone (nothing
-        # fires matplotlib events into a destroyed widget), but it does keep
-        # every connected callback's closure (and therefore this viewer and
-        # its collaborators) reachable from the canvas for as long as
-        # anything else keeps that canvas alive.
         for cid in self._mpl_cids:
             self.canvas.mpl_disconnect(cid)
         self._mpl_cids.clear()
-        # Unsubscribe from the state before anything else: after this point no
-        # state change can reach this (now dying) widget. Essential for
-        # injected states, which outlive the viewer.
         for event_name, callback in self._state_listeners:
             self.viewer_state.remove_listener(event_name, callback)
         self._state_listeners.clear()

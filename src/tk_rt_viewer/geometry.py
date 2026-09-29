@@ -1,10 +1,11 @@
 """geometry.py — Pure geometric helpers shared across the viewer.
 
-Small, dependency-free (aside from NumPy / SimpleITK / matplotlib / skimage)
-functions for slicing volumes and mapping mask slices into physical-space
-matplotlib paths. Extracted so that both ``viewer_state`` and
-``viewer_cache`` can share a single implementation instead of duplicating
-the axis-branching logic.
+Slicing volumes, computing display extents, and mapping mask slices to
+physical-space Matplotlib paths. Everything here is stateless.
+
+Axis naming: a *view* axis (``"axial"``, ``"coronal"``, ``"sagittal"``) is
+the axis normal to the displayed plane. SimpleITK orders physical dimensions
+``(x, y, z)``; NumPy arrays from SimpleITK are ordered ``(z, y, x)``.
 """
 
 from dataclasses import dataclass
@@ -17,29 +18,20 @@ from skimage.measure import find_contours
 
 AXES = ("axial", "coronal", "sagittal")
 
-#: For a given view axis, which physical axis backs each pixel axis of
-#: that view's 2-D slice: ``VIEW_TO_PIXEL_AXES[view] == (x_axis, y_axis)``.
-#: Shared by ``SliceViewerState.get_bbox_pixel_coords`` and
-#: ``set_bbox_from_pixel_coords`` so the mapping is defined once instead
-#: of duplicated (and liable to drift) across both directions of the
-#: conversion.
+#: For each view, the view axes whose indices run along the displayed
+#: pixel axes: ``VIEW_TO_PIXEL_AXES[view] == (x_axis, y_axis)``.
 VIEW_TO_PIXEL_AXES: dict[str, tuple[str, str]] = {
     "axial": ("sagittal", "coronal"),
     "coronal": ("sagittal", "axial"),
     "sagittal": ("coronal", "axial"),
 }
 
-#: Valid ``DicomViewer`` / ``LayoutManager`` layout mode names. Centralised
-#: here so ``SliceViewerState.set_layout_mode`` and ``LayoutManager.build``
-#: validate against a single source of truth instead of two copies that
-#: could silently drift apart.
+#: Valid ``DicomViewer`` / ``LayoutManager`` layout mode names.
 LAYOUT_MODES = ("single", "mpr_wide", "mpr")
 
-# Axis-name to NumPy / (x, y, z) dimension lookup. Defined once here (rather
-# than duplicated in viewer_state.py / viewer_cache.py) so that runtime
-# lookups never rebuild a dict (a measurable cost during scroll) and every
-# module shares a single source of truth.
+#: View axis -> NumPy ``(z, y, x)`` dimension.
 AXIS_TO_NUMPY_DIM: dict[str, int] = {"axial": 0, "coronal": 1, "sagittal": 2}
+#: View axis -> SimpleITK / physical ``(x, y, z)`` dimension.
 AXIS_TO_XYZ_DIM: dict[str, int] = {"axial": 2, "coronal": 1, "sagittal": 0}
 
 
@@ -47,44 +39,29 @@ AXIS_TO_XYZ_DIM: dict[str, int] = {"axial": 2, "coronal": 1, "sagittal": 0}
 class Box3D:
     """An axis-aligned box in physical (LPS, mm) coordinates.
 
-    The viewer's 2-D bounding box (``SliceViewerState.bounding_boxes``) is
-    per-view and only ever exists on one view at a time, which makes it a
-    poor fit for selecting a *volume* — a registration region of interest, a
-    crop, a 3-D inference prompt. This type is the volumetric counterpart:
-    one box, shared by all three views, each of which shows its own
-    projection (see :meth:`project`).
+    The volumetric counterpart of the per-view 2-D bounding box: one box
+    shared by all three views, each showing its own projection (see
+    :meth:`project`). Used for crops, registration regions and 3-D prompts.
 
-    ``lower`` / ``upper`` are the two opposite corners, per physical
-    dimension ``(x, y, z)``. They are normalised on construction, so
-    ``lower[d] <= upper[d]`` always holds and callers may pass the corners
-    in either order.
+    ``lower`` / ``upper`` are opposite corners per physical dimension
+    ``(x, y, z)``. They are normalised on construction, so
+    ``lower[d] <= upper[d]`` always holds and callers may pass the corners in
+    either order.
     """
 
     lower: tuple[float, float, float]
     upper: tuple[float, float, float]
 
     def __post_init__(self) -> None:
-        """Normalise the corners so ``lower`` is component-wise the smaller.
-
-        A drag that ends above / left of where it started produces a
-        "negative" box, and a caller converting from index bounds on a
-        flipped axis produces another. Sorting here means no consumer has to
-        care: ``project``, ``contains_coordinate`` and every crop built from
-        this box can assume an ordered interval.
-        """
+        """Validate the corners and sort them component-wise."""
         if len(self.lower) != 3 or len(self.upper) != 3:
             raise ValueError(
                 f"Box3D takes two 3-element corners, got {self.lower!r} / "
                 f"{self.upper!r}."
             )
-        lower = tuple(
-            float(min(a, b)) for a, b in zip(self.lower, self.upper, strict=True)
-        )
-        upper = tuple(
-            float(max(a, b)) for a, b in zip(self.lower, self.upper, strict=True)
-        )
-        object.__setattr__(self, "lower", lower)
-        object.__setattr__(self, "upper", upper)
+        pairs = list(zip(self.lower, self.upper, strict=True))
+        object.__setattr__(self, "lower", tuple(float(min(a, b)) for a, b in pairs))
+        object.__setattr__(self, "upper", tuple(float(max(a, b)) for a, b in pairs))
 
     # ------------------------------------------------------------------
     # Construction
@@ -93,8 +70,7 @@ class Box3D:
     def from_image_extent(cls, image: sitk.Image) -> "Box3D":
         """Return the box covering all of *image*, out to the voxel edges.
 
-        Uses the same pixel-center convention as :func:`compute_extent`: the
-        bounds sit half a voxel outside the first and last voxel centers.
+        Uses the same pixel-center convention as :func:`compute_extent`.
         """
         size = np.array(image.GetSize(), dtype=float)
         corners = np.array(
@@ -119,12 +95,8 @@ class Box3D:
     ) -> "Box3D":
         """Build a box from inclusive voxel index bounds on *image*'s grid.
 
-        The box spans the *centers* of the bounding voxels, which is what
-        makes it round-trip exactly through :meth:`index_bounds` (that method
-        maps physical coordinates back to the nearest voxel center). The half
-        voxel of extent beyond each bounding center is immaterial to every
-        consumer of these bounds — a crop, a region of interest, a prompt —
-        all of which work in whole voxels.
+        The box spans the *centers* of the bounding voxels so that it
+        round-trips exactly through :meth:`index_bounds`.
         """
         low_point = image.TransformContinuousIndexToPhysicalPoint(
             [float(v) for v in lower]
@@ -140,18 +112,19 @@ class Box3D:
     @property
     def center(self) -> tuple[float, float, float]:
         """The box centre in physical coordinates."""
-        low, high = self.lower, self.upper
-        return (
-            (low[0] + high[0]) / 2.0,
-            (low[1] + high[1]) / 2.0,
-            (low[2] + high[2]) / 2.0,
+        return as_point(
+            [
+                (low + high) / 2.0
+                for low, high in zip(self.lower, self.upper, strict=True)
+            ]
         )
 
     @property
     def size(self) -> tuple[float, float, float]:
         """The box side lengths in mm, per physical dimension."""
-        low, high = self.lower, self.upper
-        return (high[0] - low[0], high[1] - low[1], high[2] - low[2])
+        return as_point(
+            [high - low for low, high in zip(self.lower, self.upper, strict=True)]
+        )
 
     def with_range(self, dim: int, low: float, high: float) -> "Box3D":
         """Return a copy with physical dimension *dim* (0=x, 1=y, 2=z) replaced."""
@@ -164,10 +137,9 @@ class Box3D:
     ) -> "Box3D":
         """Return a copy with the two dimensions shown by *axis* replaced.
 
-        *rect* is ``(x, y, width, height)`` in the physical coordinates that
-        view plots — the same shape the 2-D bounding box uses. The dimension
-        perpendicular to *axis* is left untouched, which is what lets a box
-        be drawn on one view and then trimmed in depth on another.
+        *rect* is ``(x, y, width, height)`` in that view's physical
+        coordinates. The dimension perpendicular to *axis* is untouched, so a
+        box drawn on one view can be trimmed in depth on another.
         """
         x, y, width, height = rect
         dim_x, dim_y = view_dims(axis)
@@ -186,9 +158,7 @@ class Box3D:
     def contains_coordinate(self, axis: str, coord: float) -> bool:
         """Return whether *coord* lies within the box along *axis*' normal.
 
-        Used to tell whether the slice currently displayed on *axis* cuts
-        through the box, which the viewer renders differently from a slice
-        outside it.
+        Tells whether the slice displayed on *axis* cuts through the box.
         """
         dim = AXIS_TO_XYZ_DIM[axis]
         return self.lower[dim] <= coord <= self.upper[dim]
@@ -196,22 +166,15 @@ class Box3D:
     def index_bounds(
         self, image: sitk.Image
     ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
-        """Return inclusive voxel index bounds of this box on *image*'s grid.
+        """Return inclusive ``(x, y, z)`` voxel index bounds on *image*'s grid.
 
-        Each bound is the nearest voxel center to the corresponding box face,
-        clamped to the image, so a box drawn partly outside it still yields a
-        usable region. Returns ``(lower, upper)`` as ``(x, y, z)`` index
-        triples.
+        Each bound is the voxel center nearest the box face, clamped to the
+        image, so a box drawn partly outside still yields a usable region.
         """
         corners = np.array(
             [
                 image.TransformPhysicalPointToContinuousIndex(
-                    tuple(
-                        float(high if use_upper else low)
-                        for use_upper, low, high in zip(
-                            corner, self.lower, self.upper, strict=True
-                        )
-                    )
+                    tuple(float(v) for v in np.where(corner, self.upper, self.lower))
                 )
                 for corner in product((False, True), repeat=3)
             ]
@@ -228,47 +191,27 @@ class Box3D:
 def as_point(values) -> tuple[float, float, float]:
     """Return the first three elements of *values* as a 3-element float tuple.
 
-    SimpleITK's point APIs and NumPy reductions both return sequences of
-    unspecified length; building a tuple from one directly widens it to
-    ``tuple[float, ...]`` and loses the 3-D shape this module works in.
-
-    Public rather than underscore-prefixed: ``registration.session`` and
-    ``registration.template`` both need it, and a name that says "private"
-    while two other modules import it documents the opposite of the truth.
+    SimpleITK point APIs and NumPy reductions return sequences of unspecified
+    length; this restores the static 3-D shape.
     """
     return (float(values[0]), float(values[1]), float(values[2]))
 
 
 def view_dims(axis: str) -> tuple[int, int]:
-    """Return the physical dimensions backing *axis*' plotted x and y axes.
+    """Return the physical dimensions plotted on *axis*' x and y axes.
 
     ``view_dims("axial") == (0, 1)``: the axial view plots physical x
-    horizontally and physical y vertically. Derived from
-    :data:`VIEW_TO_PIXEL_AXES` so the two never disagree.
+    horizontally and physical y vertically.
     """
     x_axis, y_axis = VIEW_TO_PIXEL_AXES[axis]
     return AXIS_TO_XYZ_DIM[x_axis], AXIS_TO_XYZ_DIM[y_axis]
 
 
 def resample_binary_mask(mask: sitk.Image, reference: sitk.Image) -> sitk.Image:
-    """Resample a binary mask onto *reference*'s geometry with an identity transform.
+    """Resample a binary mask onto *reference*'s grid with an identity transform.
 
-    Uses nearest-neighbour interpolation to preserve binary (0/1) values,
-    with 0 filled outside *mask*'s original extent. This is the exact
-    resampler configuration needed by :func:`tk_rt_viewer.rtstruct_io.\
-resample_mask_to_original_space` (LPS-space mask -> original DICOM
-    geometry) and :func:`tk_rt_viewer.roi_operations.boolean_operation`
-    (aligning the second operand onto the first mask's grid); centralising
-    it here keeps both call sites from drifting apart if the
-    configuration ever needs to change.
-
-    Args:
-        mask: Binary mask to resample (sitk.Image).
-        reference: Image whose geometry (size, spacing, origin, direction)
-            the result is resampled onto.
-
-    Returns:
-        *mask* resampled onto *reference*'s grid.
+    Nearest-neighbour interpolation preserves the 0/1 values; voxels outside
+    *mask*'s extent become 0.
     """
     resampler = sitk.ResampleImageFilter()
     resampler.SetReferenceImage(reference)
@@ -280,11 +223,10 @@ resample_mask_to_original_space` (LPS-space mask -> original DICOM
 
 
 def slice_along_axis(arr: np.ndarray, axis: str, index: int) -> np.ndarray:
-    """Return the 2-D slice of *arr* at *index* along *axis*.
+    """Return the 2-D slice of a ``(z, y, x)`` array at *index* along *axis*.
 
-    Centralises the three direct-indexing branches used by every slice
-    cache (primary / secondary / dose / mask), avoiding the allocation of
-    a slice tuple on every scroll step.
+    Direct indexing per branch avoids building a slice tuple on every scroll
+    step.
     """
     dim = AXIS_TO_NUMPY_DIM[axis]
     if dim == 0:
@@ -297,29 +239,19 @@ def slice_along_axis(arr: np.ndarray, axis: str, index: int) -> np.ndarray:
 def compute_extent(image: sitk.Image, axis: str) -> tuple[float, float, float, float]:
     """Return ``(left, right, bottom, top)`` for *image* along *axis*, in mm.
 
-    Pixel-center convention: the returned edges sit half a voxel outside
-    the first / last pixel centers, i.e. ``[origin - 0.5 * spacing,
-    origin + (size - 0.5) * spacing]`` per displayed dimension. This makes
-    the extent agree with ``sitk.Image.TransformIndexToPhysicalPoint``
-    (which is itself pixel-center based) so that ``imshow(extent=...)``,
-    crosshair placement, and ``mask_slice_to_paths`` all land on the same
-    physical grid instead of drifting by up to one voxel relative to each
-    other.
+    Pixel-center convention: the edges sit half a voxel outside the first /
+    last pixel centers (``origin - 0.5 * spacing`` to
+    ``origin + (size - 0.5) * spacing``). This agrees with
+    ``TransformIndexToPhysicalPoint``, so ``imshow(extent=...)``, the
+    crosshair and :func:`mask_slice_to_paths` share one physical grid.
 
-    Shared by ``SliceViewerState.get_extent`` / ``get_dose_extent`` and by
-    the background contour-path build.
+    Only origin and spacing are read: the image must have an identity
+    direction, which :mod:`tk_rt_viewer.io` guarantees for loaded series.
     """
     size = image.GetSize()
     spacing = image.GetSpacing()
     origin = image.GetOrigin()
-    if axis == "axial":
-        dims = (0, 1)
-    elif axis == "coronal":
-        dims = (0, 2)
-    else:
-        # sagittal
-        dims = (1, 2)
-    d0, d1 = dims
+    d0, d1 = view_dims(axis)
     return (
         origin[d0] - 0.5 * spacing[d0],
         origin[d0] + (size[d0] - 0.5) * spacing[d0],
@@ -335,30 +267,21 @@ def mask_slice_to_paths(
     y0: float,
     y1: float,
 ) -> list[MplPath]:
-    """Convert a 2-D mask slice into a list of matplotlib ``Path`` objects.
+    """Convert a 2-D mask slice into closed Matplotlib ``Path`` objects.
 
-    The mask is padded with a one-voxel zero border so that masks touching
-    the slice edge (e.g. a BODY contour on coronal/sagittal views) still
-    yield closed contours. The +1 pixel padding offset is cancelled out
-    when contour coordinates are mapped back into physical space. Each
-    sub-path is explicitly closed so the fill rule recognises it as a
-    properly bounded polygon.
+    The mask is padded with a one-voxel zero border so structures touching
+    the slice edge still yield closed contours; the padding offset is removed
+    when mapping back to physical space.
 
-    ``x0, x1, y0, y1`` must be the pixel-center-convention extent produced
-    by :func:`compute_extent` (edges half a voxel outside the first / last
-    pixel centers). ``sx = (x1 - x0) / w`` then recovers the true pixel
-    spacing, and the ``+ 0.5`` term below places contour coordinate ``i``
-    at the physical *center* of pixel ``i`` (``origin + i * spacing``) —
-    the same point ``TransformIndexToPhysicalPoint`` and the crosshair
-    use, so contours, image, and crosshair share one physical grid.
+    Args:
+        mask_slice: 2-D binary mask ``(rows, cols)``.
+        x0, x1, y0, y1: The slice extent from :func:`compute_extent`. Contour
+            coordinate ``i`` is placed at the physical center of pixel ``i``,
+            matching the image and the crosshair.
 
-    Vertex and code arrays are built with vectorised NumPy operations
-    instead of a per-point Python list comprehension; this is roughly two
-    orders of magnitude faster for contours with many points (measured
-    ~90x on a several-hundred-point contour) and produces identical output.
+    Returns:
+        One explicitly closed path per contour with at least three vertices.
     """
-    # find_contours accepts uint8 directly, so the mask is padded without
-    # first copying it into a float64 array.
     padded = np.pad(mask_slice, pad_width=1, mode="constant")
     raw_contours = find_contours(padded, level=0.5)
     h, w = mask_slice.shape
@@ -370,13 +293,12 @@ def mask_slice_to_paths(
         n = len(contour)
         if n < 3:
             continue
-        # contour columns are (row, col) = (y, x) in padded-array indices;
-        # "- 1" cancels the padding offset, "+ 0.5" converts the edge-based
-        # extent origin to the pixel-center convention (see docstring).
+        # Columns are (row, col) in padded indices: "- 1" removes the padding,
+        # "+ 0.5" moves from the extent edge to the pixel center
         verts = np.empty((n + 1, 2), dtype=np.float64)
         verts[:n, 0] = x0 + (contour[:, 1] - 1 + 0.5) * sx
         verts[:n, 1] = y0 + (contour[:, 0] - 1 + 0.5) * sy
-        verts[n] = verts[0]  # explicitly close the polygon
+        verts[n] = verts[0]
         codes = np.full(n + 1, MplPath.LINETO, dtype=MplPath.code_type)
         codes[0] = MplPath.MOVETO
         codes[-1] = MplPath.CLOSEPOLY

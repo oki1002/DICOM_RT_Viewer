@@ -298,3 +298,54 @@ class TestCollectRegMatrices:
         good.ReferencedImageSequence = [image]
 
         assert list(self._collect([broken, good])) == ["1.2.3.GOOD"]
+
+
+class TestRegistrationAppliesToTheWholeSeries:
+    """A REG object naming any one slice must register the whole series.
+
+    The loader matched a registration by the SOP Instance UID of the series'
+    first file only, so a registration written by ``save_registration`` from
+    any other slice of the moving series was silently ignored on reload.
+    """
+
+    def test_a_registration_naming_a_later_slice_is_applied(self, tmp_path) -> None:
+        import pydicom
+
+        from tk_rt_viewer.io import load_all_series
+        from tk_rt_viewer.reg_io import save_registration
+
+        fixed_dir = tmp_path / "fixed"
+        fixed_dir.mkdir()
+        _write_minimal_ct_series(fixed_dir, generate_uid(), "Fixed", n_slices=3)
+        moving_dir = tmp_path / "moving"
+        moving_dir.mkdir()
+        _write_minimal_ct_series(moving_dir, generate_uid(), "Moving", n_slices=3)
+
+        fixed_ref = pydicom.dcmread(fixed_dir / "0.dcm", stop_before_pixels=True)
+        # Deliberately not the first slice of the moving series
+        moving_ref = pydicom.dcmread(moving_dir / "2.dcm", stop_before_pixels=True)
+        matrix = np.eye(4)
+        matrix[:3, 3] = (5.0, -3.0, 2.0)
+        save_registration(tmp_path / "reg" / "reg.dcm", matrix, fixed_ref, moving_ref)
+
+        series = load_all_series(tmp_path)
+
+        assert series["Fixed"]["transform"] is None
+        transform = series["Moving"]["transform"]
+        assert transform is not None
+        # Stored as the resampling direction: the inverse of the written motion
+        assert transform.TransformPoint((0.0, 0.0, 0.0)) == pytest.approx(
+            (-5.0, 3.0, -2.0)
+        )
+
+
+class TestNonCtWindowFallback:
+    def test_a_flat_non_ct_image_gets_a_usable_window(self) -> None:
+        import SimpleITK as sitk
+
+        from tk_rt_viewer.io import _get_window_level
+
+        image = sitk.GetImageFromArray(np.full((4, 4, 4), 7.0, dtype=np.float32))
+        width, level = _get_window_level(sitk.ImageSeriesReader(), image, "MR")
+        assert width > 0
+        assert level == pytest.approx(7.0)

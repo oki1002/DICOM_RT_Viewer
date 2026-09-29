@@ -6,33 +6,35 @@ validate_dicom_files(folder_path) -> bool
     Verify that every file in *folder_path* belongs to a single CT series.
 
 find_reg_matrices(dcm_root_dir) -> dict[str, np.ndarray]
-    Recursively scan a directory tree for Spatial Registration Object (REG)
-    files and return a mapping of referenced SOP Instance UID to 4x4
-    transformation matrix.
+    Map referenced SOP Instance UIDs to the 4x4 matrices of every Spatial
+    Registration (REG) object under a directory tree.
 
 scan_dicom_series(dcm_root_dir) -> SeriesScan
-    Enumerate the image series in a directory tree without reading any pixel
+    Enumerate the image series in a directory tree without reading pixel
     data, for a series picker.
 
 select_phase_series(all_series, phases) -> dict[str, SeriesInfo]
     Pick the 4DCT phases named by a scan result out of a load_all_series map.
 
 load_all_series(dcm_root_dir) -> dict[str, SeriesInfo]
-    Load every DICOM *image* series found under *dcm_root_dir*, keyed by
+    Load every DICOM *image* series under *dcm_root_dir*, keyed by
     SeriesDescription.
 
 load_dcm_series(dcm_dir) -> SeriesInfo
-    Convenience wrapper for a folder that contains exactly one series.
+    Load a folder that contains exactly one series.
 
 find_rt_dose_files(folder_path) -> list[pathlib.Path]
-    Return RT-DOSE DICOM files found (non-recursively) in *folder_path*.
+    Return RT-DOSE files found (non-recursively) in *folder_path*.
 
 load_rt_dose(dose_path) -> sitk.Image
-    Load an RT-DOSE DICOM file and return a ``sitk.Image`` scaled to Gy.
+    Load an RT-DOSE file as a ``sitk.Image`` scaled to Gy.
 
 normalize_phase_label(text) -> str | None
-    Extract a respiratory-phase label (e.g. ``"10%"``) from a DICOM
-    SeriesDescription string, or ``None`` if no such pattern is present.
+    Extract a respiratory-phase label (e.g. ``"10%"``) from a
+    SeriesDescription.
+
+Every loaded image is oriented to LPS with an identity direction (see
+:func:`_orient_to_lps`); the rendering code relies on that.
 """
 
 import itertools
@@ -40,7 +42,7 @@ import logging
 import math
 import pathlib
 import re
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import TypedDict
 
@@ -49,7 +51,7 @@ import pydicom
 import SimpleITK as sitk
 from pydicom.errors import InvalidDicomError
 
-from .window_level import WINDOW_PERCENTILE_SAMPLE_TARGET, strided_sample
+from .window_level import compute_auto_window_level
 
 logger = logging.getLogger(__name__)
 
@@ -57,25 +59,29 @@ _SPATIAL_REGISTRATION_UID = "1.2.840.10008.5.1.4.1.1.66.1"
 _CT_IMAGE_STORAGE_UID = "1.2.840.10008.5.1.4.1.1.2"
 _PHASE_LABEL_PATTERN = re.compile(r"\d+%")
 
-#: Modalities that are never loaded as a displayable image series by
-#: :func:`load_all_series`. A directory holding an RT-STRUCT, RT-PLAN, REG or
-#: RT-DOSE object alongside (or instead of) its images would otherwise have
-#: those objects enumerated by ``GetGDCMSeriesIDs`` and read through the CT
-#: code path, producing a bogus entry in the returned mapping — and, for
-#: RT-DOSE, pulling a whole dose grid in without its ``DoseGridScaling``
-#: applied. RT-DOSE has its own loader (:func:`load_rt_dose`)
+#: Modalities never loaded as a displayable image series. Without this,
+#: GDCM enumerates RT objects alongside the images and they are read through
+#: the CT path (RT-DOSE without its DoseGridScaling). RT-DOSE has its own
+#: loader, :func:`load_rt_dose`.
 _NON_IMAGE_MODALITIES: frozenset[str] = frozenset(
     {"RTSTRUCT", "RTPLAN", "RTRECORD", "RTDOSE", "REG", "SR", "PR", "KO", "SEG"}
 )
 
-#: Default fill value for voxels that fall outside the source volume when an
-#: oblique acquisition is resampled onto an axis-aligned grid. Air-equivalent
-#: HU, so the padding introduced around a gantry-tilted CT reads as air
-#: rather than as water (which a plain 0 would imply)
+#: Fill value for voxels outside the source volume when an oblique series is
+#: resampled onto an axis-aligned grid. Air-equivalent HU, so the padding
+#: around a gantry-tilted CT reads as air rather than water.
 _OUT_OF_FOV_HU: float = -1024.0
 
-#: Modalities :func:`scan_dicom_series` lists by default: the image series a
-#: viewer can display as primary or secondary, plus RT-DOSE.
+#: CT window used when the series carries no usable window tags.
+_DEFAULT_CT_WINDOW: tuple[float, float] = (300.0, 25.0)
+
+#: Percentiles bounding the initial window of a non-CT series.
+_NON_CT_WINDOW_PERCENTILES: tuple[float, float] = (0.5, 99.5)
+
+#: Width used for an image with a flat intensity range (no meaningful window).
+_FLAT_IMAGE_WINDOW_WIDTH: float = 1.0
+
+#: Modalities :func:`scan_dicom_series` lists by default.
 DEFAULT_SCAN_MODALITIES: frozenset[str] = frozenset({"CT", "MR", "PT", "RTDOSE"})
 
 
@@ -102,42 +108,51 @@ class SeriesInfo(TypedDict):
 class _ScanResult:
     """Everything the single directory-tree walk collects.
 
-    Grouped into one object rather than returned as a positional tuple: the
-    scan yields four independent maps, and a four-element tuple at the call
-    site is easy to unpack in the wrong order without any error.
-
     Attributes:
         dirs_with_dicom: Directories directly containing a DICOM file.
         reg_matrices: ``{referenced_sop_instance_uid: 4x4 ndarray}``.
-        sop_uid_by_path: ``{str(file_path): sop_instance_uid}``.
+        reg_matrices_by_series: ``{series_instance_uid: 4x4 ndarray}`` for
+            registrations that could be tied to a whole series.
+        sop_uid_by_path: ``{file_path: sop_instance_uid}``.
+        series_uid_by_sop: ``{sop_instance_uid: series_instance_uid}``.
         modality_by_series: ``{series_instance_uid: modality}``.
     """
 
     dirs_with_dicom: set[pathlib.Path] = field(default_factory=set)
     reg_matrices: dict[str, np.ndarray] = field(default_factory=dict)
-    sop_uid_by_path: dict[str, str] = field(default_factory=dict)
+    reg_matrices_by_series: dict[str, np.ndarray] = field(default_factory=dict)
+    sop_uid_by_path: dict[pathlib.Path, str] = field(default_factory=dict)
+    series_uid_by_sop: dict[str, str] = field(default_factory=dict)
     modality_by_series: dict[str, str] = field(default_factory=dict)
+
+
+def _iter_dicom_headers(
+    root: pathlib.Path,
+) -> Iterator[tuple[pathlib.Path, pydicom.Dataset]]:
+    """Yield ``(file, header)`` for every readable DICOM file under *root*.
+
+    A cheap magic-number check runs before ``dcmread``, and pixel data is
+    never read. Unreadable files are logged and skipped.
+    """
+    for file in root.rglob("*"):
+        if not file.is_file() or not pydicom.misc.is_dicom(file):
+            continue
+        try:
+            ds = pydicom.dcmread(str(file), stop_before_pixels=True)
+        except Exception as exc:
+            logger.warning(f"Skipping unreadable DICOM file '{file}': {exc}")
+            continue
+        yield file, ds
 
 
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
 def validate_dicom_files(folder_path: str | pathlib.Path) -> bool:
-    """Return ``True`` if every file in *folder_path* is a CT DICOM slice
-    belonging to exactly one series; ``False`` otherwise.
+    """Return whether every file in *folder_path* is a slice of one CT series.
 
-    Every failure mode is reported through the return value rather than an
-    exception: a file that passes ``is_dicom`` can still fail to parse (a
-    truncated transfer, an unsupported transfer syntax) or lack the tags read
-    below, and a validator that raises on exactly the malformed input it
-    exists to detect is unusable at its own call sites.
-
-    Args:
-        folder_path: Directory to inspect.
-
-    Returns:
-        ``True`` on success, ``False`` if any file is unreadable, not DICOM,
-        not CT, or if more than one series UID is present.
+    Every failure (non-DICOM, unreadable, not CT, several series) is reported
+    through the return value and logged, never raised.
     """
     folder = pathlib.Path(folder_path)
     series_uids: set[str] = set()
@@ -146,8 +161,6 @@ def validate_dicom_files(folder_path: str | pathlib.Path) -> bool:
         if not pydicom.misc.is_dicom(file):
             logger.error(f"Non-DICOM file found: {file}")
             return False
-
-        # Skip the pixel data for validation; tag access is all we need.
         try:
             ds = pydicom.dcmread(file, stop_before_pixels=True)
         except Exception as exc:
@@ -157,7 +170,6 @@ def validate_dicom_files(folder_path: str | pathlib.Path) -> bool:
         if ds.get("SOPClassUID") != _CT_IMAGE_STORAGE_UID:
             logger.error(f"File is not a CT image: {file}")
             return False
-
         series_uid = ds.get("SeriesInstanceUID")
         if series_uid is None:
             logger.error(f"File has no SeriesInstanceUID: {file}")
@@ -176,18 +188,10 @@ def validate_dicom_files(folder_path: str | pathlib.Path) -> bool:
 # Phase label utilities
 # ---------------------------------------------------------------------------
 def normalize_phase_label(text: str) -> str | None:
-    """Extract a respiratory-phase label (e.g. ``"10%"``) from *text*.
+    """Return the respiratory-phase label (e.g. ``"10%"``) in *text*, or ``None``.
 
-    Used to resolve 4DCT phase series into a stable key (see
-    :func:`_resolve_series_description`) and shared with external callers
-    that need to test whether a string represents a respiratory phase,
-    ensuring both sides agree on the same label for a given series.
-
-    Args:
-        text: A string to search, typically a DICOM SeriesDescription.
-
-    Returns:
-        The matched ``"N%"`` substring, or ``None`` if no match is found.
+    Shared by the loader (to key 4DCT phases) and host applications, so both
+    derive the same label from a SeriesDescription.
     """
     match = _PHASE_LABEL_PATTERN.search(text)
     return match.group(0) if match else None
@@ -197,110 +201,85 @@ def normalize_phase_label(text: str) -> str | None:
 # REG file discovery
 # ---------------------------------------------------------------------------
 def find_reg_matrices(dcm_root_dir: str | pathlib.Path) -> dict[str, np.ndarray]:
-    """Recursively scan *dcm_root_dir* for Spatial Registration Object files
-    and return a mapping of referenced SOP Instance UID to inverted 4x4 matrix.
+    """Return ``{referenced_sop_instance_uid: 4x4 matrix}`` for all REG files.
 
-    The stored matrix is Fixed<-Moving; each is inverted to Moving<-Fixed
-    before being returned.
-
-    Args:
-        dcm_root_dir: Root directory to search.
-
-    Returns:
-        ``{referenced_sop_instance_uid: 4x4 ndarray}``
+    The stored matrix maps moving -> fixed; each is inverted to the
+    fixed -> moving direction a resampling transform needs.
     """
     return _scan_dicom_tree(dcm_root_dir).reg_matrices
 
 
 def _scan_dicom_tree(dcm_root_dir: str | pathlib.Path) -> _ScanResult:
-    """Walk the directory tree once, collecting everything later steps need.
-
-    Previously, "does this directory contain DICOM" and "find REG files" each
-    walked the whole tree independently with ``rglob``, ``dcmread``-ing the
-    same file twice (a noticeable slowdown on large trees such as 4DCT). Here
-    a lightweight magic-number check via ``pydicom.misc.is_dicom`` is done
-    first, and ``dcmread`` is only called once per file that passes it.
-
-    Args:
-        dcm_root_dir: Root directory to search.
-
-    Returns:
-        A populated :class:`_ScanResult`.
-    """
-    root = pathlib.Path(dcm_root_dir)
+    """Walk the directory tree once, collecting everything later steps need."""
     scan = _ScanResult()
+    reg_series_refs: dict[str, np.ndarray] = {}
 
-    for file in root.rglob("*"):
-        if not file.is_file() or not pydicom.misc.is_dicom(file):
-            continue
-        try:
-            ds = pydicom.dcmread(str(file), stop_before_pixels=True)
-        except Exception as exc:
-            logger.warning(f"Skipping unreadable DICOM file '{file}': {exc}")
-            continue
-
+    for file, ds in _iter_dicom_headers(pathlib.Path(dcm_root_dir)):
         scan.dirs_with_dicom.add(file.parent)
         sop_uid = ds.get("SOPInstanceUID")
+        series_uid = ds.get("SeriesInstanceUID")
         if sop_uid is not None:
-            scan.sop_uid_by_path[str(file)] = str(sop_uid)
+            scan.sop_uid_by_path[file] = str(sop_uid)
+            if series_uid is not None:
+                scan.series_uid_by_sop[str(sop_uid)] = str(series_uid)
 
         modality = str(ds.get("Modality", "")).strip()
-        series_uid = ds.get("SeriesInstanceUID")
         if series_uid is not None and modality:
             scan.modality_by_series[str(series_uid)] = modality
 
-        if modality != "REG" or ds.get("SOPClassUID", "") != _SPATIAL_REGISTRATION_UID:
-            continue
-        _collect_reg_matrices(ds, file, scan.reg_matrices)
+        if modality == "REG" and ds.get("SOPClassUID", "") == _SPATIAL_REGISTRATION_UID:
+            _collect_reg_matrices(ds, file, scan.reg_matrices, reg_series_refs)
 
+    # A REG object may name only one instance of the moving series; resolve
+    # that instance to its series (the REG file can precede the images in the
+    # walk, hence after the loop) so every slice of the series matches
+    scan.reg_matrices_by_series.update(reg_series_refs)
+    for sop_uid, matrix in scan.reg_matrices.items():
+        series_uid = scan.series_uid_by_sop.get(sop_uid)
+        if series_uid is not None:
+            scan.reg_matrices_by_series.setdefault(series_uid, matrix)
     return scan
 
 
-def _referenced_sop_uids(reg_item: pydicom.Dataset) -> list[str]:
-    """Return every SOP Instance UID one Registration Sequence item refers to.
+def _referenced_uids(reg_item: pydicom.Dataset) -> tuple[list[str], list[str]]:
+    """Return ``(sop_instance_uids, series_instance_uids)`` a REG item refers to.
 
-    ``ReferencedImageSequence`` is optional, and an object that records its
-    references only under ``ReferencedSeriesSequence`` is equally valid —
-    including the ones :func:`tk_rt_viewer.reg_io.save_registration` writes.
-    Reading both is what makes a registration written by this package
-    loadable again by :func:`find_reg_matrices`; reading only the former
-    also raised ``AttributeError`` on any file that omitted it, which is
-    exactly the per-file failure :func:`_collect_reg_matrices` exists to
-    contain.
+    Reads the standard ``ReferencedImageSequence`` and also an item-level
+    ``ReferencedSeriesSequence``, which files written by tk-rt-viewer 2.1
+    used instead.
     """
-    uids = [
+    sop_uids = [
         str(item.ReferencedSOPInstanceUID)
         for item in getattr(reg_item, "ReferencedImageSequence", [])
         if "ReferencedSOPInstanceUID" in item
     ]
+    series_uids: list[str] = []
     for series in getattr(reg_item, "ReferencedSeriesSequence", []):
-        uids.extend(
+        if "SeriesInstanceUID" in series:
+            series_uids.append(str(series.SeriesInstanceUID))
+        sop_uids.extend(
             str(item.ReferencedSOPInstanceUID)
             for item in getattr(series, "ReferencedInstanceSequence", [])
             if "ReferencedSOPInstanceUID" in item
         )
-    return uids
+    return sop_uids, series_uids
 
 
 def _collect_reg_matrices(
     ds: pydicom.Dataset,
     file: pathlib.Path,
-    reg_matrices: dict[str, np.ndarray],
+    by_sop: dict[str, np.ndarray],
+    by_series: dict[str, np.ndarray] | None = None,
 ) -> None:
-    """Extract every registration matrix in *ds* into *reg_matrices*.
+    """Extract every registration matrix in *ds* into *by_sop* / *by_series*.
 
-    A single malformed REG file (missing sequence, singular matrix, ...) must
-    not abort loading of every other series in the tree, so failures here are
-    logged and skipped rather than propagated. Every per-item attribute
-    access therefore has to sit inside the guard below, reference lookup
-    included.
+    A malformed item is logged and skipped so one bad file cannot abort the
+    load of every other series; all per-item attribute access therefore sits
+    inside the guard.
 
-    Identity matrices are skipped. A Spatial Registration object names the
-    frame of reference it registers *to* with an identity item of its own
-    (see :func:`tk_rt_viewer.reg_io.save_registration`), and attaching that
-    to the fixed series would give it a transform that says "do not move" —
-    indistinguishable, at every later call site, from a series that really
-    was registered.
+    Identity items are skipped: a REG object names the frame of reference it
+    registers *to* with an identity item, and attaching that to the fixed
+    series would make it look registered.
     """
     try:
         reg_sequence = ds[0x0070, 0x0308].value
@@ -317,7 +296,7 @@ def _collect_reg_matrices(
                 dtype=float,
             ).reshape(4, 4)
             inv_matrix = np.linalg.inv(matrix)
-            referenced = _referenced_sop_uids(reg_item)
+            sop_uids, series_uids = _referenced_uids(reg_item)
         except (
             AttributeError,
             IndexError,
@@ -330,8 +309,11 @@ def _collect_reg_matrices(
 
         if np.allclose(matrix, np.eye(4)):
             continue
-        for sop_uid in referenced:
-            reg_matrices[sop_uid] = inv_matrix
+        for sop_uid in sop_uids:
+            by_sop[sop_uid] = inv_matrix
+        if by_series is not None:
+            for series_uid in series_uids:
+                by_series[series_uid] = inv_matrix
 
 
 # ---------------------------------------------------------------------------
@@ -340,10 +322,8 @@ def _collect_reg_matrices(
 class MultiplePatientError(ValueError):
     """More than one patient was found in a directory tree being scanned.
 
-    Loading a folder that mixes two patients is never intentional, and the
-    failure it leads to — contours or a dose from one patient displayed over
-    the other's images — is the kind that is noticed late. Raised by
-    :func:`scan_dicom_series` unless the caller opts out.
+    Mixing patients is never intentional and leads to one patient's contours
+    or dose being shown over another's images.
     """
 
 
@@ -370,13 +350,11 @@ class SeriesEntry:
         modality:    DICOM modality, e.g. ``"CT"``, ``"MR"``, ``"RTDOSE"``.
         description: SeriesDescription, or ``""`` when the series has none.
         series_dir:  Directory holding the series' files.
-        series_uid:  SeriesInstanceUID. Empty for a grouped 4DCT entry, which
-            stands for several series.
+        series_uid:  SeriesInstanceUID. Empty for a grouped 4DCT entry.
         file_path:   One file of the series. RT-DOSE is loaded from this
-            directly, since a directory may hold several dose objects that
-            a directory-level load could not tell apart.
-        phases:      The phases of a 4DCT series, oldest label first; empty
-            for an ordinary series.
+            directly, since a directory may hold several dose objects.
+        phases:      The phases of a 4DCT series, lowest percentage first;
+            empty for an ordinary series.
     """
 
     modality: str
@@ -417,28 +395,19 @@ def scan_dicom_series(
 ) -> SeriesScan:
     """List the series under *dcm_root_dir* without reading any pixel data.
 
-    This is the scan behind a series picker: it reads headers only, so a
-    folder of several thousand slices is enumerated in a fraction of the time
-    loading it would take, and the host loads only what the user then selects
-    (:func:`load_dcm_series`, :func:`load_rt_dose`).
-
-    Series are returned images first, then RT-DOSE, each group ordered by
-    modality and description, which is the order a picker wants to show.
+    Headers only, so a large folder is enumerated quickly and the host loads
+    just what the user selects (:func:`load_dcm_series`,
+    :func:`load_rt_dose`). Series come back images first, then RT-DOSE, each
+    group ordered by modality and description.
 
     Args:
         dcm_root_dir: Root directory to scan, recursively.
-        modalities: Modalities to list. Anything else (RT-STRUCT, RT-PLAN, ...)
-            is ignored, except REG files, which are always collected into
+        modalities: Modalities to list. REG files are always collected into
             :attr:`SeriesScan.reg_files`.
-        group_4dct: Whether to collapse CT series whose descriptions carry a
-            respiratory-phase label (``"0%"``, ``"10%"``, ...) into one entry
-            holding them as phases. A 4DCT otherwise shows up as ten
-            near-identical rows.
-        require_single_patient: Whether to raise when the tree holds more than
-            one patient.
-
-    Returns:
-        The scan result.
+        group_4dct: Collapse CT series whose descriptions carry a phase label
+            (``"0%"``, ``"10%"``, ...) into one entry holding them as phases.
+        require_single_patient: Raise when the tree holds more than one
+            patient.
 
     Raises:
         MultiplePatientError: If *require_single_patient* and more than one
@@ -450,15 +419,7 @@ def scan_dicom_series(
     patient_ids: set[str] = set()
     patient_names: set[str] = set()
 
-    for file in root.rglob("*"):
-        if not file.is_file() or not pydicom.misc.is_dicom(file):
-            continue
-        try:
-            ds = pydicom.dcmread(str(file), stop_before_pixels=True)
-        except Exception as exc:
-            logger.warning(f"Skipping unreadable DICOM file '{file}': {exc}")
-            continue
-
+    for file, ds in _iter_dicom_headers(root):
         patient_id = str(ds.get("PatientID", "")).strip()
         patient_name = str(ds.get("PatientName", "")).strip()
         if patient_id:
@@ -509,8 +470,8 @@ def _order_series(entries: list[SeriesEntry], group_4dct: bool) -> list[SeriesEn
     phases: list[SeriesEntry] = []
     ordinary: list[SeriesEntry] = []
     for entry in entries:
-        # Only CT carries respiratory phases; testing every modality would
-        # misread a dose series whose description happens to contain "50%".
+        # Only CT carries respiratory phases; a dose description may contain
+        # "50%" too
         is_phase = (
             group_4dct
             and entry.modality == "CT"
@@ -519,7 +480,6 @@ def _order_series(entries: list[SeriesEntry], group_4dct: bool) -> list[SeriesEn
         (phases if is_phase else ordinary).append(entry)
 
     ordinary.sort(key=lambda e: (e.modality == "RTDOSE", e.modality, e.description))
-
     if not phases:
         return ordinary
 
@@ -543,11 +503,7 @@ def _order_series(entries: list[SeriesEntry], group_4dct: bool) -> list[SeriesEn
 
 
 def _phase_sort_key(description: str) -> tuple[float, str]:
-    """Sort key ordering phase descriptions by their percentage.
-
-    Sorting the descriptions as plain strings puts ``"100%"`` between
-    ``"10%"`` and ``"20%"``, so the numeric part leads the key.
-    """
+    """Order phase descriptions numerically (``"10%"`` before ``"100%"``)."""
     label = normalize_phase_label(description)
     percent = float(label.rstrip("%")) if label else math.inf
     return percent, description
@@ -556,19 +512,10 @@ def _phase_sort_key(description: str) -> tuple[float, str]:
 def select_phase_series(
     all_series: dict[str, SeriesInfo], phases: Sequence[PhaseEntry]
 ) -> dict[str, SeriesInfo]:
-    """Pick the entries of *all_series* named by *phases*.
+    """Pick the entries of *all_series* named by *phases*, in scan order.
 
-    :func:`load_all_series` keys its result by the same normalised phase
-    label :func:`scan_dicom_series` records, but loads everything under the
-    directory it was given. This narrows that to the phases of one 4DCT
-    acquisition, in the order they were scanned.
-
-    Args:
-        all_series: Output of :func:`load_all_series`.
-        phases: The phases to pick, from ``SeriesEntry.phases``.
-
-    Returns:
-        ``{phase_label: SeriesInfo}``.
+    :func:`load_all_series` keys phases by the same label
+    :func:`scan_dicom_series` records, but loads everything under its root.
 
     Raises:
         KeyError: If any requested phase is missing from *all_series*.
@@ -601,17 +548,9 @@ def _axis_aligned_grid(
 ) -> tuple[tuple[float, float, float], tuple[int, int, int]]:
     """Return ``(origin, size)`` of the axis-aligned grid enclosing *image*.
 
-    The eight corner voxels of *image* are mapped into physical space and
-    their axis-aligned bounding box is taken, keeping *image*'s own spacing.
-
-    Sizing the resample output this way is what makes it lossless. Reusing
-    the source grid's origin and size (which is what ``SetReferenceImage``
-    alone does) describes an axis-aligned box of the *same* dimensions as the
-    rotated volume, and that box does not contain it: for an oblique
-    acquisition the two regions only overlap partially, so the corners of the
-    volume fall outside the output and are discarded while the opposite
-    corners are filled with the default pixel value. The larger the tilt, the
-    more of the volume is lost.
+    The bounding box of the eight corner voxels, at *image*'s own spacing.
+    Reusing the source grid's origin and size instead would describe a box
+    that only partly overlaps a rotated volume and would discard its corners.
     """
     size = image.GetSize()
     spacing = image.GetSpacing()
@@ -637,54 +576,35 @@ def _orient_to_lps(
 ) -> tuple[sitk.Image, sitk.Image]:
     """Orient *image* to LPS, resampling to an axis-aligned grid if rotated.
 
-    ``sitk.DICOMOrient`` only permutes and flips axes to the closest LPS-like
-    arrangement; a genuinely oblique acquisition (gantry-tilted CT, sagittal
-    or coronal MR with residual rotation) keeps a non-identity direction after
-    that call. Downstream rendering (``geometry.compute_extent`` and every
-    ``imshow(extent=...)`` call built on it) only ever reads origin/spacing
-    and assumes an axis-aligned grid, so that residual rotation has to be
-    resolved here, once, rather than by every caller.
+    ``sitk.DICOMOrient`` only permutes and flips axes, so a truly oblique
+    acquisition keeps a non-identity direction. Rendering reads only origin
+    and spacing, so the residual rotation is resolved here, once.
 
-    Two details of the resample below are deliberate and easy to get wrong.
+    Two details are deliberate:
 
-    *Transform.* The default (identity) transform is used.
-    ``ResampleImageFilter`` converts between physical points and each image's
-    own index space using that image's own Direction/Origin/Spacing, so
-    mapping an output physical point straight onto the same input physical
-    point already reslices a rotated input onto an axis-aligned output
-    correctly. Constructing a rotation transform from the direction matrix
-    (as an earlier version did) is not just redundant but actively wrong
-    unless its rotation center is the image origin and its direction of
-    application exactly cancels the rotation being resolved; get either
-    detail wrong and the output silently samples tens to over a hundred
-    millimetres away from the intended location.
+    * The resample uses the default identity transform. The filter maps
+      points through each image's own direction/origin/spacing, so identity
+      already reslices a rotated input correctly; an explicit rotation
+      transform would shift the output unless its center and direction were
+      exactly right.
+    * The output grid comes from :func:`_axis_aligned_grid`, so no part of
+      the volume is cropped.
 
-    *Output grid.* The origin and size come from :func:`_axis_aligned_grid`,
-    not from ``SetReferenceImage``. See that function for why reusing the
-    source grid discards part of the volume.
-
-    Anyone tempted to change either detail should re-derive it against a
-    synthetic oblique volume with a known off-center feature and check both
-    that the resampled feature's physical centroid does not move (beyond
-    ordinary interpolation error) and that no in-volume voxel of the input
-    falls outside the output.
+    Re-check both against a synthetic oblique volume with an off-center
+    feature before changing either.
 
     Args:
         image: The image to orient.
-        default_pixel_value: Fill value for output voxels that fall outside
-            the source volume. Defaults to air-equivalent HU for CT; pass
-            ``0.0`` for RT-DOSE (Gy) or any other non-HU volume.
+        default_pixel_value: Fill value outside the source volume. Defaults
+            to air HU; pass ``0.0`` for RT-DOSE or any non-HU volume.
 
     Returns:
-        ``(lps_image, original_image)``. When no rotation is present both
-        elements reference the same object.
+        ``(lps_image, original_image)``.
     """
-    original_image = image
     image_lps = sitk.DICOMOrient(image, "LPS")
-
     if np.allclose(image_lps.GetDirection(), np.eye(3).flatten()):
         logger.info("Axis-aligned: no resampling needed.")
-        return image_lps, original_image
+        return image_lps, image
 
     origin, out_size = _axis_aligned_grid(image_lps)
     logger.info(
@@ -699,18 +619,11 @@ def _orient_to_lps(
     resample.SetOutputPixelType(image_lps.GetPixelID())
     resample.SetInterpolator(sitk.sitkLinear)
     resample.SetDefaultPixelValue(default_pixel_value)
-    # Transform is deliberately left at its default (identity) — see the
-    # docstring above for why that is correct here, not an oversight.
-    return resample.Execute(image_lps), original_image
+    return resample.Execute(image_lps), image
 
 
 def _first_float(value: str) -> float:
-    """Parse the first component of a DICOM DS (decimal string) value.
-
-    Multi-valued window width / centre tags (e.g. ``"40\\400"``, common on GE
-    consoles when multiple presets are stored) use ``\\`` as the value
-    separator. Only the first value is used for the initial display window.
-    """
+    """Parse the first value of a DICOM DS string (e.g. ``"40\\400"``)."""
     return float(value.split("\\")[0])
 
 
@@ -719,11 +632,11 @@ def _get_window_level(
     image: sitk.Image,
     modality: str,
 ) -> tuple[float, float]:
-    """Return ``(window_width, window_center)`` for *image*.
+    """Return the initial ``(window_width, window_center)`` for *image*.
 
-    CT: uses DICOM tags 0028|1051/0028|1050, falling back to ``(300, 25)``.
-    Other modalities: derived from the 0.5th-99.5th percentile range of a
-    strided sample of the volume (see :func:`_sampled_view`).
+    CT: the WindowWidth / WindowCenter tags, else :data:`_DEFAULT_CT_WINDOW`.
+    Other modalities: a percentile window of the image itself; a flat image
+    gets a narrow window around its constant value instead of a zero width.
     """
     if modality.upper() == "CT":
         try:
@@ -736,16 +649,17 @@ def _get_window_level(
                 )
         except (ValueError, TypeError):
             logger.warning("Failed to parse DICOM window tags; using defaults.")
-        return 300.0, 25.0
+        return _DEFAULT_CT_WINDOW
 
-    arr = sitk.GetArrayViewFromImage(image)
-    sample = strided_sample(arr, WINDOW_PERCENTILE_SAMPLE_TARGET)
-    vmin, vmax = (float(v) for v in np.percentile(sample, (0.5, 99.5)))
-    return vmax - vmin, (vmin + vmax) / 2
+    window = compute_auto_window_level(image, percentiles=_NON_CT_WINDOW_PERCENTILES)
+    if window is not None:
+        return window
+    value = float(sitk.GetArrayViewFromImage(image).flat[0])
+    return _FLAT_IMAGE_WINDOW_WIDTH, value
 
 
 def _get_modality(reader: sitk.ImageSeriesReader) -> str:
-    """Return the modality string from DICOM tag 0008|0060, or ``'UNKNOWN'``."""
+    """Return the modality from tag 0008|0060, or ``"UNKNOWN"``."""
     if reader.HasMetaDataKey(0, "0008|0060"):
         return str(reader.GetMetaData(0, "0008|0060")).strip()
     logger.warning("Modality metadata not found; defaulting to 'UNKNOWN'.")
@@ -761,19 +675,40 @@ def _build_transform(reg_matrix: np.ndarray) -> sitk.AffineTransform:
 
 
 def _resolve_series_description(reader: sitk.ImageSeriesReader, series_id: str) -> str:
-    """Return SeriesDescription for the loaded series, falling back to *series_id*.
+    """Return the key for the loaded series.
 
-    For 4DCT series containing a respiratory-phase percentage (e.g. ``"CT 0%"``),
-    only the percentage token is returned as the key.
+    The phase label for a 4DCT phase (e.g. ``"CT 10%"`` -> ``"10%"``), else
+    the SeriesDescription, else *series_id*.
     """
     if not reader.HasMetaDataKey(0, "0008|103e"):
         logger.warning(
             f"SeriesDescription not found for '{series_id}'; using series ID."
         )
         return series_id
-
-    raw_desc = reader.GetMetaData(0, "0008|103e")
+    raw_desc = reader.GetMetaData(0, "0008|103e").strip()
     return normalize_phase_label(raw_desc) or raw_desc
+
+
+def _find_reg_matrix(
+    scan: _ScanResult, file_names: tuple[str, ...], series_id: str
+) -> np.ndarray | None:
+    """Return the REG matrix that applies to a loaded series, if any.
+
+    Matched by the first file's SOP Instance UID, then by series UID (which
+    also covers a REG object that references a single other slice).
+    """
+    first_file = pathlib.Path(file_names[0])
+    first_uid = scan.sop_uid_by_path.get(first_file)
+    if first_uid is None:
+        # Not seen by the tree walk (should not happen); read it directly
+        first_uid = str(
+            pydicom.dcmread(first_file, stop_before_pixels=True).SOPInstanceUID
+        )
+    matrix = scan.reg_matrices.get(first_uid)
+    if matrix is None:
+        series_uid = scan.series_uid_by_sop.get(first_uid, series_id)
+        matrix = scan.reg_matrices_by_series.get(series_uid)
+    return matrix
 
 
 def _build_series_info(
@@ -783,26 +718,12 @@ def _build_series_info(
     scan: _ScanResult,
     series_id: str,
 ) -> tuple[str, SeriesInfo]:
-    """Build a ``(description, SeriesInfo)`` pair for one series.
-
-    Encapsulates orientation, modality/window detection, REG lookup, and
-    description resolution so that :func:`load_all_series` stays high-level.
-    """
+    """Build the ``(description, SeriesInfo)`` pair for one loaded series."""
     image_lps, original_image = _orient_to_lps(raw_image)
     modality = _get_modality(reader)
     window_level = _get_window_level(reader, image_lps, modality)
 
-    # sop_uid_by_path was already populated by the single _scan_dicom_tree
-    # pass over every DICOM file in the tree, so the series' first file's UID
-    # is looked up here instead of dcmread-ing that file a second time. A path
-    # missing from the map (e.g. a series loaded from a directory that was
-    # never scanned) falls back to a direct read.
-    first_uid = scan.sop_uid_by_path.get(file_names[0])
-    if first_uid is None:
-        first_uid = pydicom.dcmread(
-            file_names[0], stop_before_pixels=True
-        ).SOPInstanceUID
-    reg_matrix = scan.reg_matrices.get(first_uid)
+    reg_matrix = _find_reg_matrix(scan, file_names, series_id)
     if reg_matrix is not None:
         logger.info(f"Applying REG matrix to series '{series_id}'.")
         transform: sitk.AffineTransform | None = _build_transform(reg_matrix)
@@ -826,17 +747,12 @@ def _build_series_info(
 def _load_all_series_impl(
     dcm_root_dir: str | pathlib.Path,
 ) -> tuple[dict[str, SeriesInfo], int]:
-    """Shared implementation for :func:`load_all_series` / :func:`load_dcm_series`.
-
-    Returns both the SeriesDescription-keyed mapping :func:`load_all_series`
-    exposes and the true count of image series actually loaded. The two can
-    differ: :func:`load_all_series` collapses same-SeriesDescription series
-    into one dict entry (the last one loaded wins), so ``len(series_dict)``
-    alone cannot tell :func:`load_dcm_series` whether the directory truly
-    held one series or silently dropped a duplicate-described one.
+    """Shared implementation of :func:`load_all_series` / :func:`load_dcm_series`.
 
     Returns:
-        ``(series_dict, loaded_count)``.
+        ``(series_dict, loaded_count)``. The count can exceed
+        ``len(series_dict)`` because series sharing a description collapse
+        into one entry.
 
     Raises:
         FileNotFoundError: If no readable DICOM image series is found.
@@ -847,11 +763,6 @@ def _load_all_series_impl(
     loaded_count = 0
 
     logger.info(f"Searching for DICOM series in '{dcm_root_dir}'.")
-    # Walk the directory tree once, gathering directories that contain DICOM
-    # files, the REG matrices, each file's SOPInstanceUID, and each series'
-    # Modality (previously find_reg_matrices and _dir_has_dicom each walked
-    # the whole tree independently, dcmread-ing the same file twice, and
-    # _build_series_info dcmread-ing a series' first file a third time).
     scan = _scan_dicom_tree(dcm_root_dir)
 
     for dcm_dir in sorted(scan.dirs_with_dicom):
@@ -865,7 +776,6 @@ def _load_all_series_impl(
                 reader, raw_image, file_names, scan, sid
             )
             loaded_count += 1
-
             if description in series_dict:
                 logger.warning(
                     f"Duplicate SeriesDescription '{description}'; overwriting."
@@ -882,22 +792,11 @@ def _load_all_series_impl(
 def load_all_series(dcm_root_dir: str | pathlib.Path) -> dict[str, SeriesInfo]:
     """Load every DICOM image series found under *dcm_root_dir*.
 
-    The root directory and all subdirectories are searched. Each series is
-    keyed by its SeriesDescription (respiratory-phase percentage for 4DCT).
-    When the same description appears in multiple series the last one loaded
-    wins. REG files are parsed and registration transforms attached to
-    matching series.
-
-    Series whose Modality is one of :data:`_NON_IMAGE_MODALITIES` (RT-STRUCT,
-    RT-PLAN, REG, RT-DOSE, ...) are skipped without reading their pixel data.
-    Use :func:`load_rt_dose` for RT-DOSE and
-    :func:`~tk_rt_viewer.rtstruct_io.load_rt_struct` for RT-STRUCT.
-
-    Args:
-        dcm_root_dir: Root directory to search.
-
-    Returns:
-        ``{series_description: SeriesInfo}`` mapping.
+    Each series is keyed by its SeriesDescription (the phase label for
+    4DCT); on a duplicate description the last one loaded wins. REG
+    transforms are attached to the series they reference. Non-image objects
+    (RT-STRUCT, RT-PLAN, REG, RT-DOSE, ...) are skipped: use
+    :func:`load_rt_dose` and :func:`~tk_rt_viewer.rtstruct_io.load_rt_struct`.
 
     Raises:
         FileNotFoundError: If no readable DICOM image series is found.
@@ -907,21 +806,12 @@ def load_all_series(dcm_root_dir: str | pathlib.Path) -> dict[str, SeriesInfo]:
 
 
 def find_rt_dose_files(folder_path: str | pathlib.Path) -> list[pathlib.Path]:
-    """Return RT-DOSE DICOM files found (non-recursively) in *folder_path*.
+    """Return the RT-DOSE files found (non-recursively) in *folder_path*, sorted.
 
     Caution:
-        This only locates candidate files; it does not disambiguate which one
-        to load when a folder holds multiple RT-DOSE series. Callers that need
-        a *specific* RT-DOSE file (e.g. one selected by the user from a series
-        list) should resolve and pass that file's path directly to
-        :func:`load_rt_dose` instead of relying on the order of this list,
-        since always picking the first entry can silently load the wrong dose.
-
-    Args:
-        folder_path: Directory to search.
-
-    Returns:
-        Sorted list of :class:`pathlib.Path` objects for each RT-DOSE file.
+        This does not choose between several doses in one folder. Pass the
+        file the user selected straight to :func:`load_rt_dose` rather than
+        relying on the order of this list.
     """
     folder = pathlib.Path(folder_path)
     rt_dose_files: list[pathlib.Path] = []
@@ -938,28 +828,19 @@ def find_rt_dose_files(folder_path: str | pathlib.Path) -> list[pathlib.Path]:
 
 
 def load_rt_dose(dose_path: str | pathlib.Path) -> sitk.Image:
-    """Load an RT-DOSE DICOM file and return a ``sitk.Image`` scaled to Gy.
+    """Load an RT-DOSE file and return a float32 ``sitk.Image`` in Gy, oriented to LPS.
 
-    The pixel data is multiplied by the DICOM tag ``DoseGridScaling``
-    (0x3004, 0x000E) so the returned image values are in Gray (Gy).
-
-    Args:
-        dose_path: Path to the RT-DOSE DICOM file.
-
-    Returns:
-        ``sitk.Image`` with float32 voxel values in Gy, oriented to LPS.
-        Voxels introduced by an oblique-grid resample are filled with 0 Gy.
+    Pixel values are multiplied by ``DoseGridScaling`` (3004,000E); voxels
+    introduced by an oblique-grid resample are 0 Gy.
 
     Caution:
-        Z-spacing for a multi-frame RT-DOSE file is derived by SimpleITK's
-        DICOM reader from ``GridFrameOffsetVector`` (0x3004, 0x000C). That
-        derivation assumes uniform frame spacing; verify against a known dose
-        file when integrating a new treatment-planning system's export, since
-        a non-uniform offset vector is technically valid DICOM but not
-        something this loader detects or corrects for.
+        SimpleITK derives the frame spacing of a multi-frame dose from
+        ``GridFrameOffsetVector`` assuming uniform spacing. A non-uniform
+        vector is valid DICOM but is not detected here; verify against a
+        known dose when integrating a new planning system.
 
     Raises:
-        ValueError: If the file is not an RT-DOSE DICOM.
+        ValueError: If the file is not an RT-DOSE object.
     """
     dose_path = pathlib.Path(dose_path)
     ds = pydicom.dcmread(str(dose_path), stop_before_pixels=True)
@@ -970,39 +851,24 @@ def load_rt_dose(dose_path: str | pathlib.Path) -> sitk.Image:
     logger.info(f"Loading RT-DOSE from '{dose_path}' (DoseGridScaling={scaling}).")
 
     image = sitk.ReadImage(str(dose_path))
-    # Scale in SimpleITK rather than round-tripping through NumPy: the
-    # previous GetArrayFromImage -> multiply -> GetImageFromArray path
-    # allocated two extra full-size copies of the dose volume and had to
-    # restore the geometry afterwards with CopyInformation.
+    # Scaled in SimpleITK to avoid NumPy round-trip copies of the volume
     scaled_image = sitk.Multiply(sitk.Cast(image, sitk.sitkFloat32), scaling)
-
-    # 0 Gy, not air-equivalent HU, for anything outside an oblique dose grid.
     lps_image, _ = _orient_to_lps(scaled_image, default_pixel_value=0.0)
     return lps_image
 
 
 def load_dcm_series(dcm_dir: str | pathlib.Path) -> SeriesInfo:
-    """Load a folder that contains exactly one DICOM series.
-
-    Args:
-        dcm_dir: Directory containing a single DICOM series.
-
-    Returns:
-        The sole :class:`SeriesInfo` dict.
+    """Load a folder that contains exactly one DICOM image series.
 
     Raises:
         FileNotFoundError: If no DICOM series is found in the directory.
-        ValueError: If more than one series is found in the directory.
+        ValueError: If more than one series is found, including two series
+            that share a SeriesDescription.
     """
-    # The true series count (loaded_count), not len(series_dict): two series
-    # sharing a SeriesDescription collapse into one dict entry (see
-    # _load_all_series_impl), which previously let a duplicate-described
-    # second series slip through this check silently instead of raising.
     series_dict, loaded_count = _load_all_series_impl(dcm_dir)
     if loaded_count != 1:
         raise ValueError(
             f"Expected exactly one DICOM series in '{dcm_dir}', "
             f"but found {loaded_count}."
         )
-    # next(iter(...)) makes the "one element" intent explicit vs. popitem().
     return next(iter(series_dict.values()))

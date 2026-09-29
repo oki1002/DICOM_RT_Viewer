@@ -16,6 +16,7 @@ from tk_rt_viewer.roi_operations import (
     apply_margin,
     boolean_operation,
     interpolate_contour,
+    smooth_contour,
     thin_slices,
 )
 
@@ -388,3 +389,10 @@ class TestInterpolateContourMorphs:
         image = sitk.GetImageFromArray(arr)
         out = sitk.GetArrayFromImage(interpolate_contour(image))
         np.testing.assert_array_equal(out.astype(bool), arr.astype(bool))
+
+
+class TestSmoothingValidation:
+    def test_a_negative_sigma_is_rejected(self) -> None:
+        mask = sitk.GetImageFromArray(np.zeros((4, 4, 4), dtype=np.uint8))
+        with pytest.raises(ValueError, match="sigma_mm"):
+            smooth_contour(mask, sigma_mm=-1.0)

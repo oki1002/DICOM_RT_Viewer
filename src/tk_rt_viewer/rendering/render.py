@@ -1,18 +1,10 @@
 """render.py — Colormap LUT helpers for fast RGBA slice rendering.
 
-Converting float slices to pre-composed ``(H, W, 4)`` uint8 RGBA arrays in
-NumPy and handing those to ``AxesImage`` bypasses matplotlib's per-draw
-normalise-and-colormap pipeline. Measured on a 512x512 slice this roughly
-halves the per-blit-frame draw cost (float32 + Normalize + bilinear ~23 ms
-vs pre-composed RGBA ~12 ms). That matters because the base image is
-redrawn on every blit frame — crosshair drags, brush-cursor motion and
-window/level drags all pay this cost per frame.
-
-The LUT output matches matplotlib's own ``Normalize`` + colormap path to
-within one 8-bit quantisation step, so the change is visually lossless.
-
-These are pure functions with no viewer or Tk dependency so they can be
-unit-tested headlessly.
+Pre-composing slices into ``(H, W, 4)`` uint8 RGBA in NumPy lets
+``AxesImage`` skip Matplotlib's per-draw normalise-and-colormap pipeline,
+roughly halving the cost of every blit frame (the base image is redrawn on
+each crosshair, brush or window/level frame). The result matches
+Matplotlib's own path to within one 8-bit step.
 """
 
 import numpy as np
@@ -25,9 +17,8 @@ _LUT_SIZE: int = 256
 def build_cmap_lut(cmap_name: str, alpha: float = 1.0) -> np.ndarray:
     """Build a ``(256, 4)`` uint8 RGBA lookup table for *cmap_name*.
 
-    The constant *alpha* is baked into the table so callers never need to
-    touch ``Artist.set_alpha`` (which would force matplotlib back through
-    its slower compositing path for every draw).
+    *alpha* is baked in, avoiding ``Artist.set_alpha`` and Matplotlib's
+    slower compositing path.
 
     Args:
         cmap_name: A registered matplotlib colormap name (e.g. ``"gray"``).
@@ -56,70 +47,42 @@ def slice_to_rgba(
     computed once in NumPy instead of on every artist draw.
 
     Args:
-        data: 2-D array of finite values (HU, dose in Gy, ...). NaN/Inf are
-            not handled; slice caches in this package never contain them.
-            Any dtype accepted by NumPy arithmetic works (int16 views are
-            fine; the windowing arithmetic promotes to float internally).
-        vmin: Lower window bound (maps to LUT entry 0).
-        vmax: Upper window bound (maps to LUT entry 255).
+        data: 2-D array of finite values in any numeric dtype (NaN / Inf
+            are not handled).
+        vmin: Lower window bound (LUT entry 0).
+        vmax: Upper window bound (LUT entry 255).
         lut:  ``(256, 4)`` uint8 table from :func:`build_cmap_lut`.
-        out:  Optional pre-allocated ``(H, W, 4)`` uint8 array to write the
-            result into, reused across frames to avoid allocating a new
-            ``(H, W, 4)`` buffer on every scroll / drag frame. When its
-            shape does not match *data* (e.g. after switching axes) it is
-            ignored and a fresh array is returned. The returned array is
-            *out* itself when it was used, so callers can keep passing the
-            same object back in.
+        out:  Optional ``(H, W, 4)`` uint8 buffer reused across frames;
+            ignored when its shape does not match *data*.
 
     Returns:
-        ``(H, W, 4)`` uint8 RGBA array ready for ``AxesImage.set_data``.
-        Callers must treat the result as owned by this function when *out*
-        is supplied: its contents are overwritten on the next call that
-        reuses the same buffer.
+        ``(H, W, 4)`` uint8 RGBA array — *out* itself when it was used, so it
+        is overwritten by the next call with the same buffer.
     """
     span = max(float(vmax) - float(vmin), 1e-6)
-    # Written as three in-place steps on one float32 scratch rather than as
-    # the expression ``np.clip((data - vmin) * (255.0 / span), 0, 255)``,
-    # which allocates a full-slice temporary at each of its three stages and
-    # promotes an int16 CT slice to float64 while doing it. Reusing the RGBA
-    # buffer via *out* below while still paying four allocations here left
-    # most of the per-frame allocation cost in place.
+    # In-place steps on one float32 scratch: no float64 promotion and one
+    # allocation instead of three
     scaled = np.subtract(data, vmin, dtype=np.float32)
     scaled *= 255.0 / span
     np.clip(scaled, 0.0, 255.0, out=scaled)
     indices = scaled.astype(np.uint8)
     expected_shape = (data.shape[0], data.shape[1], 4)
     if out is not None and out.shape == expected_shape and out.dtype == np.uint8:
-        # np.take with out= writes directly into the reused buffer, avoiding
-        # the (H, W, 4) allocation that ``lut[indices]`` fancy-indexing would
-        # produce every frame. mode="clip" is used because the default
-        # mode="raise" makes NumPy route the write through an internal
-        # temporary buffer even when out= is supplied; indices is already
-        # uint8-clamped above, so clipping is a no-op here, not a behaviour
-        # change.
+        # mode="clip" (a no-op for uint8 indices) lets np.take write straight
+        # into `out`; the default mode buffers through a temporary
         np.take(lut, indices, axis=0, out=out, mode="clip")
         return out
     return np.asarray(lut[indices])
 
 
 def window_level_to_clim(window_level: tuple[float, float]) -> tuple[float, float]:
-    """Convert ``(window_width, window_level)`` to ``(vmin, vmax)``.
-
-    Display windows are authored and stored as width/level because that is
-    what DICOM records and what clinicians work in, while every renderer needs
-    the two bounds. Defining the conversion once here keeps the primary and
-    secondary display paths from drifting apart.
-    """
+    """Convert ``(window_width, window_level)`` to ``(vmin, vmax)``."""
     window, level = window_level
     return (level - window / 2.0, level + window / 2.0)
 
 
 def clim_to_window_level(clim: tuple[float, float]) -> tuple[float, float]:
-    """Convert ``(vmin, vmax)`` to ``(window_width, window_level)``.
-
-    Inverse of :func:`window_level_to_clim`, for callers that think in bounds
-    (e.g. "show 0-60 Gy") but must store a window.
-    """
+    """Convert ``(vmin, vmax)`` to ``(window_width, window_level)``."""
     vmin, vmax = clim
     return (vmax - vmin, (vmax + vmin) / 2.0)
 

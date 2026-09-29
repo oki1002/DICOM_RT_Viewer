@@ -15,7 +15,7 @@ import SimpleITK as sitk
 
 from ..geometry import Box3D
 from .params import RigidParams, params_from_resample_transform, resample_transform
-from .session import RegistrationSession, crop_to_box, moving_chain
+from .session import RegistrationSession, crop_to_box
 
 logger = logging.getLogger(__name__)
 
@@ -72,12 +72,10 @@ def pyramid_levels(
 ) -> tuple[list[int], list[float]]:
     """Return per-level shrink factors and smoothing sigmas for *image*.
 
-    A level whose shrink factor would leave fewer than
-    :data:`PYRAMID_MIN_VOXELS` voxels along the shortest axis keeps the image
-    at full size but still smooths it. Dropping such levels entirely — the
-    obvious alternative — leaves a small region of interest (a marker, a
-    single vertebra) with no coarse level at all, which is exactly where the
-    optimiser is most likely to settle into a nearby local minimum.
+    A level that would shrink the shortest axis below
+    :data:`PYRAMID_MIN_VOXELS` voxels keeps full size but is still smoothed,
+    so a small region still gets a coarse (smoothed) level to escape local
+    minima.
 
     Returns:
         ``(shrink_factors, smoothing_sigmas)``, in voxels, coarsest first.
@@ -125,8 +123,7 @@ def register_rigid(
 ) -> RigidParams:
     """Optimise the rigid correction aligning the moving image to the fixed one.
 
-    Runs on a worker thread as happily as on the main one: it touches no
-    viewer state and returns a value.
+    Touches no viewer state, so it may run on a worker thread.
 
     Args:
         session: The image pair and its conventions.
@@ -157,7 +154,7 @@ def register_rigid(
     )
     registration.SetOptimizerScalesFromPhysicalShift()
     if dof == DegreesOfFreedom.TRANSLATION:
-        # Euler3DTransform parameters are (angleX, angleY, angleZ, tx, ty, tz).
+        # Euler3DTransform parameters: (angleX, angleY, angleZ, tx, ty, tz)
         registration.SetOptimizerWeights([0.0, 0.0, 0.0, 1.0, 1.0, 1.0])
 
     factors, sigmas = pyramid_levels(fixed)
@@ -185,7 +182,6 @@ __all__ = [
     "DegreesOfFreedom",
     "RegistrationMetric",
     "configure_metric",
-    "moving_chain",
     "pyramid_levels",
     "register_rigid",
 ]

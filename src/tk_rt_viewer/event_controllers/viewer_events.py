@@ -12,27 +12,15 @@ Event priority for ``on_press`` / ``on_motion``:
     4. 3-D bounding box interaction
     5. 2-D bounding box interaction
 
-    The two bounding-box tools are independent — a host may show either, or
-    both — so one of them has to win the mouse when both are visible. The 3-D
-    box goes first because it is the more specific tool: a host that has
-    turned it on is asking the user to select a volume, and the per-view box
-    is normally off while that is happening.
+    When both boxes are visible the 3-D box wins (the more specific tool).
 
 Hover tracking:
-    ``current_axis`` lives here, not on ``SliceViewerState``. "Which view is
-    the pointer over" is transient input state owned by the input layer: it is
-    not observable, nothing listens for it, and it has no meaning to a
-    headless consumer of the state. Keeping it here also removes the last
-    place where a handler wrote to the state directly, which the viewer's own
-    documentation said never happened.
+    ``current_axis`` (the view under the pointer) is transient input state,
+    so it lives here rather than on ``SliceViewerState``.
 
 Scroll debounce:
-    Scroll events are buffered for ``SCROLL_DEBOUNCE_MS`` ms; accumulated
-    steps are applied to ``state.set_index`` in a single call after that
-    interval elapses from the last event. Debouncing is driven by the Tk event
-    loop, so no background thread or lock is needed — every callback runs on
-    the main thread. Brush-size adjustment requires real-time response and is
-    therefore excluded from debouncing.
+    Wheel steps are accumulated for ``SCROLL_DEBOUNCE_MS`` and applied in one
+    ``set_index`` call, on the Tk main thread. Brush resizing is immediate.
 """
 
 import numpy as np
@@ -45,32 +33,25 @@ from .bbox_handler import BboxEventHandler
 from .brush_handler import BrushEventHandler
 from .crosshair_handler import CrosshairEventHandler
 
-# Debounce window (ms) for batching consecutive scroll events. Kept short so
-# that the commit-to-frame latency stays well under the 16 ms budget of a
-# 60 FPS target. Rapid wheel flicks still coalesce into a single redraw
-# because consecutive events arrive faster than this window.
+#: Debounce window (ms) for batching scroll events; short enough to feel
+#: immediate, long enough to coalesce a wheel flick.
 SCROLL_DEBOUNCE_MS: int = 30
 
-# Slice step for the PageUp / PageDown keys (Up / Down move by 1). Larger than
-# one so paging is meaningfully faster than single stepping.
+# Slice step for PageUp / PageDown (Up / Down move by 1)
 _PAGE_STEP: int = 10
 
-# Matplotlib mouse-button number for the right button, which drives the
-# window/level drag.
+# Right mouse button drives the window/level drag
 _WL_BUTTON: int = 3
 
-# Window/level drag sensitivity, in display units per pixel of drag, at the
-# reference window width below. Both are scaled by the window width in effect
-# when the drag started, so a drag feels the same on a 400 HU soft-tissue
-# window and on a 4 Gy dose window instead of being unusably coarse on one and
-# unusably fine on the other.
+# Window/level drag sensitivity (display units per pixel) at the reference
+# width; scaled by the window at drag start so a 400 HU and a 4 Gy window
+# feel alike
 _WINDOW_UNITS_PER_PIXEL: float = 2.0
 _LEVEL_UNITS_PER_PIXEL: float = 1.0
 _WL_REFERENCE_WINDOW: float = 400.0
 
-# Smallest window width a drag may produce. A zero-width window maps every
-# voxel to one LUT entry, so the image goes flat and the drag cannot be
-# recovered from by dragging back.
+# Smallest window width a drag may produce (zero would flatten the image and
+# stall the width scaling)
 _MIN_WINDOW_WIDTH: float = 1.0
 
 
@@ -81,8 +62,6 @@ class ViewerEventHandler:
         self.state = state
         self.viewer = viewer
 
-        #: View the pointer is currently inside, or ``""`` when outside all of
-        #: them. Sub-handlers read it through :attr:`current_axis`.
         self._current_axis: str = ""
 
         self.crosshair_handler = CrosshairEventHandler(state, viewer, self)
@@ -96,8 +75,7 @@ class ViewerEventHandler:
         self._wl_initial: tuple[float, float] | None = None
         self._wl_target: str = "primary"
 
-        # Scroll debounce state. All fields are touched only from the Tk main
-        # thread, so no lock is required.
+        # Scroll debounce state (Tk main thread only)
         self._scroll_handle: str | None = None
         self._scroll_accum: int = 0
         self._scroll_axis: str | None = None
@@ -117,11 +95,7 @@ class ViewerEventHandler:
     def _on_brush_tool_active_changed(self, is_active: bool) -> None:
         if is_active:
             self.brush_handler.activate()
-            # Cancel any in-progress drag from another interaction mode
-            # immediately. Each of these otherwise keeps its drag flags set
-            # after the brush claims the mouse, so the abandoned drag would
-            # resume on the next unrelated motion event once that mode is
-            # active again (see each handler's cancel() docstring).
+            # The brush claims the mouse: abandon every other drag
             self._reset_wl_drag()
             self.crosshair_handler.cancel()
             self.bbox_handler.cancel()
@@ -156,13 +130,7 @@ class ViewerEventHandler:
     # Scroll
     # ------------------------------------------------------------------
     def on_scroll(self, event) -> None:
-        """Receive a scroll event and accumulate it in the debounce buffer.
-
-        Brush-size changes are processed immediately because they require
-        real-time response. All other scroll events accumulate their steps and
-        are applied together after ``SCROLL_DEBOUNCE_MS`` ms.
-        """
-        # Brush-size changes bypass debouncing.
+        """Resize the brush immediately, or accumulate a debounced slice scroll."""
         if self.state.brush_tool_active and self._current_axis:
             self.brush_handler.handle_scroll(event)
             return
@@ -171,9 +139,7 @@ class ViewerEventHandler:
         if not axis or self.state.primary_image is None:
             return
 
-        # Flush any accumulated steps for the previous view before switching
-        # views, otherwise a quick hop between views silently drops the pending
-        # scroll delta of the view the pointer just left.
+        # Flush the previous view's pending steps before switching views
         if self._scroll_axis is not None and self._scroll_axis != axis:
             self._cancel_scroll_timer()
             self._flush_scroll()
@@ -184,8 +150,7 @@ class ViewerEventHandler:
         self._cancel_scroll_timer()
         handle = self.viewer.schedule(SCROLL_DEBOUNCE_MS, self._flush_scroll)
         if handle is None:
-            # No Tk event loop available (e.g. a headless test): apply
-            # immediately rather than losing the event.
+            # No Tk event loop (headless): apply immediately
             self._flush_scroll()
             return
         self._scroll_handle = handle
@@ -198,14 +163,7 @@ class ViewerEventHandler:
         self._scroll_handle = None
 
     def _flush_scroll(self) -> None:
-        """Apply the accumulated scroll steps to the current slice index.
-
-        Runs on the Tk main thread, so direct calls into Matplotlib / state are
-        safe. Range clamping is delegated to ``SliceViewerState.set_index``.
-        After ``set_index`` fires its listener chain — which enqueues redraw
-        requests — the queue is drained immediately so the new slice appears
-        without waiting for the next Tk idle iteration.
-        """
+        """Apply the accumulated scroll steps and draw the new slice immediately."""
         accum = self._scroll_accum
         axis = self._scroll_axis
         self._scroll_accum = 0
@@ -220,12 +178,7 @@ class ViewerEventHandler:
         self.viewer.flush_redraws()
 
     def cancel_pending(self) -> None:
-        """Cancel a pending debounced scroll flush and unregister the listener.
-
-        Call this when the owning viewer is being destroyed so that a scheduled
-        callback never fires against a widget that no longer exists, and so a
-        shared (injected) state does not keep notifying a dead handler.
-        """
+        """Cancel a pending scroll flush and unregister from the state (teardown)."""
         self._cancel_scroll_timer()
         self._scroll_accum = 0
         self._scroll_axis = None
@@ -237,59 +190,43 @@ class ViewerEventHandler:
     # Mouse press
     # ------------------------------------------------------------------
     def on_press(self, event) -> None:
-        """Dispatch a mouse-press event to the appropriate handler.
+        """Dispatch a mouse press to the handler with the highest priority.
 
-        A button-down transition is, under ordinary single-pointer desktop
-        interaction, only ever preceded by button-up: a drag flag still set
-        when a *new* press arrives is therefore the same signal
-        :meth:`on_motion` already recovers from (a lost
-        ``button_release_event``), just observed one event earlier. Without
-        this check here, only the button-less-motion recovery in
-        :meth:`on_motion` existed, which left a window between the lost
-        release and the next motion event: a press landing in that window
-        (e.g. a right-drag W/L release lost, then an immediate left-click to
-        start a bbox) still saw ``_dragging_wl`` set, and the *next* motion
-        event resumed adjusting the window/level instead of dragging the
-        bbox this press just started — priority 3 runs ahead of priority 4
-        in :meth:`on_motion`. Recovering here closes that window the same
-        way :meth:`on_motion` closes its own.
+        A drag still in progress when a new press arrives means its release
+        was lost; it is ended first so it cannot resume on the next motion.
         """
-        # Ignore while the toolbar zoom/pan mode is active.
         if self.viewer.toolbar_mode:
+            # The toolbar's zoom / pan owns the mouse
             return
 
         if self._any_drag_in_progress():
             self._recover_lost_drag(event)
 
-        # Priority 1: brush tool (exclusive; blocks crosshair, W/L, bbox).
+        # Priority 1: brush tool (exclusive)
         if self.state.brush_tool_active:
             self.brush_handler.handle_press(event)
             return
 
-        # Priority 2: crosshair drag.
+        # Priority 2: crosshair drag
         if self.crosshair_handler.handle_press(event):
             return
 
-        # Priority 3: window / level (right-click).
+        # Priority 3: window / level (right-click)
         if event.button == _WL_BUTTON:
             self._begin_wl_drag(event)
             return
 
-        # Priority 4: 3-D bounding box, then priority 5: 2-D bounding box.
+        # Priority 4: 3-D bounding box, then priority 5: 2-D bounding box
         if event.button == 1 and self._current_axis:
             if self.bbox_3d_handler.handle_press(event):
                 return
             self.bbox_handler.handle_press(event)
 
     def _begin_wl_drag(self, event) -> None:
-        """Start a window/level drag against the image the user is targeting.
+        """Start a window/level drag, resolving its target image once.
 
-        The target is resolved once here rather than on every motion event, so
-        a target change mid-drag cannot make the drag jump from one image's
-        window to the other's. Holding Shift targets the secondary image for
-        this drag alone, which saves a round trip through a settings UI when a
-        fusion overlay just needs a quick adjustment; without a secondary image
-        loaded there is nothing to target, so the modifier is ignored.
+        Shift targets the other image for this drag, when a secondary image
+        is loaded.
         """
         target = self.state.window_level_target
         if event.key == "shift" and self.state.secondary_image is not None:
@@ -310,46 +247,28 @@ class ViewerEventHandler:
     # Mouse motion
     # ------------------------------------------------------------------
     def on_motion(self, event) -> None:
-        """Route mouse-motion events while a drag is in progress.
+        """Route a mouse motion to the drag in progress, by priority.
 
-        If a drag flag here is still set but :meth:`_no_button_held` reports
-        no button currently down, the ``button_release_event`` that should
-        have ended that drag was lost somewhere upstream — released outside
-        the canvas, a window focus change, or the toolbar grabbing the mouse
-        — and never reached :meth:`on_release`. Recovering here is what
-        actually closes that hole: cancelling only in
-        :meth:`_on_brush_tool_active_changed` / ``BrushEventHandler.deactivate``
-        only handles a lost release that happens to coincide with the brush
-        tool being toggled off; every other cause of a lost release left the
-        drag flag set, so the very next ordinary hover would otherwise resume
-        it. See :meth:`_no_button_held` for why this cannot simply check
-        ``event.button is None``.
+        A drag flag still set while no button is held means the release was
+        lost (released outside the canvas, a focus change, the toolbar
+        grabbing the mouse); the drag is ended instead of resumed.
         """
         if self._no_button_held(event) and self._any_drag_in_progress():
             self._recover_lost_drag(event)
             return
 
-        # Priority 1: brush tool (exclusive).
         if self.state.brush_tool_active:
             self.brush_handler.handle_motion(event)
             return
-
-        # Priority 2: crosshair drag.
         if self.crosshair_handler.is_dragging:
             self.crosshair_handler.handle_motion(event)
             return
-
-        # Priority 3: window / level.
         if self._dragging_wl:
             self._apply_wl_drag(event)
             return
-
-        # Priority 4: 3-D bounding box.
         if self.bbox_3d_handler.is_dragging:
             self.bbox_3d_handler.handle_motion(event)
             return
-
-        # Priority 5: 2-D bounding box.
         if self.bbox_handler.is_dragging:
             self.bbox_handler.handle_motion(event)
 
@@ -357,28 +276,10 @@ class ViewerEventHandler:
     def _no_button_held(event) -> bool:
         """Return whether *event* carries no currently-held mouse button.
 
-        Prefers ``event.buttons`` (plural, added in Matplotlib 3.10): the
-        backend builds this directly from the event's own button-state mask,
-        so it reflects the physical state at the moment of *this* event.
-
-        The singular ``event.button`` cannot be used for this check.
-        ``backend_bases._mouse_handler`` (the default callback every backend
-        registers) dead-reckons a motion event's ``button`` from the last
-        ``button_press_event`` / ``button_release_event`` that reached the
-        canvas::
-
-            elif event.name == "motion_notify_event" and event.button is None:
-                event.button = event.canvas._button
-
-        ``canvas._button`` is only cleared by a ``button_release_event``.
-        When that release is exactly what got lost — the scenario this
-        recovery exists to handle — ``event.button`` stays stuck on the
-        button that was pressed, so a check against ``event.button is None``
-        never fires for the one case it is supposed to catch.
-
-        Falls back to ``event.button is None`` on Matplotlib < 3.10, where
-        ``buttons`` does not exist; that version cannot detect a lost
-        release this way, but at least preserves prior behaviour.
+        Uses ``event.buttons`` (Matplotlib >= 3.10), built from the event's
+        own button mask. The singular ``event.button`` is useless here: for
+        motion events Matplotlib fills it from the last press, and it stays
+        set exactly when the release was lost.
         """
         buttons = getattr(event, "buttons", None)
         if buttons is not None:
@@ -398,22 +299,8 @@ class ViewerEventHandler:
     def _recover_lost_drag(self, event) -> None:
         """End whichever drag is in progress after its release event was lost.
 
-        The brush stroke is committed rather than discarded: unlike the
-        crosshair / W-L / bbox drags, whose target state is already fully
-        up to date from the motion events already applied, an in-progress
-        brush stroke only exists as an unsaved buffer
-        (``BrushEventHandler._cached_mask_volume``) until a release commits
-        it — discarding that here would silently drop paint strokes the
-        user watched land on screen. ``handle_release`` reads no field of
-        *event* other than the drag state already recorded on the handler,
-        so passing this button-less motion event through is safe.
-        Crosshair / bbox only need their drag flags cleared — the state
-        they touch (``state.indices`` / ``state.bounding_boxes``) was
-        already kept current by every motion event processed before this
-        one, so ``cancel()`` (which does not touch that state, only the
-        flags) is enough; committing one more position update from this
-        recovery event's coordinates would risk applying a stale point if
-        several motion events coalesced before the lost release.
+        A brush stroke is committed (the user saw the paint land); the other
+        drags already applied every motion, so their flags are just cleared.
         """
         if self.brush_handler.is_dragging:
             self.brush_handler.handle_release(event)

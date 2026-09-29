@@ -1,14 +1,8 @@
-"""events.py — Canonical event-name constants for SliceViewerState's Observer pattern.
+"""events.py — Event-name constants for SliceViewerState's observer API.
 
-``SliceViewerState.add_listener`` / ``_notify`` accept plain strings, so a
-typo'd event name (``"windw_level_changed"``) previously failed silently —
-the listener would simply never fire. Importing these constants instead of
-writing string literals turns that typo into an ``AttributeError`` /
-``NameError`` at import or lint time.
-
-This module is the single source of truth for every event name and is also
-used by :meth:`SliceViewerState._notify` to validate that only known event
-types are ever broadcast (see ``ALL_EVENTS`` below).
+Use these constants instead of string literals with
+``SliceViewerState.add_listener`` so a typo fails at import / lint time
+rather than silently registering a listener that never fires.
 """
 
 from typing import Final
@@ -38,9 +32,7 @@ BRUSH_FILL_INSIDE_CHANGED: Final = "brush_fill_inside_changed"
 SELECTED_ROI_CHANGED: Final = "selected_roi_changed"
 CONTOUR_CACHE_BUILT: Final = "contour_cache_built"
 
-#: Every event type SliceViewerState may broadcast. Used by ``_notify`` to
-#: catch a typo'd event name (a string not in this set) at the point it is
-#: fired, instead of silently reaching zero listeners.
+#: Every event type SliceViewerState may broadcast; ``_notify`` rejects others.
 ALL_EVENTS: Final[frozenset[str]] = frozenset(
     {
         PRIMARY_IMAGE_DATA_CHANGED,

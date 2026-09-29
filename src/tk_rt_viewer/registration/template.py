@@ -1,16 +1,11 @@
 """template.py — Template matching for small, high-contrast landmarks.
 
-Intensity-based registration optimises a similarity metric over a whole
-region, which is the right tool for anatomy and the wrong one for a 2 mm gold
-fiducial: the marker contributes almost nothing to the metric, and the
-surrounding anatomy dominates the result. Cross-correlating a template cut
-from the fixed image against the moving image finds the marker directly, and
-reports how confident the match is.
+A 2 mm fiducial contributes almost nothing to a region-wide similarity
+metric. Cross-correlating a template cut from the fixed image against the
+moving image finds it directly and reports a confidence score.
 
-Only translation is searched. The moving image is sampled with the caller's
-current correction already applied, so any rotation the user or an earlier
-registration established is preserved and the result is the additional shift
-needed on top of it.
+Only translation is searched, on top of the caller's current correction
+(any rotation is preserved).
 """
 
 import logging
@@ -119,8 +114,7 @@ def match_template_translation(
     direction = np.array(session.fixed.GetDirection()).reshape(3, 3)
     found_at = direction @ (offset_xyz * np.array(session.fixed.GetSpacing()))
 
-    # The content was found that far from where it should be, so it has to
-    # move back by the same amount.
+    # The content was found that far from where it belongs: move it back
     shift = as_point(-found_at)
     score = float(correlation[peak])
     logger.info(

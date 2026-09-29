@@ -1,13 +1,8 @@
 """session.py — The fixed / moving pair a registration runs against.
 
-Every registration in this sub-package needs the same handful of things: the
-image that stays put, the image that moves, whatever transform already
-aligned the moving image before the user touched anything (a REG object, a
-4DCT phase transform), the centre rotations are measured about, and the value
-to fill in where the moving image does not cover the fixed grid.
-:class:`RegistrationSession` holds those together so that a host application
-builds them once per image pair instead of threading five arguments through
-every call.
+:class:`RegistrationSession` bundles what every registration needs: the fixed
+and moving images, any transform already aligning the moving image (a REG
+object, a 4DCT phase transform), the rotation centre, and the fill value.
 
 The transform chain applied to the moving image is, in the order a fixed-grid
 point travels:
@@ -40,17 +35,13 @@ MIN_REGION_VOXELS: int = 4
 class RegistrationSession:
     """One fixed / moving image pair, plus the conventions used to align them.
 
-    ``eq=False``: like the viewer state, this is an identity-carrying service
-    object. A generated ``__eq__`` would compare whole images voxel by voxel,
-    and a host comparing sessions wants to know "is this still the same pair",
-    which identity answers.
+    ``eq=False``: sessions compare by identity, not voxel by voxel.
 
     Attributes:
         fixed: The image that stays put (the viewer's primary image).
-        moving: The image being aligned, on its own grid. Pass the *source*
-            image rather than one already resampled onto the fixed grid, so
-            that the parts of it currently outside the fixed field of view are
-            still available when a correction moves them into it.
+        moving: The image being aligned, on its own grid. Pass the source
+            image (not one resampled onto the fixed grid) so content outside
+            the fixed field of view is still available.
         base_transform: An alignment already applied to *moving* before any
             correction — a REG transform, a 4DCT phase transform — or ``None``.
         rotation_center: Physical point rotations are measured about. Defaults

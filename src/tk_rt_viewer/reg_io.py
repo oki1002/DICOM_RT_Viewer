@@ -1,20 +1,18 @@
 """reg_io.py — Writing DICOM Spatial Registration (REG) objects.
 
-:func:`~tk_rt_viewer.io.find_reg_matrices` reads registrations other systems
-produced; this writes one back out, so that an alignment computed here — by
-:mod:`tk_rt_viewer.registration` or by hand — can be sent to a treatment
-planning system rather than staying inside the application that found it.
+:func:`~tk_rt_viewer.io.find_reg_matrices` reads registrations; this module
+writes one, so an alignment computed here can be sent to a treatment
+planning system.
 
-Only rigid registrations are written. A deformable result is a displacement
-field and belongs to the Deformable Spatial Registration IOD, which is a
-different object with different consumers; writing one as a matrix would
-silently discard everything that made it deformable.
+Only rigid registrations are written. A deformable result belongs to the
+Deformable Spatial Registration IOD; writing it as a matrix would silently
+discard the deformation.
 
-The matrix convention follows the standard: it maps points from the moving
-image's frame of reference into the fixed image's frame of reference, in
-DICOM patient coordinates (LPS, mm). That is the same direction as
-:func:`tk_rt_viewer.registration.motion_transform` — the motion of the moving
-image — and the opposite of the transform used to resample it.
+Matrix convention (per the standard): the matrix maps points from the moving
+image's frame of reference into the fixed one, in patient coordinates (LPS,
+mm). That is the direction of
+:func:`tk_rt_viewer.registration.motion_transform`, and the inverse of the
+transform used to resample the moving image.
 """
 
 import datetime
@@ -35,6 +33,23 @@ SPATIAL_REGISTRATION_SOP_CLASS_UID = UID("1.2.840.10008.5.1.4.1.1.66.1")
 IMPLEMENTATION_CLASS_UID = UID("1.2.826.0.1.3680043.10.1424")
 IMPLEMENTATION_VERSION_NAME = "TK_RT_VIEWER"
 
+#: Maximum length of an LO (Long String) value.
+_LO_MAX_LENGTH = 64
+
+#: Type 2 patient / study attributes copied from the fixed reference.
+_COPIED_PATIENT_STUDY_TAGS = (
+    "PatientName",
+    "PatientID",
+    "PatientBirthDate",
+    "PatientSex",
+    "StudyInstanceUID",
+    "StudyDate",
+    "StudyTime",
+    "StudyID",
+    "AccessionNumber",
+    "ReferringPhysicianName",
+)
+
 _IDENTITY = np.eye(4)
 
 
@@ -50,22 +65,13 @@ class RegistrationExportError(ValueError):
 def transform_to_matrix(transform: sitk.Transform) -> np.ndarray:
     """Return *transform* as a 4x4 homogeneous matrix.
 
-    The matrix is measured rather than read off the transform's parameters:
-    the origin and the three basis vectors are mapped through it, which works
-    for every linear transform type (translation, rigid, affine, or a
-    composite of them) without a cast per type. A transform that is not
-    linear maps a test point somewhere the resulting matrix does not, and is
-    rejected on that basis.
-
-    Args:
-        transform: The transform to convert.
-
-    Returns:
-        The matrix, mapping input points to output points.
+    The matrix is measured by mapping the origin and the basis vectors, which
+    works for every linear transform type (including composites) without a
+    per-type cast. A probe point then rejects non-linear transforms.
 
     Raises:
-        RegistrationExportError: If the transform is not linear — a B-spline
-            or a displacement field has no matrix form.
+        RegistrationExportError: If the transform is not linear (a B-spline
+            or displacement field has no matrix form).
     """
     origin = np.array(transform.TransformPoint((0.0, 0.0, 0.0)))
     columns = [
@@ -99,25 +105,22 @@ def save_registration(
 ) -> Dataset:
     """Write a Spatial Registration object aligning a moving image to a fixed one.
 
-    Patient and study identifiers are taken from *fixed_reference*, so the
+    Patient and study identifiers are copied from *fixed_reference*, so the
     object lands in the same study as the image it registers to.
 
     Args:
         path: Destination file.
-        matrix: 4x4 homogeneous matrix mapping the moving frame of reference
-            into the fixed one (see the module docstring for the direction).
-        fixed_reference: Any dataset from the fixed image's series — one
-            slice read with ``stop_before_pixels=True`` is enough. Supplies
-            the patient, the study, and the Frame of Reference registered to.
-        moving_reference: Any dataset from the moving image's series, for its
-            Frame of Reference and series reference.
-        description: Series description, e.g. the name a user gave the
-            registration. Truncated to the 64 characters the LO value
-            representation allows.
+        matrix: 4x4 rigid matrix mapping the moving frame of reference into
+            the fixed one (see the module docstring).
+        fixed_reference: Any dataset of the fixed series (a header read with
+            ``stop_before_pixels=True`` is enough).
+        moving_reference: Any dataset of the moving series.
+        description: Series / content description, truncated to 64
+            characters.
         series_number: Series number of the written object.
 
     Returns:
-        The dataset written, in case the caller wants its SOP Instance UID.
+        The dataset written.
 
     Raises:
         RegistrationExportError: If *matrix* is not a 4x4 rigid matrix, or
@@ -143,47 +146,44 @@ def save_registration(
     ds.SOPClassUID = SPATIAL_REGISTRATION_SOP_CLASS_UID
     ds.SOPInstanceUID = sop_instance_uid
 
-    # Patient and study: copy what is there rather than inventing values, so
-    # the object files alongside the images it refers to.
-    # Type 2 attributes: an empty value is valid, a missing one is not.
-    for tag in (
-        "PatientName",
-        "PatientID",
-        "PatientBirthDate",
-        "PatientSex",
-        "StudyInstanceUID",
-        "StudyDate",
-        "StudyTime",
-        "StudyID",
-        "AccessionNumber",
-        "ReferringPhysicianName",
-    ):
+    # Type 2: an empty value is valid, a missing attribute is not
+    for tag in _COPIED_PATIENT_STUDY_TAGS:
         setattr(ds, tag, getattr(fixed_reference, tag, ""))
 
     ds.Modality = "REG"
     ds.SeriesInstanceUID = generate_uid()
     ds.SeriesNumber = series_number
-    ds.SeriesDescription = description[:64]
+    ds.SeriesDescription = description[:_LO_MAX_LENGTH]
     ds.InstanceNumber = 1
     ds.ContentLabel = "REGISTRATION"
-    ds.ContentDescription = description[:64]
+    ds.ContentDescription = description[:_LO_MAX_LENGTH]
     ds.ContentCreatorName = ""
     ds.Manufacturer = IMPLEMENTATION_VERSION_NAME
-    # Local time: these stamps are read alongside the rest of the study, which
-    # the modality also wrote in local time.
-    ds.ContentDate = now.strftime("%Y%m%d")  # noqa: DTZ005
+    # Local time, like the rest of the study the modality wrote
+    ds.ContentDate = now.strftime("%Y%m%d")
     ds.ContentTime = now.strftime("%H%M%S")
     ds.InstanceCreationDate = ds.ContentDate
     ds.InstanceCreationTime = ds.ContentTime
 
-    # The frame of reference everything is registered *to*.
+    # The frame of reference everything is registered *to*
     ds.FrameOfReferenceUID = fixed_frame
-
     ds.RegistrationSequence = [
-        # The fixed image: registered to itself, hence the identity.
+        # The fixed image registered to itself, hence the identity
         _registration_item(fixed_reference, fixed_frame, _IDENTITY),
         _registration_item(moving_reference, moving_frame, matrix),
     ]
+    referenced_series = [
+        series
+        for series in (
+            _referenced_series_item(fixed_reference),
+            _referenced_series_item(moving_reference),
+        )
+        if series is not None
+    ]
+    if referenced_series:
+        # Common Instance Reference Module: lets readers resolve the
+        # referenced instances to whole series
+        ds.ReferencedSeriesSequence = referenced_series
 
     path.parent.mkdir(parents=True, exist_ok=True)
     ds.save_as(path, enforce_file_format=True)
@@ -196,7 +196,7 @@ def save_registration(
 
 
 def _validate_rigid(matrix: np.ndarray) -> None:
-    """Raise unless *matrix* is a 4x4 rigid transformation matrix."""
+    """Raise unless *matrix* is a 4x4 proper rigid transformation matrix."""
     if matrix.shape != (4, 4):
         raise RegistrationExportError(
             f"A spatial registration matrix must be 4x4, got {matrix.shape}."
@@ -211,6 +211,12 @@ def _validate_rigid(matrix: np.ndarray) -> None:
             "Only rigid registrations can be written; the matrix includes "
             "scaling or shear."
         )
+    # An orthonormal matrix with determinant -1 is a reflection, which a
+    # "RIGID" matrix type must not contain
+    if np.linalg.det(rotation) <= 0:
+        raise RegistrationExportError(
+            "Only rigid registrations can be written; the matrix includes a reflection."
+        )
 
 
 def _frame_of_reference(reference: Dataset, role: str) -> str:
@@ -222,6 +228,30 @@ def _frame_of_reference(reference: Dataset, role: str) -> str:
             "spatial registration cannot refer to it."
         )
     return str(frame)
+
+
+def _referenced_instance(reference: Dataset) -> Dataset | None:
+    """Return a SOP class / instance reference to *reference*, if identifiable."""
+    sop_class_uid = getattr(reference, "SOPClassUID", None)
+    sop_instance_uid = getattr(reference, "SOPInstanceUID", None)
+    if not (sop_class_uid and sop_instance_uid):
+        return None
+    item = Dataset()
+    item.ReferencedSOPClassUID = sop_class_uid
+    item.ReferencedSOPInstanceUID = sop_instance_uid
+    return item
+
+
+def _referenced_series_item(reference: Dataset) -> Dataset | None:
+    """Return a Referenced Series Sequence item naming *reference*'s series."""
+    series_uid = getattr(reference, "SeriesInstanceUID", None)
+    instance = _referenced_instance(reference)
+    if not series_uid or instance is None:
+        return None
+    series = Dataset()
+    series.SeriesInstanceUID = series_uid
+    series.ReferencedInstanceSequence = [instance]
+    return series
 
 
 def _registration_item(
@@ -241,19 +271,9 @@ def _registration_item(
     item.FrameOfReferenceUID = frame_of_reference
     item.MatrixRegistrationSequence = [matrix_registration]
 
-    series_uid = getattr(reference, "SeriesInstanceUID", None)
-    sop_class_uid = getattr(reference, "SOPClassUID", None)
-    sop_instance_uid = getattr(reference, "SOPInstanceUID", None)
-    if series_uid and sop_class_uid and sop_instance_uid:
-        # Naming the series this item refers to is optional, but it is what
-        # lets a reader match the registration to images rather than to a
-        # bare frame of reference.
-        referenced_image = Dataset()
-        referenced_image.ReferencedSOPClassUID = sop_class_uid
-        referenced_image.ReferencedSOPInstanceUID = sop_instance_uid
-
-        referenced_series = Dataset()
-        referenced_series.SeriesInstanceUID = series_uid
-        referenced_series.ReferencedInstanceSequence = [referenced_image]
-        item.ReferencedSeriesSequence = [referenced_series]
+    # Optional, but lets a reader match the registration to images rather
+    # than to a bare frame of reference
+    instance = _referenced_instance(reference)
+    if instance is not None:
+        item.ReferencedImageSequence = [instance]
     return item

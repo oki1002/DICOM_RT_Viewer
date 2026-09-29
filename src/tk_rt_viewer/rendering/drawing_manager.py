@@ -1,41 +1,29 @@
-"""drawing_manager.py — Idle-driven blit-redraw coalescing (no polling timer).
+"""drawing_manager.py — Redraw coalescing (no polling timer).
 
-Extracted out of viewer.py so that DicomViewer only wires this collaborator
-up instead of defining it inline.
+- :class:`DrawingManager` merges blit requests into one idle callback.
+- :class:`ContourRedrawCoalescer` merges background contour-build
+  completions into one contour redraw.
 """
 
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Iterable
 
 
 class DrawingManager:
-    """Coalesces blit-redraw requests into a single Tk idle-callback.
+    """Coalesces blit-redraw requests into a single Tk idle callback.
 
-    There is no polling timer. The first ``add_request()`` call after the
-    pending set was empty schedules one ``after_idle`` callback; every
-    ``add_request()`` call that arrives before that callback actually runs
-    (e.g. several axes updated inside the same state-change handler) is merged
-    into the same redraw pass. This gives real-time rendering — a change is
-    drawn on the very next Tk event-loop iteration rather than waiting for the
-    next tick of a fixed-interval timer — while still coalescing bursts of
-    requests into one pass per axis, and it costs nothing while idle.
-
-    Collaborators are injected as plain callables rather than as the owning
-    widget. A previous version took the ``DicomViewer`` itself and reached
-    into its private ``_redraw_axis_blit``, which made the two mutually
-    dependent (only breakable with a ``TYPE_CHECKING`` import) and made this
-    class untestable without a live Tk widget.
+    The first request schedules one ``after_idle`` callback; requests that
+    arrive before it runs join the same pass. Changes appear on the next
+    event-loop iteration, bursts cost one pass per axis, and nothing runs
+    while idle.
 
     Args:
-        redraw: Called with an axis name to actually repaint that axis.
-        is_known_axis: Returns whether an axis exists in the current layout;
-            requests for axes the layout does not build are dropped.
-        schedule_idle: Schedules a callback on the next idle iteration and
-            returns its handle (``tkinter.Misc.after_idle``).
-        cancel: Cancels a handle previously returned by *schedule_idle*.
-            It must tolerate a handle that Tk has already forgotten (the
-            widget is mid-teardown, the callback has already fired), so this
-            class never has to know about ``tkinter.TclError`` — which is
-            also what lets it be exercised without a Tk build at all.
+        redraw: Repaints one axis.
+        is_known_axis: Whether an axis exists in the current layout; other
+            requests are dropped.
+        schedule_idle: ``tkinter.Misc.after_idle``-like scheduler returning a
+            handle.
+        cancel: Cancels a handle; must tolerate one Tk already forgot.
     """
 
     def __init__(
@@ -61,21 +49,12 @@ class DrawingManager:
             self._idle_handle = self._schedule_idle(self._process_pending)
 
     def flush(self) -> None:
-        """Run the pending redraw now instead of waiting for the idle loop.
-
-        Called from interactive paths (e.g. scroll / key-press commit) so the
-        new slice appears in the same event-handling turn rather than one Tk
-        iteration later.
-        """
+        """Run the pending redraws now instead of waiting for the idle loop."""
         self._cancel_idle_callback()
         self._process_pending()
 
     def cancel(self) -> None:
-        """Cancel any scheduled idle callback and discard pending requests.
-
-        Call this when the owning viewer is being destroyed so the callback
-        never fires against a widget that no longer exists.
-        """
+        """Cancel any scheduled callback and discard pending requests (teardown)."""
         self._cancel_idle_callback()
         self._pending_axes.clear()
 
@@ -92,3 +71,74 @@ class DrawingManager:
             return
         self._cancel(self._idle_handle)
         self._idle_handle = None
+
+
+class ContourRedrawCoalescer:
+    """Merges contour-build completions into one redraw on the Tk main loop.
+
+    Background builds finish one ROI at a time on worker threads; redrawing
+    every contour once per finished ROI would repeat the same work N times
+    for an N-ROI RT-STRUCT. :meth:`notify_built` (thread-safe) records the
+    ROI and schedules at most one pending flush; the flush redraws once, and
+    only when a finished ROI is actually displayed.
+
+    Args:
+        schedule: Schedules a callback after a delay in ms and returns a
+            handle, or ``None`` when scheduling is impossible (teardown).
+            Called from worker threads.
+        cancel: Cancels a handle; must tolerate one Tk already forgot.
+        redraw: Redraws every contour (main thread).
+        active_rois: Returns the ROI numbers currently displayed.
+        delay_ms: How long to wait for further completions before flushing.
+    """
+
+    def __init__(
+        self,
+        schedule: Callable[[int, Callable[[], None]], str | None],
+        cancel: Callable[[str], None],
+        redraw: Callable[[], None],
+        active_rois: Callable[[], Iterable[int]],
+        delay_ms: int = 50,
+    ) -> None:
+        self._schedule = schedule
+        self._cancel = cancel
+        self._redraw = redraw
+        self._active_rois = active_rois
+        self._delay_ms = delay_ms
+        self._lock = threading.Lock()
+        self._built: set[int] = set()
+        self._handle: str | None = None
+        self._pending = False
+
+    def notify_built(self, roi_number: int) -> None:
+        """Record a finished build and schedule a flush if none is pending."""
+        with self._lock:
+            self._built.add(roi_number)
+            if self._pending:
+                return
+            self._pending = True
+        handle = self._schedule(self._delay_ms, self._flush)
+        with self._lock:
+            if handle is None:
+                # Nothing will run the flush: allow a later retry
+                self._pending = False
+            else:
+                self._handle = handle
+
+    def cancel(self) -> None:
+        """Cancel a pending flush and forget recorded builds (teardown)."""
+        with self._lock:
+            handle, self._handle = self._handle, None
+            self._pending = False
+            self._built.clear()
+        if handle is not None:
+            self._cancel(handle)
+
+    def _flush(self) -> None:
+        """Redraw once if any ROI finished since the last flush is displayed."""
+        with self._lock:
+            built, self._built = self._built, set()
+            self._handle = None
+            self._pending = False
+        if built & set(self._active_rois()):
+            self._redraw()

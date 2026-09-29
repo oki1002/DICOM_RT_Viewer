@@ -1,53 +1,26 @@
-"""viewer_state.py — Centralised state management for DicomViewer.
+"""viewer_state.py — Observable state for DicomViewer.
 
-Design notes:
-    - Image data is stored as ``sitk.Image``; all physical-coordinate
-      transforms are delegated to the SimpleITK API.
-    - State changes are broadcast through the Observer pattern:
-      register callbacks with :meth:`SliceViewerState.add_listener` and
-      emit events via :meth:`SliceViewerState._notify`.
-    - ROI masks are managed by :class:`StructureSet`, keyed by integer ROI
-      number (auto-assigned on :meth:`StructureSet.add`).
+Design:
+    - Images are ``sitk.Image``; physical <-> index conversion goes through
+      SimpleITK (LPS coordinates). NumPy views are ``(z, y, x)`` while
+      ``GetSize()`` is ``(x, y, z)``.
+    - Every change is broadcast to listeners registered with
+      :meth:`SliceViewerState.add_listener` (names in :mod:`tk_rt_viewer.events`).
+    - The secondary image (a fusion series or an active 4DCT phase) has its
+      own display window; ``None`` means "follow the primary".
 
-Secondary image & 4DCT:
-    The state supports an optional secondary image that is blended over the
-    primary image. 4DCT phase data can be loaded via :meth:`set_all_phases`;
-    individual phases are activated as the secondary image with
-    :meth:`set_active_phase_as_secondary`. The two images carry independent
-    display windows — see "Window / level" below.
-
-Window / level:
-    :attr:`window_level` is the primary image's window, and
-    :attr:`secondary_window_level` the secondary image's. The latter may be
-    ``None``, which means "follow the primary"; that is the default, so a
-    same-modality overlay needs no extra setup, while a secondary image on a
-    different intensity scale (a PET fusion, an MR, a dose map in Gy) can be
-    windowed independently. :meth:`effective_secondary_window_level` resolves
-    the two into the window actually used for display.
-
-Coordinate system:
-    SimpleITK uses the LPS (Left-Posterior-Superior) physical coordinate
-    system. NumPy arrays obtained via ``sitk.GetArrayViewFromImage`` are
-    indexed as ``(z, y, x)``, while ``sitk.Image.GetSize()`` returns
-    ``(x, y, z)``.
-
-Collaborators:
-    This class owns four collaborators and delegates to them rather than
-    implementing their concerns inline:
-
-    - :class:`~tk_rt_viewer.state.viewer_cache.ViewerCacheManager` — every
-      performance cache (image / dose array caches, contour path cache, mask
-      volume cache, background contour-build pool).
-    - :class:`~tk_rt_viewer.state.phase_manager.PhaseManager` — 4DCT phase
-      storage and lazy resampling onto the primary grid.
-    - :class:`~tk_rt_viewer.state.dose_manager.DoseManager` — RT-DOSE storage
-      in both geometries, Dmax, and dose-slice lookup.
+Collaborators (each receives what it needs by injection, none refers back):
+    - :class:`~tk_rt_viewer.state.viewer_cache.ViewerCacheManager` —
+      performance caches and the background contour build.
+    - :class:`~tk_rt_viewer.state.phase_manager.PhaseManager` — 4DCT phases.
+    - :class:`~tk_rt_viewer.state.secondary_manager.SecondaryManager` — the
+      secondary source image and its transform.
+    - :class:`~tk_rt_viewer.state.dose_manager.DoseManager` — RT-DOSE.
     - :class:`~tk_rt_viewer.state.roi_manager.RoiManager` — the structure set
-      and the cache bookkeeping every ROI change implies.
+      and its cache bookkeeping.
 
-    What stays here is the observable surface: the fields, their setters, and
-    the notifications. Everything each collaborator needs is injected, so none
-    of them holds a reference back to this class.
+This class keeps the observable surface: the fields, their setters and the
+notifications.
 """
 
 import logging
@@ -119,31 +92,21 @@ logger = logging.getLogger(__name__)
 #: Valid values for :attr:`SliceViewerState.window_level_target`.
 WINDOW_LEVEL_TARGETS: tuple[str, ...] = ("primary", "secondary")
 
-#: Smallest brush radius the state will accept, in mm. A radius of zero (or
-#: less) divides by zero in the stroke-interpolation step of the brush, so it
-#: is clamped here rather than guarded at every consumer. Public because the
-#: brush handler's own scroll-to-resize clamp has to agree with it; it
-#: previously hardcoded a different floor of its own
+#: Smallest brush radius the state accepts, in mm (a non-positive radius
+#: breaks the brush's stroke interpolation). Shared with the brush handler.
 MIN_BRUSH_SIZE_MM: float = 0.1
 
 
 @dataclass(eq=False)
 class SliceViewerState:
-    """Centralised state container for the 3-plane DICOM viewer.
+    """State container for the 3-plane DICOM viewer.
 
-    Coordinates are expressed in the SimpleITK physical coordinate system
-    (LPS). All slice navigation uses integer indices; physical <-> index
-    conversion is handled by :meth:`index_to_physical` /
-    :meth:`physical_to_index`.
+    Coordinates are LPS physical coordinates; slice navigation uses integer
+    indices (see :meth:`index_to_physical` / :meth:`physical_to_index`).
+    ``eq=False`` gives identity semantics (hashable, no voxel-wise ``__eq__``).
 
-    ``eq=False``: this is a long-lived mutable service object with identity
-    semantics, not a value. The generated ``__eq__`` would have compared
-    whole ``sitk.Image`` fields voxel by voxel and, by suppressing
-    ``__hash__``, made the state unusable as a dict key or set member.
-
-    Observer pattern:
-        Register a callback with :meth:`add_listener` and remove it with
-        :meth:`remove_listener`. Changes are broadcast via :meth:`_notify`.
+    Observable fields must be changed through their ``set_*`` method; a
+    direct assignment is redirected to it (see :meth:`__setattr__`).
 
     Event types and callback signatures:
         ``"primary_image_data_changed"``    — ``(image: sitk.Image | None)``
@@ -171,9 +134,8 @@ class SliceViewerState:
         ``"selected_roi_changed"``          — ``(roi_number: int | None)``
         ``"contour_cache_built"``           — ``(roi_number: int)``
 
-    Every event name above has a matching constant in
-    :mod:`tk_rt_viewer.events` (e.g. ``events.INDEX_CHANGED``); prefer those
-    over string literals when calling :meth:`add_listener`.
+    Use the matching constants in :mod:`tk_rt_viewer.events`
+    (e.g. ``events.INDEX_CHANGED``) rather than string literals.
     """
 
     # --- Primary image ---
@@ -186,10 +148,7 @@ class SliceViewerState:
     secondary_image_cmap: str = "gray"
 
     # --- 4DCT phases ---
-    #: Max number of resampled phase volumes kept in the LRU cache. Raising
-    #: it trades memory for faster repeat-activation of recently viewed
-    #: phases; the default keeps the current and a couple of neighbours warm
-    #: for quick back-and-forth cycling.
+    #: Max number of resampled phase volumes kept in the LRU cache.
     max_cached_phases: int = 3
 
     # --- RT-DOSE ---
@@ -224,7 +183,7 @@ class SliceViewerState:
     # --- 3-D bounding box ---
     #: Whether the volumetric bounding box is shown and accepts mouse input.
     #: Independent of :attr:`bbox_visible`; when both are on, the 3-D box
-    #: takes the mouse (see ``ViewerEventHandler.on_press``).
+    #: takes the mouse.
     bbox_3d_visible: bool = False
 
     # --- Collaborators (created in __post_init__) ---
@@ -235,7 +194,7 @@ class SliceViewerState:
     _rois: RoiManager = field(init=False, repr=False)
     _roi_editor: RoiEditor = field(init=False, repr=False)
 
-    # --- Private per-axis storage, published as read-only views ---
+    # --- Private storage, published read-only (changes must notify) ---
     _indices: dict[str, int] = field(
         init=False, repr=False, default_factory=lambda: dict.fromkeys(AXES, 0)
     )
@@ -245,36 +204,21 @@ class SliceViewerState:
     _bounding_boxes: dict[str, tuple[float, float, float, float] | None] = field(
         init=False, repr=False, default_factory=lambda: dict.fromkeys(AXES)
     )
-    #: The volumetric bounding box, published read-only as
-    #: :attr:`bounding_box_3d` for the same reason as the per-axis boxes:
-    #: assigning it directly would skip the notification listeners rely on.
     _bounding_box_3d: Box3D | None = field(init=False, repr=False, default=None)
-    #: Which ROIs are displayed, as a set of ROI numbers. Private and
-    #: published as a read-only ``frozenset`` (see the ``active_contours``
-    #: property below) for the same reason as ``_indices`` /
-    #: ``_crosshair_pos`` / ``_bounding_boxes``: handing out the live set
-    #: would let a caller mutate it in place and desynchronise this state
-    #: from its listeners without a notification (see
-    #: :meth:`set_active_contours`), and would let ``ContourOverlay.draw`` /
-    #: ``DvhPanel.update`` raise ``RuntimeError`` by iterating a set that
-    #: mutates underneath them mid-render.
     _active_contours: set[int] = field(init=False, repr=False, default_factory=set)
 
     # --- Observer ---
-    # Values are unused; a dict is used as an insertion-ordered set so that
-    # listeners fire in a deterministic, registration order.
+    # Dicts used as insertion-ordered sets: listeners fire in registration order
     _listeners: dict[str, dict[Callable, None]] = field(
         init=False, repr=False, default_factory=lambda: defaultdict(dict)
     )
-    # Guards _listeners. Registration happens on the main thread, but
-    # "contour_cache_built" is fired from the background contour-build pool,
-    # so the two genuinely do touch this registry concurrently. See _notify
-    # for why the lock is not held while listeners run.
+    # contour_cache_built is fired from the build pool while the main thread
+    # may (un)subscribe
     _listeners_lock: threading.Lock = field(
         init=False, repr=False, default_factory=threading.Lock
     )
 
-    # Cache for get_extent() results, keyed by axis name.
+    # get_extent() results by axis; cleared on primary image change
     _extent_cache: dict[str, tuple[float, float, float, float]] = field(
         init=False, repr=False, default_factory=dict
     )
@@ -315,9 +259,7 @@ class SliceViewerState:
                 f"Expected one of: {WINDOW_LEVEL_TARGETS}."
             )
 
-    # Every field that has a dedicated ``set_*`` method (and therefore a
-    # notification listeners rely on) is listed here, mapped to that method's
-    # name. See __setattr__ below.
+    # Observable field -> its setter; see __setattr__
     _OBSERVABLE_SETTERS: ClassVar[dict[str, str]] = {
         "blend_alpha": "set_blend_alpha",
         "secondary_image_cmap": "set_secondary_image_cmap",
@@ -329,10 +271,6 @@ class SliceViewerState:
         "crosshair_visible": "set_crosshair_visible",
         "bbox_visible": "set_bbox_visible",
         "bbox_3d_visible": "set_bbox_3d_visible",
-        # "active_contours" intentionally absent: it is now a read-only
-        # property (see below), not an assignable field. Assigning
-        # state.active_contours = ... raises AttributeError from the
-        # property itself; call set_active_contours() instead.
         "selected_roi_number": "set_selected_roi",
         "overlay_contours": "set_overlay_contours",
         "brush_tool_active": "set_brush_tool_active",
@@ -340,46 +278,20 @@ class SliceViewerState:
         "brush_fill_inside": "set_brush_fill_inside",
     }
 
-    # Observable fields whose setter takes the assigned value as separate
-    # arguments rather than as a single object (see _call_unpacked_setter).
+    # Fields whose setter takes the value unpacked (see _call_unpacked_setter)
     _UNPACKED_SETTER_FIELDS: ClassVar[frozenset[str]] = frozenset({"window_level"})
 
     def __setattr__(self, name: str, value: Any) -> None:
         """Redirect external writes to observable fields through their setter.
 
-        Assigning e.g. ``state.blend_alpha = 0.5`` directly (instead of
-        calling ``state.set_blend_alpha(0.5)``) would silently skip the
-        ``"blend_alpha_changed"`` notification, leaving listeners — and
-        therefore the on-screen rendering — out of sync with the new value.
-        Every field with a dedicated ``set_*`` method that guards a
-        notification is listed in ``_OBSERVABLE_SETTERS`` and redirected here
-        to that method.
+        ``state.blend_alpha = 0.5`` becomes ``state.set_blend_alpha(0.5)``, so
+        listeners are notified. The first write of each field (the
+        dataclass ``__init__``) passes through unchanged, as do the setters'
+        own writes, which use ``object.__setattr__``.
 
-        The very first write to an observable field is always the
-        dataclass-generated ``__init__`` assigning its default (or a
-        caller-supplied constructor argument), which must be let through
-        unredirected: no listener could be registered yet at that point
-        (there is nothing to notify), and several setters below read the
-        field's current value before deciding whether to notify, which would
-        raise ``AttributeError`` if the field did not exist yet. That first
-        write is identified cheaply by checking whether *name* is already
-        present in ``self.__dict__``.
-
-        This class's own ``set_*`` methods write their field with
-        ``object.__setattr__`` directly (bypassing this method entirely) so
-        they never re-enter themselves, and the coordinated multi-field reset
-        in :meth:`set_primary_image_data` does the same for the handful of
-        fields it resets without per-field notification — see the comment
-        there.
-
-        Fields that are *not* in ``_OBSERVABLE_SETTERS`` (e.g.
-        ``secondary_image``, ``primary_image``) never take a simple 1:1
-        ``set_<field>(value)`` shape — their setters resample images, rebuild
-        caches, or update more than one field at once — so guarding the bare
-        field name would not add real safety. Those must always be mutated
-        through their dedicated method (``set_secondary_image_data``,
-        ``set_rt_dose_image``, ``set_index``, ``add_contour``, ...), never by
-        direct assignment.
+        Image fields (``primary_image``, ``secondary_image``) are not guarded;
+        change them only through their dedicated methods
+        (``set_primary_image_data``, ``set_secondary_image_data``, ...).
         """
         setter_name = type(self)._OBSERVABLE_SETTERS.get(name)
         if setter_name is not None and name in self.__dict__:
@@ -391,29 +303,13 @@ class SliceViewerState:
         object.__setattr__(self, name, value)
 
     def _call_unpacked_setter(self, name: str, setter_name: str, value: Any) -> None:
-        """Invoke a setter that takes the assigned value as separate arguments.
+        """Invoke a setter that takes the assigned 2-tuple as two arguments.
 
-        ``window_level`` is stored as a 2-tuple but its setter takes
-        ``(window, level)``, so the assigned value has to be unpacked.
-        Unpacking blindly turns a malformed assignment such as
-        ``state.window_level = (300,)`` into an ``IndexError`` raised from
-        inside ``__setattr__``, which points nowhere near the offending line;
-        validate the shape first and report it as a ``ValueError`` naming the
-        field and what was expected.
-
-        ``str`` and ``bytes`` are rejected up front even though they are
-        sequences: ``tuple("ab")`` is a two-element sequence, so a stray
-        string assignment would otherwise pass the length check and fail much
-        later inside ``float()``.
-
-        Args:
-            name:        Name of the field being assigned.
-            setter_name: Name of the setter method to call.
-            value:       The assigned value, expected to be a 2-element
-                sequence of numbers.
+        Used for ``window_level``. Strings are rejected even though
+        ``tuple("ab")`` has two elements.
 
         Raises:
-            ValueError: If *value* is not a sequence of exactly two numbers.
+            ValueError: If *value* is not a sequence of exactly two values.
         """
         if isinstance(value, (str, bytes)):
             raise ValueError(
@@ -449,42 +345,30 @@ class SliceViewerState:
     def roi_editor(self) -> RoiEditor:
         """Contour operations (margin, boolean, smoothing, ...) by ROI number.
 
-        Bound to this state's structure set. Its methods only read, so they
-        may be called from a worker thread; adding or replacing an ROI with
-        the result goes back through :meth:`add_contour` /
-        :meth:`update_contour_properties` on the main thread.
+        Read-only, so usable from a worker thread; commit results through
+        :meth:`add_contour` / :meth:`update_contour_properties` on the main
+        thread.
         """
         return self._roi_editor
 
     @property
     def structure_set(self) -> StructureSet:
-        """The ROI container (owned by :class:`RoiManager`).
+        """The ROI container.
 
-        Read-only: it is replaced wholesale when the primary image changes,
-        and every mutation must go through this class's ROI methods so the
-        caches and notifications stay in step.
+        Replaced when the primary image changes. Mutate it only through this
+        class's ROI methods so caches and notifications stay in step.
         """
         return self._rois.structure_set
 
     @property
     def active_contours(self) -> frozenset[int]:
-        """Which ROIs are currently displayed, as a set of ROI numbers.
-
-        Read-only, and a ``frozenset`` rather than the internal mutable set:
-        callers that iterate this (``ContourOverlay.draw``, ``DvhPanel.
-        update``) would otherwise risk a ``RuntimeError`` if a listener
-        mutated it mid-render, and a caller that mutated it directly would
-        silently desynchronise this state from its listeners, since no
-        setter here would ever run to fire the notification. Change with
-        :meth:`set_active_contours`.
-        """
+        """ROI numbers currently displayed. Change with :meth:`set_active_contours`."""
         return frozenset(self._active_contours)
 
     def close(self) -> None:
         """Shut down the background contour-build thread pool permanently.
 
-        Call this once when the viewer that owns this state is destroyed. The
-        state itself has no other resources that require explicit cleanup.
+        Call once, when the state is no longer needed.
         """
         self._cache.close()
 
@@ -506,21 +390,13 @@ class SliceViewerState:
     def _notify(self, event_type: str, *args, **kwargs) -> None:
         """Call every listener registered for *event_type*.
 
-        The listener set is snapshotted under the registry lock so that
-        neither a listener that mutates the registry during iteration nor a
-        concurrent :meth:`add_listener` / :meth:`remove_listener` on another
-        thread can raise ``RuntimeError``. The lock is released before any
-        listener runs: ``contour_cache_built`` is emitted from the
-        contour-build pool while the main thread may be subscribing, but a
-        listener is free to subscribe or unsubscribe from inside its own
-        callback, and holding the lock across the calls would deadlock that.
+        The listener list is snapshotted under the lock, which is released
+        before any listener runs, so a listener may (un)subscribe without
+        deadlocking. A listener that raises is logged and does not stop the
+        others.
 
         Raises:
-            ValueError: If *event_type* is not one of the names declared in
-                :mod:`tk_rt_viewer.events`. Every call site in this class uses
-                those constants rather than string literals, so this only
-                fires for a genuinely unknown event — e.g. a typo in
-                third-party code driving the state directly.
+            ValueError: If *event_type* is not declared in :mod:`tk_rt_viewer.events`.
         """
         if event_type not in ALL_EVENTS:
             raise ValueError(
@@ -528,9 +404,7 @@ class SliceViewerState:
                 f"See tk_rt_viewer.events for the full list."
             )
         with self._listeners_lock:
-            # .get rather than the defaultdict's __getitem__: firing an event
-            # nobody listens for should not grow the registry with an empty
-            # entry.
+            # .get: do not grow the defaultdict for an event nobody listens to
             listeners = list(self._listeners.get(event_type, ()))
         for listener in listeners:
             try:
@@ -541,13 +415,6 @@ class SliceViewerState:
     # =========================================================
     # Per-axis mappings (read-only views)
     # =========================================================
-    # These three are stored privately and published as read-only views. Each
-    # has a setter that clamps or normalises the value and notifies listeners;
-    # handing out the live dictionary let callers assign into it and skip
-    # both, leaving the viewer showing one slice while the state reported
-    # another, with no event to reconcile them. Reading is unchanged —
-    # indexing, ``in``, ``len``, ``items()``, ``dict(...)`` all work; only
-    # mutation now raises.
 
     @property
     def indices(self) -> Mapping[str, int]:
@@ -614,13 +481,7 @@ class SliceViewerState:
         return float(phys_point[_AXIS_TO_XYZ_DIM[axis]])
 
     def _current_physical_point(self) -> tuple[float, float, float]:
-        """Return the physical (x, y, z) point at the current 3-axis indices.
-
-        Calling ``index_to_physical`` for each of the 3 axes individually
-        results in 3 calls to ``TransformIndexToPhysicalPoint`` on effectively
-        the same ``sitk_indices``. This does it in a single call to reduce the
-        cost on hot paths such as crosshair dragging.
-        """
+        """Return the physical (x, y, z) point at the current indices."""
         if self.primary_image is None:
             return (0.0, 0.0, 0.0)
         sitk_indices = (
@@ -663,12 +524,7 @@ class SliceViewerState:
         return slice_along_axis(arr, axis, self._indices[axis])
 
     def get_extent(self, axis: str) -> tuple[float, float, float, float]:
-        """Return ``(left, right, bottom, top)`` in physical coordinates.
-
-        Results are cached in ``_extent_cache`` to avoid repeated
-        GetSize/GetSpacing/GetOrigin calls during scrolling. The cache is
-        invalidated by ``_invalidate_extent_cache()``.
-        """
+        """Return the primary image's ``(left, right, bottom, top)`` along *axis*."""
         cached = self._extent_cache.get(axis)
         if cached is not None:
             return cached
@@ -679,23 +535,14 @@ class SliceViewerState:
         return extent
 
     def _invalidate_extent_cache(self) -> None:
-        """Clear the ``get_extent()`` result cache.
-
-        Called from ``set_primary_image_data`` whenever the primary image
-        changes.
-        """
+        """Clear the ``get_extent()`` cache after a primary image change."""
         self._extent_cache.clear()
 
     # =========================================================
     # Index manipulation
     # =========================================================
     def set_index(self, axis: str, value: int, update_crosshair: bool = True) -> None:
-        """Set the slice index for *axis* and notify listeners.
-
-        *value* is clamped to ``[0, get_max_index(axis)]`` here so that every
-        caller (scroll, keyboard, crosshair drag) shares one range-checking
-        rule instead of duplicating ``max(0, min(...))`` at each call site.
-        """
+        """Set the slice index for *axis*, clamped to its valid range, and notify."""
         clamped = int(np.clip(value, 0, self.get_max_index(axis)))
         if self._indices.get(axis) != clamped:
             self._indices[axis] = clamped
@@ -710,32 +557,19 @@ class SliceViewerState:
         self,
         image: sitk.Image,
         transform: sitk.Transform | None = None,
-        default_pixel_value: float = -2048,
+        default_pixel_value: float = DEFAULT_SECONDARY_FILL_VALUE,
     ) -> sitk.Image:
-        """Resample *image* to match the primary image geometry.
-
-        If *transform* is provided it is applied before resampling (useful for
-        4DCT phase registration). Otherwise an identity transform is used.
+        """Resample *image* onto the primary image grid (linear interpolation).
 
         Args:
-            image:     The source image to resample.
-            transform: Optional pre-registered transform. When ``None`` an
-                identity transform is assumed.
-            default_pixel_value: Value used to fill the area outside the
-                reference image. Use ``-2048`` (air-equivalent HU) for CT, or
-                ``0.0`` for RT-DOSE (Gy).
-
-        Returns:
-            A ``sitk.Image`` resampled to the primary image grid.
+            image: The source image.
+            transform: Maps primary-grid points into *image* (a registration
+                or REG transform); ``None`` for identity.
+            default_pixel_value: Fill value outside *image*. The default suits
+                CT; use ``0.0`` for dose (Gy) and most other modalities.
 
         Raises:
-            RuntimeError: If no primary image is loaded. Without this,
-                ``SetReferenceImage(None)`` fails somewhere inside SimpleITK
-                with a message that names neither this method nor the
-                caller's mistake, and the two public entry points that reach
-                here (:meth:`set_secondary_image_data` and
-                :meth:`set_active_phase_as_secondary`) disagreed on the
-                matter — the phase one already refused early.
+            RuntimeError: If no primary image is loaded.
         """
         if self.primary_image is None:
             raise RuntimeError(
@@ -768,14 +602,22 @@ class SliceViewerState:
     ) -> None:
         """Set the primary CT image and reset all derived state.
 
+        ROIs, boxes, the secondary image, phases, dose and caches are reset and
+        the indices clamped *before* the first notification, so every
+        listener sees a consistent state. Each reset field is notified once,
+        and only when its value actually changed.
+
         Event firing order:
             1. ``all_contours_changed`` (empty StructureSet)
             2. ``active_contours_changed`` (empty frozenset)
             3. ``secondary_image_data_changed`` (None)
             4. ``rt_dose_changed`` (None)
-            5. ``primary_image_data_changed`` (image)
-            Listeners for events 3 and 4 may read the new primary image
-            because it is assigned before any notification is fired.
+            5. ``index_changed`` for each axis moved to its middle slice
+            6. Only for fields that changed: ``selected_roi_changed``,
+               ``blend_alpha_changed``, ``secondary_window_level_changed``,
+               ``bounding_boxes_changed`` (per axis that had a box),
+               ``bounding_box_3d_changed``
+            7. ``primary_image_data_changed`` (image)
 
         Args:
             image:     The CT volume as a ``sitk.Image``, or ``None`` to clear.
@@ -784,13 +626,15 @@ class SliceViewerState:
         self.primary_image = image
         self.primary_image_dir = image_dir
 
-        # Reset all derived state before firing any notifications so that
-        # listeners always see a consistent state. The fields written with
-        # object.__setattr__ below are observable (see _OBSERVABLE_SETTERS);
-        # this is a coordinated multi-field reset that must not fire a
-        # per-field notification storm mid-reset (the 5 notifications in
-        # this method already cover it), so each bypasses its individual
-        # set_* method.
+        # Values before the reset, to notify only the fields that changed
+        previous_selected = self.selected_roi_number
+        previous_blend = self.blend_alpha
+        previous_secondary_wl = self.secondary_window_level
+        previous_boxes = [axis for axis in AXES if self._bounding_boxes.get(axis)]
+        previous_box_3d = self._bounding_box_3d
+
+        # object.__setattr__ bypasses the per-field setters: the reset must be
+        # complete before any listener runs
         self._rois.reset()
         self._active_contours = set()
         object.__setattr__(self, "selected_roi_number", None)
@@ -804,43 +648,11 @@ class SliceViewerState:
         self._dose.clear()
         object.__setattr__(self, "prescription_dose", None)
 
-        # Discard every performance cache and cancel in-flight background
-        # builds. This happens *before* the first notification, not after:
-        # self.primary_image already points at the new image here, while the
-        # extent cache and the array caches still describe the old one, and a
-        # listener for either event below re-renders from both
-        # (ContourOverlay.draw reads get_extent, DvhPanel.update reads the
-        # dose volume cache). Today the active set is empty by this point so
-        # nothing is actually drawn from the stale values, which makes the
-        # ordering a latent trap rather than a live bug — the comment above
-        # promises listeners a consistent state, so the code should give them
-        # one rather than depend on there being nothing to be inconsistent
-        # about.
         self._cache.clear_all()
         self._invalidate_extent_cache()
 
-        # A host application mirroring the ROI list off these two events (a
-        # listbox, a legend) would otherwise keep showing the previous
-        # image's ROIs after this reset: none of the 3 notifications later
-        # in this method names either one.
-        self._notify(ALL_CONTOURS_CHANGED, self.structure_set)
-        self._notify(ACTIVE_CONTOURS_CHANGED, frozenset())
-
-        # Clamp the slice indices to the new image's bounds *before* firing any
-        # notification, and build the array cache immediately.
-        #
-        # Listeners for secondary_image_data_changed / rt_dose_changed re-render
-        # the primary slice using self._indices as it stands at notification
-        # time. If the previous image had more slices along an axis than the new
-        # one, self._indices still held an out-of-range value here, and the plain
-        # NumPy indexing in slice_along_axis() raised IndexError. That exception
-        # propagated out of this method *before* primary_image_data_changed was
-        # notified, so the artist reset and the subsequent redraw never ran,
-        # leaving the previous image on screen while self.primary_image had
-        # already been swapped internally. Clamping here (without notifying
-        # index_changed) guarantees every index is valid for the new image by the
-        # time the first listener runs, while preserving the mid-slice jump
-        # performed by the set_index() calls below.
+        # Indices must be valid for the new image before any listener
+        # re-renders a slice (listeners of the events below do)
         if image is not None:
             self._indices = {
                 axis: int(
@@ -852,6 +664,9 @@ class SliceViewerState:
         else:
             self._indices = dict.fromkeys(AXES, 0)
 
+        # Hosts mirroring the ROI list (a listbox, a legend) need these too
+        self._notify(ALL_CONTOURS_CHANGED, self.structure_set)
+        self._notify(ACTIVE_CONTOURS_CHANGED, frozenset())
         self._notify(SECONDARY_IMAGE_DATA_CHANGED, None)
         self._notify(RT_DOSE_CHANGED, None)
 
@@ -860,6 +675,19 @@ class SliceViewerState:
             self.set_index("axial", z_dim // 2, update_crosshair=False)
             self.set_index("coronal", y_dim // 2, update_crosshair=False)
             self.set_index("sagittal", x_dim // 2, update_crosshair=False)
+
+        # Hosts mirroring these fields (a blend slider, an ROI selection)
+        # would otherwise keep showing the pre-reset values
+        if previous_selected is not None:
+            self._notify(SELECTED_ROI_CHANGED, None)
+        if previous_blend != self.blend_alpha:
+            self._notify(BLEND_ALPHA_CHANGED, self.blend_alpha)
+        if previous_secondary_wl is not None:
+            self._notify(SECONDARY_WINDOW_LEVEL_CHANGED, None)
+        for axis in previous_boxes:
+            self._notify(BOUNDING_BOXES_CHANGED, axis, None)
+        if previous_box_3d is not None:
+            self._notify(BOUNDING_BOX_3D_CHANGED, None)
 
         self._notify(PRIMARY_IMAGE_DATA_CHANGED, image)
 
@@ -874,26 +702,19 @@ class SliceViewerState:
     ) -> None:
         """Set (or clear) the secondary overlay image.
 
-        The image is kept as supplied and resampled onto the primary grid for
-        display; :attr:`secondary_source_image` returns the original and
-        :attr:`secondary_image` the resampled result. Setting ``image=None``
-        hides the overlay. When a new image is provided, :attr:`blend_alpha`
-        is set to ``0.5`` so both images are visible immediately.
-
-        The secondary window/level is *not* reset here: a host application
-        that has configured one for a given overlay modality keeps it across
-        image swaps. Call ``set_secondary_window_level(None)`` to go back to
-        following the primary window.
+        The source is kept (:attr:`secondary_source_image`) and resampled
+        onto the primary grid for display (:attr:`secondary_image`). A new
+        image sets :attr:`blend_alpha` to ``0.5`` so both are visible. The
+        secondary window is kept across image swaps; clear it with
+        ``set_secondary_window_level(None)``.
 
         Args:
-            image: Secondary ``sitk.Image`` to overlay, or ``None`` to clear.
-            transform: Transform mapping primary-grid points into *image*,
-                applied before resampling — a registration result, or a REG
-                transform for a 4DCT phase. ``None`` means identity.
-            fill_value: Value used where the transformed image does not cover
-                the primary grid. The default is air-equivalent HU; an
-                overlay on another intensity scale (PET, an MR, a dose map in
-                Gy) usually wants ``0.0``.
+            image: Secondary image to overlay, or ``None`` to clear.
+            transform: Maps primary-grid points into *image* (a registration
+                or REG transform); ``None`` for identity.
+            fill_value: Value where the transformed image does not cover the
+                primary grid. The default suits CT; PET / MR / dose overlays
+                usually want ``0.0``.
 
         Raises:
             RuntimeError: If *image* is given while no primary image is
@@ -901,10 +722,10 @@ class SliceViewerState:
                 Clearing the overlay (``image=None``) is always allowed.
         """
         self.secondary_image = self._secondary.set_source(image, transform, fill_value)
+        # Cache before set_blend_alpha, whose listeners re-render the overlay
+        self._cache.build_secondary_array(self.secondary_image)
         if image is not None:
             self.set_blend_alpha(0.5)
-        # Pre-cast once at load time to eliminate sitk round-trips during scroll.
-        self._cache.build_secondary_array(self.secondary_image)
         self._notify(SECONDARY_IMAGE_DATA_CHANGED, self.secondary_image)
 
     def set_secondary_transform(
@@ -914,21 +735,15 @@ class SliceViewerState:
     ) -> None:
         """Move the secondary overlay by re-resampling its source image.
 
-        Unlike :meth:`set_secondary_image_data` this leaves
-        :attr:`blend_alpha` alone, so an interactive registration can update
-        the overlay as often as it likes without resetting the blend the user
-        set. Does nothing when no secondary image is loaded.
-
-        Resampling a whole volume is slow enough to be worth moving off the
-        UI thread: call :meth:`resample_secondary_with` on a worker thread and
-        pass its result as *resampled*, and no resampling happens here.
+        Leaves :attr:`blend_alpha` alone. Does nothing without a secondary
+        image. To keep the UI responsive, run :meth:`resample_secondary_with`
+        on a worker thread and pass its result as *resampled*.
 
         Args:
-            transform: Transform mapping primary-grid points into the source
-                image, or ``None`` for identity.
-            resampled: The matching output of :meth:`resample_secondary_with`,
-                when already computed. The caller is responsible for it
-                corresponding to *transform*.
+            transform: Maps primary-grid points into the source image, or
+                ``None`` for identity.
+            resampled: The output of :meth:`resample_secondary_with` for
+                *transform*, when already computed.
         """
         if self._secondary.source is None:
             return
@@ -949,11 +764,10 @@ class SliceViewerState:
 
     @property
     def secondary_source_image(self) -> sitk.Image | None:
-        """The secondary image as supplied, before resampling to the primary grid.
+        """The secondary image as supplied, before resampling.
 
-        This is what a registration should be run against: it still covers
-        the parts of the overlay that fall outside the primary's field of
-        view, which :attr:`secondary_image` has already discarded.
+        Run registrations against this: it still covers what lies outside the
+        primary's field of view.
         """
         return self._secondary.source
 
@@ -963,26 +777,19 @@ class SliceViewerState:
         return self._secondary.transform
 
     def set_blend_alpha(self, alpha: float) -> None:
-        """Set the primary-image opacity for the blend slider (0.0-1.0).
+        """Set the primary-image opacity, clamped to ``[0, 1]``.
 
-        A value of ``1.0`` means only the primary image is visible; ``0.0``
-        shows only the secondary image. *alpha* is clamped to ``[0.0, 1.0]``
-        so an out-of-range caller value (e.g. a slightly overshooting drag
-        delta) can never leave ``blend_alpha`` outside the range every
-        consumer of it (the secondary LUT, the isodose fill alpha) assumes.
+        ``1.0`` shows only the primary image, ``0.0`` only the secondary.
         """
         alpha = min(1.0, max(0.0, alpha))
         if self.blend_alpha != alpha:
-            # Bypasses __setattr__'s observable-field redirect: that redirect
-            # exists so *external* writes reach this method, and this method
-            # writing its own field must not re-enter itself.
+            # object.__setattr__: setters must not re-enter __setattr__
             object.__setattr__(self, "blend_alpha", alpha)
             self._notify(BLEND_ALPHA_CHANGED, alpha)
 
     def set_secondary_image_cmap(self, cmap_name: str) -> None:
         """Change the colourmap used to display the secondary image."""
         if self.secondary_image_cmap != cmap_name:
-            # See set_blend_alpha for why object.__setattr__ is used here.
             object.__setattr__(self, "secondary_image_cmap", cmap_name)
             self._notify(SECONDARY_IMAGE_CMAP_CHANGED, cmap_name)
 
@@ -990,30 +797,20 @@ class SliceViewerState:
     # Window / level
     # =========================================================
     def set_window_level(self, window: float, level: float) -> None:
-        """Update the primary image's window width and level.
-
-        Values are kept as floats: MR percentile-derived windows and dose
-        images (Gy) legitimately need sub-integer precision, and CT integer HU
-        values are unaffected by float storage.
-        """
-        if self.window_level != (window, level):
-            object.__setattr__(self, "window_level", (float(window), float(level)))
-            self._notify(WINDOW_LEVEL_CHANGED, window, level)
+        """Update the primary image's window width and level (stored as floats)."""
+        resolved = (float(window), float(level))
+        if self.window_level != resolved:
+            object.__setattr__(self, "window_level", resolved)
+            self._notify(WINDOW_LEVEL_CHANGED, *resolved)
 
     def set_secondary_window_level(
         self, window: float | tuple[float, float] | None, level: float | None = None
     ) -> None:
         """Set the secondary image's own window, or clear the override.
 
-        The secondary image usually shares the primary's intensity scale (a
-        4DCT phase, a MAR-corrected reconstruction), and following the primary
-        window keeps a single slider meaningful for both. It just as often
-        does not — a PET fusion, an MR overlay on CT, a dose map in Gy — and
-        those need their own window, which is what this sets.
-
-        Accepts either two arguments or a single ``(window, level)`` tuple, so
-        that a value read from :attr:`secondary_window_level` can be passed
-        straight back in.
+        An overlay on another intensity scale (PET, MR, dose) needs its own
+        window; ``None`` follows the primary window again. Accepts two
+        arguments or one ``(window, level)`` pair.
 
         Args:
             window: Window width, a ``(window, level)`` pair, or ``None`` to
@@ -1045,22 +842,14 @@ class SliceViewerState:
             self._notify(SECONDARY_WINDOW_LEVEL_CHANGED, resolved)
 
     def effective_secondary_window_level(self) -> tuple[float, float]:
-        """Return the window actually used to display the secondary image.
+        """Return the window used to display the secondary image.
 
-        The secondary override when one is set, otherwise the primary window.
-        Callers should use this rather than reading
-        :attr:`secondary_window_level` directly, so the "follow the primary"
-        default is resolved in exactly one place.
+        The secondary override when set, otherwise the primary window.
         """
         return self.secondary_window_level or self.window_level
 
     def set_window_level_target(self, target: str) -> None:
-        """Choose which image a window/level *interaction* adjusts.
-
-        Both windows are always settable through their own setters; this only
-        decides where an interactive adjustment (the viewer's right-drag)
-        lands, so a host application can offer a primary/secondary toggle
-        without the viewer having to guess.
+        """Choose which image the interactive window/level drag adjusts.
 
         Args:
             target: ``"primary"`` or ``"secondary"``.
@@ -1080,10 +869,7 @@ class SliceViewerState:
     def apply_window_level_delta(
         self, target: str, window: float, level: float
     ) -> None:
-        """Set the window of *target* without the caller branching on it.
-
-        Used by the interactive window/level drag, which resolves its target
-        once at press time and then applies values on every motion event.
+        """Set the window of *target* (``"primary"`` or ``"secondary"``).
 
         Args:
             target: ``"primary"`` or ``"secondary"``.
@@ -1119,15 +905,10 @@ class SliceViewerState:
     def set_rt_dose_image(self, image: sitk.Image | None) -> None:
         """Set (or clear) the RT-DOSE volume.
 
-        The raw image is kept for slice display with the dose's own physical
-        extent, and a copy resampled to the primary image grid for DVH
-        computation (where dose values must align with ROI masks). The dose
-        array cache is rebuilt so subsequent slice updates read a pre-cast
-        NumPy view instead of converting from sitk on every frame.
-
-        When *image* is provided, :attr:`blend_alpha` is set to ``0.5`` so
-        that the IsoDose fill (alpha = (1 - blend_alpha) * 0.4) is visible
-        immediately without requiring manual slider adjustment.
+        The dose is kept on its own grid and resampled onto the primary grid
+        for the isodose overlay and the DVH. With a primary image loaded,
+        :attr:`blend_alpha` is set to ``0.5`` so the isodose fill (whose
+        opacity follows the blend) is visible immediately.
 
         Args:
             image: LPS-oriented RT-DOSE ``sitk.Image``, or ``None`` to clear.
@@ -1138,11 +919,7 @@ class SliceViewerState:
         self._notify(RT_DOSE_CHANGED, image)
 
     def get_dose_fallback_ref_gy(self) -> float | None:
-        """Return the Dmax used as the IsoDose reference when no prescription is set.
-
-        Returns the value computed once at :meth:`set_rt_dose_image` time, so
-        this call is constant-time.
-        """
+        """Return the Dmax used as the isodose reference when no prescription is set."""
         return self._dose.fallback_ref_gy
 
     def set_prescription_dose(self, dose_gy: float | None) -> None:
@@ -1161,18 +938,12 @@ class SliceViewerState:
         return self._dose.get_extent(axis)
 
     def get_dose_slice(self, axis: str) -> np.ndarray:
-        """Extract the dose 2-D slice closest to the current CT slice position.
+        """Return the slice of the dose's **own** grid nearest the current CT slice.
 
-        The slice lies on the dose volume's **own** grid (not the primary
-        CT grid), so it pairs with :meth:`get_dose_extent` — not with
-        :meth:`get_extent`. Use :meth:`get_dose_slice_cached` instead when
-        the slice has to line up with the CT grid (ROI masks, the isodose
-        overlay, DVH computation).
-
-        Returns an empty array when the CT slice lies outside the dose volume.
-        The returned array is a zero-copy view into the dose image, valid only
-        as long as this state keeps that image alive; callers that need to
-        retain the slice beyond the current call must copy it.
+        Pairs with :meth:`get_dose_extent`, not :meth:`get_extent`; use
+        :meth:`get_dose_slice_cached` for a slice on the CT grid. Empty when
+        the CT slice lies outside the dose. A zero-copy view: copy it to keep
+        it.
         """
         if self.rt_dose_image is None:
             return np.array([])
@@ -1183,23 +954,14 @@ class SliceViewerState:
     # Slice accessors backed by the performance caches
     # =========================================================
     def get_primary_slice_cached(self, axis: str) -> np.ndarray:
-        """Return the current primary image slice from the array cache.
-
-        The returned array is a read-only view in the image's native dtype
-        (float promotion happens later in ``slice_to_rgba``). Falls back to
-        ``get_slice_data`` when the cache has not been built.
-        """
+        """Return the current primary slice (read-only view, native dtype)."""
         cached = self._cache.get_primary_slice(axis, self._indices[axis])
         if cached is None:
             return self.get_slice_data(self.primary_image, axis)
         return cached
 
     def get_secondary_slice_cached(self, axis: str) -> np.ndarray:
-        """Return the current secondary image slice from the array cache.
-
-        The returned array is a read-only view in the image's native dtype.
-        Falls back to ``get_slice_data`` when the cache has not been built.
-        """
+        """Return the current secondary slice (read-only view), or an empty array."""
         if self.secondary_image is None:
             return np.array([], dtype=np.float32)
         cached = self._cache.get_secondary_slice(axis, self._indices[axis])
@@ -1208,29 +970,11 @@ class SliceViewerState:
         return cached
 
     def get_dose_slice_cached(self, axis: str) -> np.ndarray:
-        """Return the dose 2-D slice for the current index along *axis*.
+        """Return the current dose slice on the **primary CT grid** (float32).
 
-        The returned slice lies on the **primary CT grid** (the dose
-        resampled onto it via ``DoseManager._resampled``), so it pairs with
-        :meth:`get_extent` — not with :meth:`get_dose_extent`, which
-        describes the dose volume's own grid. Use :meth:`get_dose_slice`
-        instead when a slice on the dose's own grid is wanted.
-
-        Uses the manager's dose array cache when available (avoids a
-        ``sitk`` round-trip on every frame). Deliberately does **not** fall
-        back to :meth:`get_dose_slice` when the cache is empty: that method
-        returns a slice from a different grid (a different shape and a
-        different physical extent), and every caller of this method pairs
-        the result with :meth:`get_extent`. Substituting one for the other
-        would silently stretch the dose's own grid across the CT's extent.
-        This is safe because the cache is empty only when
-        ``rt_dose_resampled`` is ``None`` (both are cleared together by
-        ``DoseManager.set_image`` / ``clear_all``), a case every caller
-        already excludes before reaching here.
-
-        Returns:
-            A 2-D ``float32`` NumPy array, or an empty array when the dose
-            volume is absent or the CT slice lies outside the dose grid.
+        Pairs with :meth:`get_extent`. Deliberately never falls back to
+        :meth:`get_dose_slice`, whose slice lies on a different grid. Empty
+        when no resampled dose exists.
         """
         cached = self._cache.get_dose_slice(axis, self._indices[axis])
         if cached is None:
@@ -1238,12 +982,7 @@ class SliceViewerState:
         return cached
 
     def get_dose_volume_cached(self) -> np.ndarray | None:
-        """Return the whole resampled dose volume as a float32 array.
-
-        Intended for whole-volume consumers such as DVH computation. Returns
-        ``None`` when the cache has not been built, so callers can fall back
-        to converting from sitk.
-        """
+        """Return the whole resampled dose volume (float32), or ``None``."""
         return self._cache.dose_array
 
     # =========================================================
@@ -1275,17 +1014,10 @@ class SliceViewerState:
     # =========================================================
     @property
     def all_phases_data(self) -> Mapping[str, Mapping[str, Any]]:
-        """The loaded 4DCT phase entries, keyed by phase name.
+        """The loaded 4DCT phase entries (read-only), keyed by phase name.
 
-        A read-only view — of the outer mapping and of each entry — onto
-        :class:`~tk_rt_viewer.state.phase_manager.PhaseManager`, so that
-        neither a reader of this property nor a ``phases_data_loaded``
-        listener can replace a phase's image or drop a phase behind the
-        resampled-volume cache's back. Build a plain ``dict`` from it when a
-        mutable copy is wanted.
-
-        The ``"sitk_image"`` in each entry is the raw image as passed to
-        :meth:`set_all_phases`, *not* resampled to the primary grid.
+        Each ``"sitk_image"`` is the raw image passed to
+        :meth:`set_all_phases`, not resampled.
         """
         return self._phases.all_phases
 
@@ -1295,21 +1027,12 @@ class SliceViewerState:
         return self._phases.current_phase
 
     def set_all_phases(self, phases_data: Mapping[str, Mapping[str, Any]]) -> None:
-        """Store all 4DCT phase images for lazy, on-demand resampling.
+        """Store all 4DCT phase images for lazy resampling.
 
-        Each entry in *phases_data* must be a mapping containing at minimum:
-
-        - ``"sitk_image"`` — the raw phase ``sitk.Image``
-        - ``"transform"`` — a ``sitk.Transform | None`` for registration
-
-        The phases are **not** resampled to the primary grid here. Each phase
-        is resampled on first activation via
-        :meth:`set_active_phase_as_secondary` and the result is kept in a small
-        LRU cache (:attr:`max_cached_phases`). This keeps peak memory
-        proportional to the number of *recently viewed* phases rather than the
-        total phase count.
-
-        Listeners are notified with ``"phases_data_loaded"``.
+        Each entry needs ``"sitk_image"`` (the raw phase) and ``"transform"``
+        (``sitk.Transform | None``). A phase is resampled on first activation
+        (:meth:`set_active_phase_as_secondary`) into an LRU cache of
+        :attr:`max_cached_phases` volumes.
         """
         if self.primary_image is None:
             logger.error("Cannot set phases: primary image not loaded.")
@@ -1319,11 +1042,7 @@ class SliceViewerState:
         self._notify(PHASES_DATA_LOADED, self.all_phases_data)
 
     def set_active_phase_as_secondary(self, phase_name: str) -> None:
-        """Activate a 4DCT phase as the secondary overlay image.
-
-        The phase is resampled to the primary grid on demand (and cached); see
-        :meth:`set_all_phases` for the lazy-resampling rationale.
-        """
+        """Activate a 4DCT phase as the secondary overlay image."""
         if not self._phases.has_phase(phase_name):
             logger.warning(f"Phase '{phase_name}' not found in loaded phases.")
             return
@@ -1336,25 +1055,15 @@ class SliceViewerState:
     # Crosshair
     # =========================================================
     def refresh_crosshair(self) -> None:
-        """Recompute the crosshair position from the current indices and notify.
+        """Recompute the crosshair position and notify even if it is unchanged.
 
-        Forces a notification even when the physical position has not changed.
-        Call this after a layout rebuild or a dose load to ensure the crosshair
-        artists are repositioned after an artist reset.
+        Used after an artist reset (layout rebuild, image load).
         """
-        # Force notification by clearing the previous position first.
         self._crosshair_pos = dict.fromkeys(AXES)
         self.update_crosshair_by_index()
 
     def update_crosshair_by_index(self) -> None:
-        """Recompute crosshair positions from current indices and notify listeners.
-
-        For coronal/sagittal views the physical z coordinate is passed directly
-        as the y data value; the display extent in the viewer already maps
-        physical z to the correct screen position without further adjustment.
-        """
-        # Hot path called on every frame while dragging the crosshair, so
-        # compute all 3 axes in a single transform call.
+        """Recompute the crosshair positions from the indices; notify on change."""
         x, y, z = self._current_physical_point()
         new_pos: dict[str, tuple[float, float] | None] = {
             "axial": (x, y),
@@ -1381,13 +1090,10 @@ class SliceViewerState:
     ) -> None:
         """Set or clear the bounding box for *axis*.
 
-        Only one bounding box can exist across all views at a time. When a
-        non-``None`` box is set for *axis*, any existing box on another axis is
-        cleared automatically.
+        Only one 2-D box exists at a time: setting one clears the others.
         """
         if self._bounding_boxes.get(axis) == bbox:
             return
-        # Clear boxes on all other axes when placing a new box.
         if bbox is not None:
             for other in AXES:
                 if other != axis and self._bounding_boxes.get(other) is not None:
@@ -1431,17 +1137,7 @@ class SliceViewerState:
     ) -> None:
         """Set the bounding box for *axis* from pixel coordinates.
 
-        Inverse of :meth:`get_bbox_pixel_coords`; converts a pixel-space box
-        back to the physical LPS bounding box stored internally, so callers do
-        not need to know which physical axis (sagittal / coronal / axial) backs
-        the x/y pixel axes for a given view.
-
-        Args:
-            axis:   View axis ("axial", "coronal", or "sagittal").
-            x_min:  Left edge in pixel indices.
-            y_min:  Top edge in pixel indices.
-            width:  Box width in pixel indices.
-            height: Box height in pixel indices.
+        Inverse of :meth:`get_bbox_pixel_coords`.
         """
         x_axis, y_axis = VIEW_TO_PIXEL_AXES[axis]
         x0_p = self.index_to_physical(x_axis, x_min)
@@ -1464,11 +1160,7 @@ class SliceViewerState:
         self._notify(BOUNDING_BOX_3D_CHANGED, box)
 
     def set_bbox_3d_visible(self, visible: bool) -> None:
-        """Show or hide the 3-D bounding box overlay.
-
-        Hiding keeps the box itself, so a host can toggle the tool off and
-        back on without the user having to draw it again.
-        """
+        """Show or hide the 3-D bounding box overlay (the box itself is kept)."""
         if self.bbox_3d_visible != visible:
             object.__setattr__(self, "bbox_3d_visible", visible)
             self._notify(BOUNDING_BOX_3D_CHANGED, self._bounding_box_3d)
@@ -1479,13 +1171,9 @@ class SliceViewerState:
         """Update the two dimensions *axis* displays from a rectangle drawn on it.
 
         *rect* is ``(x, y, width, height)`` in that view's physical
-        coordinates. The dimension perpendicular to *axis* keeps its current
-        range, or spans the whole primary image when no box exists yet — so
-        drawing on one view gives a full-depth box, and drawing on a second
-        view trims it.
-
-        Does nothing when no primary image is loaded, since there would be no
-        extent to fall back on for the third dimension.
+        coordinates. The perpendicular dimension keeps its range, or spans the
+        whole primary image when no box exists yet. No-op without a primary
+        image.
         """
         if self.primary_image is None:
             return
@@ -1495,10 +1183,7 @@ class SliceViewerState:
     def get_bbox_3d_index_bounds(
         self,
     ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
-        """Return the 3-D box as inclusive ``(x, y, z)`` voxel index bounds.
-
-        Bounds are on the primary image's grid and clamped to it, which is
-        the form a crop or a volumetric inference prompt needs.
+        """Return the 3-D box as inclusive ``(x, y, z)`` primary-grid index bounds.
 
         Raises:
             ValueError: If no 3-D box is set, or no primary image is loaded.
@@ -1514,8 +1199,7 @@ class SliceViewerState:
     ) -> None:
         """Set the 3-D box from inclusive ``(x, y, z)`` voxel index bounds.
 
-        Inverse of :meth:`get_bbox_3d_index_bounds`; lets a host restore a box
-        it stored in index space without knowing the primary image's geometry.
+        Inverse of :meth:`get_bbox_3d_index_bounds`.
 
         Raises:
             ValueError: If no primary image is loaded.
@@ -1534,19 +1218,10 @@ class SliceViewerState:
     ) -> bool:
         """Return whether *roi_number* has any voxel set on the given slice.
 
-        Answers "does the ROI the user selected appear on the slice they are
-        looking at" — the question behind enabling a per-slice editing tool,
-        or deciding whether to offer a bounding-box prompt. Reads the mask
-        slice cache, which every ROI change keeps current, so it costs no
-        resampling.
-
         Args:
-            roi_number: ROI to test; ``None`` (no selection) returns ``False``.
-            axis:       View axis the slice belongs to.
-            index:      Slice index, or ``None`` for the currently displayed one.
-
-        Returns:
-            ``True`` if the ROI has a mask with at least one set voxel there.
+            roi_number: ROI to test; ``None`` returns ``False``.
+            axis: View axis the slice belongs to.
+            index: Slice index, or ``None`` for the displayed one.
         """
         if roi_number is None:
             return False
@@ -1559,22 +1234,8 @@ class SliceViewerState:
     def set_active_contours(self, active_roi_numbers: Iterable[int]) -> None:
         """Set which ROIs are displayed.
 
-        *active_roi_numbers* is copied into a new ``set`` before being stored
-        (accepting any iterable, not just ``set[int]``, is what lets
-        :attr:`active_contours` — a ``frozenset`` — be combined with a plain
-        set via ``|`` / ``-`` and passed straight back in, as
-        :meth:`add_rt_struct_rois` / :meth:`delete_contour` do).
-        Without this, a caller that kept its own reference to the set it passed
-        in (and later mutated it in place instead of calling this method again)
-        would silently desynchronise this state from its listeners: the next
-        call here would compare the stored set against that same,
-        already-mutated object and find them equal, so the change-detection
-        check would skip the notification entirely.
-
-        Listeners receive a ``frozenset`` for the mirror-image reason: the
-        stored set is mutated by later state changes, so handing out the
-        internal object would let a listener that retains it observe the
-        active-ROI set change underneath it with no notification.
+        The input is copied, and listeners receive a ``frozenset``, so no
+        caller can change the stored set behind the state's back.
         """
         active_roi_numbers = set(active_roi_numbers)
         if self._active_contours != active_roi_numbers:
@@ -1591,8 +1252,6 @@ class SliceViewerState:
         """Enable or disable filled (semi-transparent) contour overlay."""
         if self.overlay_contours != enable:
             object.__setattr__(self, "overlay_contours", enable)
-            # Path objects remain valid; the facecolor is recomputed from
-            # to_rgba() inside ContourOverlay.draw() on every redraw.
             self._notify(OVERLAY_CONTOURS_CHANGED, enable)
 
     def add_contour(self, name: str, mask: sitk.Image, color: str) -> int:
@@ -1602,16 +1261,7 @@ class SliceViewerState:
         return roi_number
 
     def add_contours(self, rois: list[tuple[str, sitk.Image, str]]) -> list[int]:
-        """Add multiple ROIs in a single batch and fire one notification.
-
-        Loading an RT-STRUCT with many ROIs one at a time via
-        :meth:`add_contour` fires ``all_contours_changed`` — and therefore a
-        full contour redraw — after every single ROI. This method performs the
-        same per-ROI registration but defers the notification until all ROIs
-        have been added, so an N-ROI RT-STRUCT triggers one redraw instead of N.
-
-        Args:
-            rois: List of ``(name, mask, color)`` tuples.
+        """Add ``(name, mask, color)`` ROIs with a single notification.
 
         Returns:
             ROI numbers in the same order as *rois*.
@@ -1630,24 +1280,18 @@ class SliceViewerState:
     ) -> list[int]:
         """Add the ROIs returned by :func:`~tk_rt_viewer.rtstruct_io.load_rt_struct`.
 
-        Delegates the mask conversion, shape validation and name resolution to
-        :meth:`RoiManager.add_from_rt_struct`, then fires one
-        ``all_contours_changed`` (and, when activating, one
-        ``active_contours_changed``) for the whole batch instead of one per ROI.
+        Fires one ``all_contours_changed`` (and one ``active_contours_changed``
+        when activating) for the whole batch.
 
         Args:
-            rois: The mapping returned by ``load_rt_struct``. Its keys — the ROI
-                numbers from the file — are not preserved; this state assigns
-                its own, which is what the returned list reports.
-            activate: Whether to add the new ROIs to :attr:`active_contours` so
-                they are drawn immediately.
-            resolve_name_collisions: When ``True``, a name already used by an
-                existing ROI is suffixed. Pass ``False`` to keep the names
-                exactly as recorded in the file.
+            rois: The mapping returned by ``load_rt_struct``; new ROI numbers
+                are assigned.
+            activate: Add the new ROIs to :attr:`active_contours`.
+            resolve_name_collisions: Suffix names already in use; ``False``
+                keeps the names from the file.
 
         Returns:
-            The ROI numbers assigned by this state, one per entry in *rois* and
-            in its iteration order.
+            The assigned ROI numbers, in *rois*' iteration order.
 
         Raises:
             RuntimeError: If no primary image is loaded.
@@ -1664,16 +1308,13 @@ class SliceViewerState:
         return roi_numbers
 
     def delete_contour(self, roi_number: int) -> None:
-        """Remove the ROI identified by *roi_number* from the StructureSet.
-
-        Deactivation goes through :meth:`set_active_contours` rather than
-        discarding from :attr:`active_contours` in place. An in-place discard
-        mutates the very set previously handed to listeners, and fires
-        ``active_contours_changed`` even when the deleted ROI was not active;
-        routing through the setter keeps both concerns correct.
-        """
+        """Remove *roi_number*, deactivating and deselecting it if needed."""
         self._rois.remove(roi_number)
         self.set_active_contours(self.active_contours - {roi_number})
+        if self.selected_roi_number == roi_number:
+            # A selection pointing at a deleted ROI would make the brush and
+            # host UIs act on nothing
+            self.set_selected_roi(None)
         self._notify(ALL_CONTOURS_CHANGED, self.structure_set)
 
     def update_contour_properties(self, roi_number: int, props: dict[str, Any]) -> None:
@@ -1682,12 +1323,7 @@ class SliceViewerState:
         self._notify(ALL_CONTOURS_CHANGED, self.structure_set)
 
     def refresh_contours(self) -> None:
-        """Force a contour redraw and DVH update without modifying any mask.
-
-        Call this when leaving the edit tab so that brush-painted changes are
-        reflected in the DVH even if no ``update_contour_properties`` was
-        issued.
-        """
+        """Fire ``all_contours_changed`` without changing any mask (forces a redraw)."""
         self._notify(ALL_CONTOURS_CHANGED, self.structure_set)
 
     # =========================================================
@@ -1700,14 +1336,7 @@ class SliceViewerState:
             self._notify(BRUSH_TOOL_ACTIVE_CHANGED, is_active)
 
     def set_brush_size_mm(self, size_mm: float) -> None:
-        """Set the brush radius in millimetres.
-
-        Clamped to at least :data:`MIN_BRUSH_SIZE_MM`: the brush converts its
-        radius to pixels and divides by it when interpolating between two
-        motion events, so a zero or negative radius raises from inside the
-        stroke rather than simply painting nothing. Clamping here means every
-        consumer can assume a positive radius.
-        """
+        """Set the brush radius in mm, clamped to at least :data:`MIN_BRUSH_SIZE_MM`."""
         size_mm = max(MIN_BRUSH_SIZE_MM, float(size_mm))
         if self.brush_size_mm != size_mm:
             object.__setattr__(self, "brush_size_mm", size_mm)

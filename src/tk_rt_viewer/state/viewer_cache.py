@@ -1,19 +1,15 @@
-"""viewer_cache.py — Performance-cache collaborators for SliceViewerState.
+"""viewer_cache.py — Performance caches for SliceViewerState.
 
-These caches are not part of the viewer's logical state; they exist purely
-to keep scrolling and redraws cheap by avoiding repeated ``sitk`` round-trips
-and ``find_contours`` calls. They are grouped here (rather than living inside
-``SliceViewerState``) so that the state class stays focused on observable
-logical state.
+Not part of the logical state: these only keep scrolling cheap by avoiding
+repeated ``sitk`` round-trips and ``find_contours`` calls.
 
-Contained classes:
-    - ContourPathCache: per-slice matplotlib ``Path`` cache.
+    - ContourPathCache: per-slice Matplotlib ``Path`` cache.
     - MaskSliceCache: per-ROI 3-D mask volume cache.
-    - ViewerCacheManager: owns the image/dose array caches and drives the
-      background contour-path build (thread pool + in-flight futures).
+    - ViewerCacheManager: owns the image / dose array views and the
+      background contour-path build.
 
-Thread-safety notes for the background contour build are documented on
-:meth:`ViewerCacheManager.build_contour_paths_for_roi`.
+Threading: the background build pool and the UI thread both read and write
+the two ROI caches, so both are internally locked.
 """
 
 import logging
@@ -37,54 +33,28 @@ logger = logging.getLogger(__name__)
 class ContourPathCache:
     """Per-slice contour path cache keyed by (roi_number, axis, slice_index).
 
-    Paths are computed by ``find_contours`` and stored here so that
-    revisiting the same slice avoids re-computation.
-
-    Invalidation rules:
-        - :meth:`invalidate_roi` removes every entry for a single ROI.
-          Call this when a mask is modified via the brush tool or an ROI
-          operation.
-        - :meth:`clear` removes all entries.
-          Call this when the primary image or the entire structure set is
-          replaced.
+    Invalidation:
+        - :meth:`invalidate_roi` after a mask edit.
+        - :meth:`clear` when the primary image or structure set is replaced.
 
     Epochs:
-        Either invalidation can happen while a background build for that ROI
-        is still running, and a build cannot be interrupted mid-flight. Each
-        ROI therefore carries an *epoch*, a number drawn from a
-        monotonically increasing counter and issued afresh the first time the
-        ROI is seen after an invalidation. A writer that passes the epoch it
-        started from (see
-        :meth:`ViewerCacheManager.build_contour_paths_for_roi`) has its write
-        dropped once that epoch is no longer current, so paths computed
-        against a mask or a reference geometry that has since been replaced
-        cannot land in the cache. The counter is never reset, so an epoch is
-        never reissued — which matters because ROI numbers *are* reused:
-        loading a new image restarts them at 1, and a plain per-ROI
-        "changed?" flag would let a build from the previous image's ROI 1
-        write into the new one's.
+        A background build cannot be interrupted, so each ROI carries an
+        *epoch* from a never-reset counter, reissued after every
+        invalidation. A background writer passes the epoch it started from
+        and its write is dropped once that epoch is stale. Because epochs are
+        never reused, a build for the previous image's ROI 1 cannot write into
+        the new image's ROI 1 (ROI numbers restart per image).
 
     Thread safety:
-        Every method takes a lock. Writes come from two directions at once —
-        the background contour-build pool pre-computes whole ROIs while the
-        UI thread stores paths for slices it renders before the build reaches
-        them (see :meth:`ContourOverlay.draw`) — so the two do write the same
-        ROI concurrently. The individual dict operations are atomic under the
-        GIL, but ``setdefault`` followed by an item assignment is not: two
-        threads adding the first entry for the same ROI can each create a
-        nested dict, and one of the two writes is then dropped. The lost entry
-        is only recomputed rather than corrupting anything, but the lock costs
-        nothing measurable next to ``find_contours`` and removes the need to
-        reason about it at all.
+        Every method takes a lock; the build pool and the UI thread
+        (:meth:`ContourOverlay.draw`) write the same ROI concurrently.
     """
 
     def __init__(self) -> None:
-        # { roi_number: { (axis, slice_index): list[matplotlib.path.Path] } }
-        # Nested per-ROI so invalidate_roi is O(1) (a flat dict required
-        # a full key scan).
+        # { roi_number: { (axis, slice_index): list[Path] } }, nested so
+        # invalidate_roi is O(1)
         self._cache: dict[int, dict[tuple[str, int], list]] = {}
-        # { roi_number: epoch }. Dropped alongside the entries themselves, so
-        # the next lookup issues a fresh epoch from the counter below.
+        # { roi_number: epoch }; dropped on invalidation, reissued on next use
         self._epochs: dict[int, int] = {}
         self._next_epoch: int = 0
         self._lock = threading.Lock()
@@ -133,13 +103,10 @@ class ContourPathCache:
             axis:       View axis.
             index:      Slice index along *axis*.
             paths:      The computed paths.
-            epoch:      The epoch the caller started from, when it is a
-                background build that may have been overtaken by an
-                invalidation. The write is dropped when that epoch is no
-                longer current. ``None`` (the default) writes
-                unconditionally, which is what the UI thread wants: it
-                computes from the mask as it stands and stores it in the same
-                breath, so there is no window for it to be stale in.
+            epoch:      The epoch a background build started from; the write is
+                dropped when it is no longer current. ``None`` writes
+                unconditionally (UI thread, which computes from the current
+                mask).
         """
         with self._lock:
             if epoch is not None and epoch != self._epoch_locked(roi_number):
@@ -169,28 +136,13 @@ class ContourPathCache:
 class MaskSliceCache:
     """Per-ROI cache of 3-D NumPy mask volumes for fast slice retrieval.
 
-    Stores each ROI mask as a NumPy array so that scroll updates can index
-    directly into the array instead of calling ``sitk.GetArrayViewFromImage``
-    and recomputing indices on every frame.
-
-    Call :meth:`invalidate_roi` when a mask is updated.
-    Call :meth:`clear` when the entire structure set is replaced.
+    Call :meth:`invalidate_roi` when a mask is updated and :meth:`clear` when
+    the structure set is replaced.
 
     Thread safety:
-        Locked for the same reason as :class:`ContourPathCache`: the
-        background contour-build pool reads a registered volume
-        (:meth:`get_volume`, via
-        :meth:`ViewerCacheManager.build_contour_paths_for_roi`) while the UI
-        thread can concurrently register a new one
-        (:meth:`ViewerCacheManager.register_mask_volume`, called from
-        :meth:`~tk_rt_viewer.state.roi_manager.RoiManager.update` on every
-        brush-stroke commit) or invalidate/clear the cache outright. Every
-        access here touches two dicts (``_volumes`` and ``_backers``)
-        rather than one; without a lock, a reader could observe one updated
-        and the other still stale (e.g. a new volume registered but its
-        backer not yet set), where the whole-cache invariant this class
-        keeps — every volume has a matching backer reference, or none at
-        all — briefly does not hold from another thread's point of view.
+        Locked: the build pool reads volumes while the UI thread registers or
+        invalidates them, and each operation touches two dicts
+        (``_volumes`` and ``_backers``) that must stay consistent.
 
     Example::
 
@@ -202,21 +154,10 @@ class MaskSliceCache:
     def __init__(self) -> None:
         # { roi_number: ndarray(z, y, x) }
         self._volumes: dict[int, np.ndarray] = {}
-        # { roi_number: object }. Holds a strong reference to whatever owns
-        # the buffer a zero-copy view points into (e.g. the sitk.Image), so
-        # the view's backing storage is never garbage-collected while the
-        # view is cached, even if no other reference to that owner
-        # survives. Without this, caching a view of a temporary sitk.Image
-        # would leave a dangling view once the temporary is
-        # garbage-collected (silent data corruption).
-        #
-        # This only protects against GC: it assumes the backing sitk.Image
-        # is never mutated in place after being registered here. An
-        # in-place edit that triggers a reallocation (e.g. via a
-        # copy-on-write path) would leave the cached view pointing at the
-        # old buffer without any error. Callers must treat a registered
-        # image as immutable and go through invalidate_roi/set_volume with
-        # a fresh image instead of mutating the one already cached.
+        # { roi_number: owner of a zero-copy view's buffer (e.g. the
+        # sitk.Image) }. Keeps the buffer alive while the view is cached.
+        # Registered images must be treated as immutable: replace them via
+        # set_volume instead of editing them in place.
         self._backers: dict[int, object] = {}
         self._lock = threading.Lock()
 
@@ -227,11 +168,9 @@ class MaskSliceCache:
 
         Args:
             roi_number: ROI number assigned by StructureSet.
-            arr:        NumPy array in (z, y, x) order. uint8 is recommended.
-            backer:     Optional object that owns *arr*'s underlying buffer
-                when *arr* is a zero-copy view (e.g. the source sitk.Image).
-                A strong reference is kept so the view stays valid; pass
-                ``None`` for arrays that own their own data.
+            arr:        Array in (z, y, x) order; uint8 is recommended.
+            backer:     Owner of *arr*'s buffer when *arr* is a zero-copy view
+                (e.g. the source sitk.Image); ``None`` for an owning array.
         """
         with self._lock:
             self._volumes[roi_number] = arr
@@ -248,22 +187,13 @@ class MaskSliceCache:
     def get_slice(self, roi_number: int, axis: str, index: int) -> np.ndarray | None:
         """Return the 2-D slice at *index* along *axis*, or ``None`` if not cached.
 
-        Args:
-            roi_number: ROI number.
-            axis:       One of ``"axial"``, ``"coronal"``, or ``"sagittal"``.
-            index:      Slice index along the given axis.
-
-        Returns:
-            2-D NumPy array, or None when the entry is absent or *index* is
-            out of range.
+        An explicit range check rejects negative indices, which NumPy would
+        otherwise wrap around.
         """
         with self._lock:
             arr = self._volumes.get(roi_number)
         if arr is None:
             return None
-        # NumPy allows negative indices (wrap-around), so an explicit range
-        # check is required here; a bare IndexError catch would silently
-        # accept negative values and return the slice from the opposite end.
         dim = _AXIS_TO_NUMPY_DIM[axis]
         if index < 0 or index >= arr.shape[dim]:
             return None
@@ -290,29 +220,16 @@ class MaskSliceCache:
 # ViewerCacheManager
 # ---------------------------------------------------------------------------
 class ViewerCacheManager:
-    """Collaborator that owns every performance cache used by SliceViewerState.
+    """Owns every performance cache used by SliceViewerState.
 
-    Holds and manages:
-        - float32 array caches for the primary / secondary images
-        - a float32 array cache for the resampled RT-DOSE volume
-        - the ROI contour path cache (:class:`ContourPathCache`) and mask
-          volume cache (:class:`MaskSliceCache`)
-        - the thread pool and in-flight futures for background contour-path
-          builds
-
-    When a background contour build completes, the ``on_contour_built``
-    callback supplied to the constructor is invoked. ``SliceViewerState``
-    binds this to its ``"contour_cache_built"`` event, keeping cache
-    management decoupled from the state class (dependency injection).
-
-    See :meth:`build_contour_paths_for_roi` for thread-safety notes.
+    Holds zero-copy array views of the primary / secondary images and the
+    resampled dose, the ROI caches (:class:`ContourPathCache`,
+    :class:`MaskSliceCache`), and the thread pool for background
+    contour-path builds. ``on_contour_built`` is called (from a worker
+    thread) whenever a build finishes.
     """
 
-    #: Default number of worker threads for the background contour-path
-    #: build pool. Overridable per instance via the ``max_workers``
-    #: constructor argument (e.g. to trade CPU headroom for faster
-    #: multi-ROI RT-STRUCT loads on a machine with more cores, or to
-    #: reduce it on a constrained deployment).
+    #: Default worker count of the background contour-build pool.
     _DEFAULT_CONTOUR_WORKERS: int = 8
 
     def __init__(
@@ -323,23 +240,17 @@ class ViewerCacheManager:
         """Initialise the manager.
 
         Args:
-            on_contour_built: Callback receiving the roi_number whose contour
-                paths finished building. Invoked from a background thread.
-            max_workers: Number of worker threads for the background
-                contour-path build pool (see :meth:`_get_executor`).
+            on_contour_built: Called with the ROI number whose contour paths
+                finished building, from a background thread.
+            max_workers: Worker threads of the contour-build pool.
         """
         self._on_contour_built = on_contour_built
         self._max_workers = max_workers
 
         self.primary_array: np.ndarray | None = None
         self.secondary_array: np.ndarray | None = None
-        # Pre-cast float32 view of the resampled dose volume (shared by all axes).
         self.dose_array: np.ndarray | None = None
-        # Strong references to the sitk.Images the array views above point
-        # into, so the caller dropping its own reference to the image can
-        # never GC the buffer out from under a cached view. As with
-        # MaskSliceCache's backers, this assumes the registered image is
-        # not mutated in place afterwards.
+        # Owners of the buffers the views above point into (see MaskSliceCache)
         self._primary_backer: sitk.Image | None = None
         self._secondary_backer: sitk.Image | None = None
         self._dose_backer: sitk.Image | None = None
@@ -348,37 +259,20 @@ class ViewerCacheManager:
         self.mask_slice_cache = MaskSliceCache()
 
         self._contour_executor: ThreadPoolExecutor | None = None
-        # In-flight background build futures keyed by roi_number. Written
-        # from both the pool thread (schedule_contour_build's _on_done
-        # callback) and the UI thread (cancel_contour_build,
-        # cancel_all_contour_builds, clear_all), so every access is
-        # guarded by _futures_lock. This mirrors the locking already
-        # applied to ContourPathCache; see that class's docstring for the
-        # concurrent-writer argument, which applies here identically.
+        # In-flight builds by ROI number; touched by pool and UI threads
         self._contour_futures: dict[int, Future] = {}
         self._futures_lock = threading.Lock()
-        # Set by close(); guards against schedule_contour_build silently
-        # recreating a new executor (and leaking a thread pool that is
-        # never closed) after the manager has been torn down.
+        # Set by close(); prevents a new pool being created afterwards
         self._closed: bool = False
 
     # ------------------------------------------------------------------
     # Image / dose array caches
     # ------------------------------------------------------------------
     def build_primary_array(self, primary_image: sitk.Image | None) -> None:
-        """Cache a zero-copy NumPy view of the primary CT image.
+        """Cache a zero-copy, read-only view of the primary image.
 
-        ``GetArrayViewFromImage`` returns a read-only view that shares the
-        sitk buffer, so no volume-sized copy is made here (a 512x512x200
-        int16 CT would otherwise cost ~100 MB, and casting the whole volume
-        to float32 up front ~200 MB). Per-slice float promotion happens
-        cheaply inside ``slice_to_rgba`` when a frame is rendered (measured
-        <0.1 ms per 512x512 slice), so keeping the volume in its native
-        dtype trades a negligible per-frame cost for a large standing
-        memory saving.
-
-        The view is kept read-only; callers that need to mutate a slice
-        must copy it first.
+        The native dtype is kept; per-slice float promotion happens in
+        ``slice_to_rgba`` at negligible cost, avoiding a volume-sized copy.
         """
         if primary_image is None:
             self.primary_array = None
@@ -389,11 +283,7 @@ class ViewerCacheManager:
         logger.info(f"Primary array view cached: shape={self.primary_array.shape}.")
 
     def build_secondary_array(self, secondary_image: sitk.Image | None) -> None:
-        """Cache a zero-copy NumPy view of the secondary image.
-
-        Like :meth:`build_primary_array`, this avoids a volume-sized copy;
-        see that method for the rationale.
-        """
+        """Cache a zero-copy, read-only view of the secondary image."""
         if secondary_image is None:
             self.secondary_array = None
             self._secondary_backer = None
@@ -403,16 +293,10 @@ class ViewerCacheManager:
         logger.info(f"Secondary array view cached: shape={self.secondary_array.shape}.")
 
     def build_dose_array(self, dose_resampled: sitk.Image | None) -> None:
-        """Cache a zero-copy float32 NumPy view of the resampled dose volume.
+        """Cache a float32 view of the dose resampled onto the primary grid.
 
-        *dose_resampled* is the dose already resampled onto the primary
-        grid (``GetArrayViewFromImage`` returns (z, y, x) order); it is
-        typically float64 after Gy scaling. It is cast to float32 here if
-        needed (float32 has ample precision for display and DVH and halves
-        the resampled volume's footprint), and the resulting image — the
-        cast when one was needed, otherwise *dose_resampled* itself — is
-        kept as the view's backer. Clears the cache when no resampled dose
-        is available.
+        A non-float32 volume is cast once (ample precision for display and
+        DVH). ``None`` clears the cache.
         """
         if dose_resampled is None:
             self.dose_array = None
@@ -458,23 +342,13 @@ class ViewerCacheManager:
     # ROI mask / contour path caches
     # ------------------------------------------------------------------
     def register_mask_volume(self, roi_number: int, mask: sitk.Image) -> None:
-        """Register a zero-copy view of *mask* in MaskSliceCache.
+        """Register a zero-copy view of *mask* in the mask cache.
 
-        ``GetArrayViewFromImage`` shares the sitk buffer, so no per-ROI
-        volume-sized copy is made (previously each ROI was duplicated: the
-        sitk.Image in StructureSet plus a full uint8 copy here — ~50 MB per
-        ROI for a 512x512x200 grid, i.e. ~1 GB across 20 ROIs).
-
-        The *mask* image is passed to the cache as the view's backer, so the
-        cache itself keeps the buffer alive for as long as the view is
-        cached. The view therefore stays valid regardless of whether any
-        other reference to *mask* survives, removing the fragile lifetime
-        coupling a bare view would otherwise have.
+        *mask* is kept as the view's backer. A non-uint8 mask is cast to an
+        owning uint8 copy instead.
         """
         arr = sitk.GetArrayViewFromImage(mask)
         if arr.dtype != np.uint8:
-            # Non-uint8 masks are rare, but a cast produces an owning copy;
-            # in that case there is no shared buffer to keep alive.
             owning = arr.astype(np.uint8)
             self.mask_slice_cache.set_volume(roi_number, owning, backer=None)
         else:
@@ -495,9 +369,7 @@ class ViewerCacheManager:
     def clear_all(self) -> None:
         """Discard every cache and cancel all in-flight background builds.
 
-        Call this when the state is fully reset, e.g. on image switch.
-        The thread pool itself is kept alive; use :meth:`close` to shut it
-        down permanently.
+        Called on image switch. The thread pool stays alive; see :meth:`close`.
         """
         self.cancel_all_contour_builds()
         self.primary_array = None
@@ -510,14 +382,10 @@ class ViewerCacheManager:
         self.mask_slice_cache.clear()
 
     def close(self) -> None:
-        """Cancel in-flight builds and shut down the background thread pool.
+        """Cancel in-flight builds and shut down the thread pool permanently.
 
-        Call this exactly once, when the owning ``SliceViewerState`` (and its
-        viewer) is being torn down permanently. After this call the manager
-        must not be used again: :meth:`schedule_contour_build` checks
-        :attr:`_closed` and raises instead of silently recreating a new
-        executor, which would otherwise leak a thread pool that is never
-        closed.
+        Scheduling a build afterwards raises instead of silently creating a
+        pool that would never be shut down.
         """
         self.cancel_all_contour_builds()
         self._closed = True
@@ -532,8 +400,7 @@ class ViewerCacheManager:
         """Return the thread pool used for contour path builds (created lazily).
 
         Raises:
-            RuntimeError: If called after :meth:`close`. See that method's
-                docstring for why this is not simply a no-op.
+            RuntimeError: If called after :meth:`close`.
         """
         if self._closed:
             raise RuntimeError(
@@ -549,14 +416,10 @@ class ViewerCacheManager:
     def schedule_contour_build(
         self, roi_number: int, primary_image: sitk.Image | None
     ) -> None:
-        """Pre-compute contour paths for all slices of *roi_number* in the background.
+        """Pre-compute contour paths for every slice of *roi_number* in the background.
 
-        Any existing in-flight task is cancelled before the new one is
-        submitted. On completion the ``on_contour_built`` callback fires so
-        the viewer can issue a redraw request.
-
-        See :meth:`build_contour_paths_for_roi` for the thread-safety
-        argument covering its unlocked writes into ``contour_path_cache``.
+        Any in-flight task for the ROI is cancelled first; ``on_contour_built``
+        fires on completion.
         """
         self.cancel_contour_build(roi_number)
         epoch = self.contour_path_cache.epoch(roi_number)
@@ -568,11 +431,8 @@ class ViewerCacheManager:
             self._contour_futures[roi_number] = future
 
         def _on_done(f: Future) -> None:
-            # Ignore this as a stale completion notification if the future
-            # currently tracked for this ROI is a different object (the task
-            # was replaced by a re-invocation of schedule_contour_build, or
-            # by cancel_contour_build). Checking cancelled() alone would not
-            # catch a task that was replaced while still running.
+            # Stale if the tracked future is no longer this one (replaced or
+            # cancelled while running, which cancelled() alone cannot detect)
             with self._futures_lock:
                 if self._contour_futures.get(roi_number) is not f:
                     return
@@ -591,10 +451,8 @@ class ViewerCacheManager:
     def cancel_contour_build(self, roi_number: int) -> None:
         """Cancel the pending build task for *roi_number*, if any.
 
-        Queued but not-yet-started tasks are cancelled immediately.
-        Already-running tasks cannot be interrupted, but their ``_on_done``
-        callback will not emit a notification because ``cancelled()`` returns
-        ``False`` and the Future is no longer tracked.
+        A running task cannot be interrupted, but it is untracked here so its
+        completion is not reported.
         """
         with self._futures_lock:
             future = self._contour_futures.pop(roi_number, None)
@@ -612,33 +470,18 @@ class ViewerCacheManager:
     def build_contour_paths_for_roi(
         self, roi_number: int, primary_image: sitk.Image | None, epoch: int
     ) -> None:
-        """Run ``find_contours`` for every axis and slice of *roi_number*.
+        """Compute contour paths for every axis and slice of *roi_number*.
 
-        This is the contour counterpart of the dose array cache for RT-DOSE.
-        Running it on a background thread at load time ensures that
-        ``find_contours`` is never called during scrolling.
+        Runs on a worker thread so ``find_contours`` never runs while
+        scrolling.
 
         Args:
             roi_number: Target ROI number.
-            primary_image: Reference image used to derive the physical
-                coordinate extent of the contours.
-            epoch: The ROI's cache epoch when this task was scheduled (see
-                :class:`ContourPathCache`). An invalidation while this task
-                runs — an image switch, a brush-stroke commit — retires that
-                epoch, and every write below is then dropped. The loop also
-                checks it between slices so a superseded build stops doing
-                work rather than merely discarding it; the checks are an
-                optimisation, and correctness rests on the epoch being
-                re-tested inside ``ContourPathCache.set`` under its own lock,
-                which closes the window between a check here and the write
-                that follows it.
-
-        Thread safety: ``contour_path_cache`` is internally locked, which is
-        what makes the unsynchronised interleaving here safe. The UI thread
-        does write the same ROI concurrently — ``ContourOverlay.draw`` stores
-        the paths for any slice it renders before this build reaches it — so
-        the two are genuinely concurrent writers, not merely potentially so.
-        See :class:`ContourPathCache` for the failure mode the lock removes.
+            primary_image: Reference image defining the physical extent.
+            epoch: The ROI's cache epoch when this task was scheduled. Writes
+                are dropped by ``ContourPathCache.set`` (under its lock) once
+                the epoch is stale; the checks in the loop below only stop
+                superseded work early.
         """
         if primary_image is None:
             return
@@ -647,13 +490,8 @@ class ViewerCacheManager:
         if arr is None:
             return
 
-        # A typical ROI occupies a small fraction of the volume, so most
-        # slices along each axis are empty. Projecting the mask onto each
-        # axis up front (cheap: one any() reduction per axis) lets us skip
-        # find_contours entirely for empty slices, which dominate the count.
-        # Empty slices still get an explicit empty-path entry so the cache
-        # is complete and lookups never miss. Measured ~3x faster build on
-        # a compact ROI in a 512x512x200 volume.
+        # Most slices of a typical ROI are empty: project the mask per axis so
+        # those get an empty entry without calling find_contours
         nonzero_indices: dict[str, np.ndarray] = {
             "axial": np.asarray(arr.any(axis=(1, 2))),
             "coronal": np.asarray(arr.any(axis=(0, 2))),
@@ -676,9 +514,7 @@ class ViewerCacheManager:
                 if cache.get(roi_number, axis, idx) is not None:
                     continue
 
-                # Empty slice: store an empty path list without calling
-                # find_contours. ``idx`` can exceed len(occupied) only if the
-                # mask and reference geometry disagree; treat as empty.
+                # idx beyond `occupied` means mask and geometry disagree: empty
                 if idx >= occupied.shape[0] or not occupied[idx]:
                     cache.set(roi_number, axis, idx, [], epoch=epoch)
                     continue

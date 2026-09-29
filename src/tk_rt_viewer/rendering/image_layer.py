@@ -1,16 +1,9 @@
 """image_layer.py — Primary / secondary base-image artists for each view.
 
-The base image is the one artist redrawn on *every* blit frame, so its update
-path is the hottest code in the viewer and the most sensitive to detail:
-window/level is applied through a NumPy LUT into a reused RGBA buffer, the
-extent is only written when it actually changes, and visibility toggles are
-reported so the blit-artist list is not rebuilt for nothing.
-
-:class:`ImageLayer` owns that path — the two ``AxesImage`` artists per view,
-their reusable buffers, and the secondary colour lookup table — so
-``DicomViewer`` is left wiring collaborators rather than compositing pixels.
-It takes the state and two callbacks at construction and never touches the
-viewer.
+The base image is redrawn on every blit frame, so this is the hottest path in
+the viewer: window/level goes through a NumPy LUT into a reused RGBA buffer,
+the extent is written only when it changes, and only real visibility changes
+invalidate the blit-artist list.
 """
 
 import logging
@@ -33,18 +26,11 @@ logger = logging.getLogger(__name__)
 class ImageLayer:
     """Owns and updates the primary / secondary image artists for all axes.
 
-    Blit integration: the artists created here live in the viewer's blit
-    layer. ``on_artists_changed`` fires when an artist is created or its
-    visibility changes; a pure data update keeps the cached blit list valid
-    and does not fire it.
-
     Args:
-        state: The shared viewer state. Read-only access: cached slices,
-            extents, window/level and the secondary colourmap.
-        on_artists_changed: Called with the axis name whenever the artist
-            composition for that axis changes.
-        request_redraw: Called with the axis name when the axis needs to be
-            blitted, e.g. after the slice data has been replaced.
+        state: The shared viewer state (read only).
+        on_artists_changed: Called with an axis name when an artist is
+            created or its visibility changes (not on data updates).
+        request_redraw: Called with an axis name when it needs a blit.
     """
 
     def __init__(
@@ -59,10 +45,7 @@ class ImageLayer:
 
         self._primary: dict[str, AxesImage | None] = dict.fromkeys(AXES)
         self._secondary: dict[str, AxesImage | None] = dict.fromkeys(AXES)
-        # Reused (H, W, 4) uint8 RGBA buffers, one per axis per layer, so
-        # slice_to_rgba does not allocate a fresh buffer on every scroll /
-        # window-level / crosshair-drag frame. Cleared on image switch (the
-        # slice shape changes) so a stale-shaped buffer is never reused.
+        # Reused RGBA buffers per axis and layer; cleared on reset()
         self._primary_buffers: dict[str, np.ndarray | None] = dict.fromkeys(AXES)
         self._secondary_buffers: dict[str, np.ndarray | None] = dict.fromkeys(AXES)
         self._secondary_lut = self._build_secondary_lut()
@@ -90,13 +73,7 @@ class ImageLayer:
         return artists
 
     def reset(self) -> None:
-        """Drop every artist reference and reusable buffer.
-
-        Call this after ``Axes.clear()`` or a layout rebuild: the artists are
-        already detached from their Axes, so only the references are released.
-        The buffers go too, because the new image's slices may have a
-        different shape.
-        """
+        """Drop every artist reference and buffer after ``Axes.clear()``."""
         self._primary = dict.fromkeys(AXES)
         self._secondary = dict.fromkeys(AXES)
         self._primary_buffers = dict.fromkeys(AXES)
@@ -113,12 +90,7 @@ class ImageLayer:
         )
 
     def rebuild_secondary_lut(self) -> None:
-        """Recreate the secondary LUT from the current cmap and blend alpha.
-
-        The alpha is baked into the table rather than set on the artist,
-        because ``Artist.set_alpha`` pushes matplotlib back onto its slower
-        per-draw compositing path.
-        """
+        """Recreate the secondary LUT from the current cmap and blend alpha."""
         self._secondary_lut = self._build_secondary_lut()
 
     # ------------------------------------------------------------------
@@ -127,11 +99,8 @@ class ImageLayer:
     def update(self, axis: str, ax: Axes) -> None:
         """Update (or create) the base-image artists for *axis*.
 
-        Both images receive pre-composed uint8 RGBA data (see render.py):
-        window/level is applied by a NumPy LUT once per slice change, and
-        matplotlib skips its Normalize + colormap pipeline on every subsequent
-        blit frame. Window/level changes therefore re-enter this method
-        instead of calling ``set_clim``.
+        Both images get pre-composed RGBA data (see :mod:`.render`), so a
+        window/level change re-enters this method rather than ``set_clim``.
         """
         state = self._state
         primary_data = state.get_primary_slice_cached(axis)
@@ -157,7 +126,6 @@ class ImageLayer:
             self._on_artists_changed(axis)
         else:
             primary.set_data(rgba)
-            # extent is stable during scrolling; update only on diff.
             if primary.get_extent() != extent:
                 primary.set_extent(extent)
 
@@ -173,8 +141,6 @@ class ImageLayer:
         if secondary is not None and secondary.get_visible():
             secondary.set_visible(False)
             self._on_artists_changed(axis)
-        # Without this, the cleared display would not reach the screen until
-        # some unrelated event happened to request a redraw of this axis.
         self._request_redraw(axis)
 
     @staticmethod
@@ -195,10 +161,8 @@ class ImageLayer:
     ) -> None:
         """Set the axis limits and aspect for a newly created view.
 
-        coronal/sagittal: increasing row index = increasing z (inferior ->
-        superior); with ``origin="lower"``, large-z (superior) naturally
-        appears at the top. axial: the y limits are inverted so anterior
-        (large y) is at the top, per radiological convention.
+        Coronal / sagittal show superior (large z) at the top. Axial inverts y
+        so anterior is at the top, per radiological convention.
         """
         if axis in ("coronal", "sagittal"):
             y_bottom, y_top = extent[2], extent[3]
@@ -217,12 +181,8 @@ class ImageLayer:
     ) -> None:
         """Create or update the secondary overlay artist for *axis*.
 
-        The secondary image is windowed with its own window/level when one is
-        set and with the primary's otherwise (see
-        ``SliceViewerState.effective_secondary_window_level``), so a fusion
-        overlay on a different intensity scale is displayable without
-        disturbing the primary window. The colormap and blend alpha are baked
-        into the LUT, so this method only pushes the data through the table.
+        Windowed with ``SliceViewerState.effective_secondary_window_level``;
+        colormap and blend alpha come from the LUT.
         """
         if secondary_data.size == 0:
             artist = self._secondary[axis]

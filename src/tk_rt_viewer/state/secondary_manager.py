@@ -1,23 +1,10 @@
 """secondary_manager.py — The secondary overlay image and its transform.
 
-The secondary image is displayed on the primary image's grid, so whatever a
-host application hands in has to be resampled onto that grid before it can be
-blended. Storing only the resampled result — what the state did before this
-manager existed — costs the host two things:
-
-- **The source is lost.** Resampling clips the overlay to the primary's field
-  of view. Anything a later transform would pull *into* view (a rigid
-  registration nudging an MR by a centimetre) has already been replaced by
-  the fill value, so moving the overlay smears its edge instead of revealing
-  what was there.
-- **Every move costs two resamples.** A host that wanted to move the overlay
-  had to resample the source itself and hand the result back in, at which
-  point the state resampled that result again through an identity transform.
-
-Keeping ``(source, transform)`` here instead makes a move one resample of the
-original data: :meth:`set_transform` re-runs it from the source, and
-:meth:`resample_with` lets a host do that work on a worker thread and pass the
-finished image back (see ``SliceViewerState.set_secondary_transform``).
+The overlay is displayed on the primary grid, but the source image is kept
+alongside its transform: moving the overlay then re-resamples the original
+data (one resample, nothing clipped away by an earlier one). A host can run
+:meth:`SecondaryManager.resample_with` on a worker thread and hand the result
+back through ``SliceViewerState.set_secondary_transform``.
 """
 
 import logging
@@ -27,8 +14,8 @@ import SimpleITK as sitk
 
 logger = logging.getLogger(__name__)
 
-#: Fill value for voxels outside the source volume. Air-equivalent HU, so the
-#: area a moved overlay uncovers reads as air rather than as water.
+#: Fill value outside the source volume. Below air HU, so the area a moved CT
+#: overlay uncovers reads as air; pass 0.0 for other intensity scales.
 DEFAULT_SECONDARY_FILL_VALUE: float = -2048.0
 
 
@@ -36,10 +23,8 @@ class SecondaryManager:
     """Store the secondary image as ``(source, transform)`` and resample it.
 
     Args:
-        resample: Callable resampling an image onto the primary grid, given a
-            transform and a fill value. Injected (rather than reached for
-            through a back-reference to the state) so this manager needs to
-            know nothing about the state that owns it.
+        resample: Resamples ``(image, transform, fill_value)`` onto the
+            primary grid.
     """
 
     def __init__(
@@ -123,9 +108,8 @@ class SecondaryManager:
     def resample_with(self, transform: sitk.Transform | None) -> sitk.Image:
         """Resample the stored source through *transform* onto the primary grid.
 
-        Pure with respect to this manager: it reads the source but writes
-        nothing, so a host may call it from a worker thread and apply the
-        result later through :meth:`set_transform`.
+        Writes nothing, so it may run on a worker thread; apply the result
+        with :meth:`set_transform`.
 
         Raises:
             ValueError: If no source image is set.
