@@ -40,7 +40,7 @@ Submodule API (import from the submodule)
     validate_dicom_files, find_reg_matrices, scan_dicom_series,
     load_scanned_series, load_phase_series, select_phase_series,
     load_all_series, load_dcm_series, normalize_phase_label,
-    MultiplePatientError, MixedSeriesDirectoryError
+    MultiplePatientError, MixedSeriesDirectoryError, NON_IMAGE_MODALITIES
 
 ``tk_rt_viewer.rtstruct_io``
     load_rt_struct, mask2rtstruct, save_structure_set,
@@ -104,7 +104,7 @@ __all__ = [
     "StructureSet",
     "to_gy_pairs",
 ]
-__version__ = "2.2.0"
+__version__ = "2.2.1"
 
 
 def __getattr__(name: str) -> Any:

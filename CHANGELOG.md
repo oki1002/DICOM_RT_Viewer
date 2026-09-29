@@ -30,6 +30,10 @@ Loading a series picked from a scan now reads only that series' files.
   directory holding a listed series also holds another image series.
   Non-image objects and the phases of one 4DCT may share a directory. Off by
   default; `MultiplePatientError` is still checked first.
+- **`NON_IMAGE_MODALITIES`** (formerly the private `_NON_IMAGE_MODALITIES`):
+  the modalities never treated as an image series, so a host that sorts
+  files into per-series folders agrees with the scan on what an image
+  series is.
 
 ### Changed
 

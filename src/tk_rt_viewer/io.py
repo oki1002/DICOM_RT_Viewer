@@ -20,6 +20,9 @@ load_phase_series(phases, reg_files=(), max_workers=None)
     -> dict[str, SeriesInfo]
     Load the phases of a scanned 4DCT, reading only their own files.
 
+NON_IMAGE_MODALITIES
+    Modalities never treated as an image series (RT objects, REG, SR, ...).
+
 select_phase_series(all_series, phases) -> dict[str, SeriesInfo]
     Pick the 4DCT phases named by a scan result out of a load_all_series map.
 
@@ -70,8 +73,9 @@ _PHASE_LABEL_PATTERN = re.compile(r"\d+%")
 #: Modalities never loaded as a displayable image series. Without this,
 #: GDCM enumerates RT objects alongside the images and they are read through
 #: the CT path (RT-DOSE without its DoseGridScaling). RT-DOSE has its own
-#: loader, :func:`load_rt_dose`.
-_NON_IMAGE_MODALITIES: frozenset[str] = frozenset(
+#: loader, :func:`load_rt_dose`. Public so hosts that reorganise files agree
+#: with :func:`scan_dicom_series` on what counts as an image series.
+NON_IMAGE_MODALITIES: frozenset[str] = frozenset(
     {"RTSTRUCT", "RTPLAN", "RTRECORD", "RTDOSE", "REG", "SR", "PR", "KO", "SEG"}
 )
 
@@ -492,7 +496,7 @@ def scan_dicom_series(
         series_uid = str(ds.get("SeriesInstanceUID", ""))
         if not series_uid:
             continue
-        if modality not in _NON_IMAGE_MODALITIES:
+        if modality not in NON_IMAGE_MODALITIES:
             image_series_by_dir.setdefault(file.parent, set()).add(series_uid)
         if modality not in modalities:
             continue
@@ -937,7 +941,7 @@ def _load_all_series_impl(
     for dcm_dir in sorted(scan.dirs_with_dicom):
         for sid in reader.GetGDCMSeriesIDs(str(dcm_dir)):
             modality = scan.modality_by_series.get(sid, "")
-            if modality.upper() in _NON_IMAGE_MODALITIES:
+            if modality.upper() in NON_IMAGE_MODALITIES:
                 logger.info(f"Skipping {modality} series '{sid}' (not an image).")
                 continue
             raw_image, file_names = _read_series(reader, dcm_dir, sid)
