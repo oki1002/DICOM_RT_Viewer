@@ -220,8 +220,8 @@ class TestBlitCompositor:
     ) -> None:
         """Pins the 2.0.3 fix: on_draw must key off ax.bbox, not just xlim/ylim.
 
-        With aspect="equal", adjustable="box" (every base image in this
-        package uses that), a figure resize changes ax.bbox but leaves
+        With aspect="equal", adjustable="box" (the base images used that
+        before 2.3.0), a figure resize changes ax.bbox but leaves
         get_xlim()/get_ylim() untouched. Comparing limits alone therefore
         missed every resize, leaving the background bitmap the old size and
         position until some unrelated event happened to trigger a full

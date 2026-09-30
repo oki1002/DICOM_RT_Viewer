@@ -21,17 +21,28 @@ Hover tracking:
 Scroll debounce:
     Wheel steps are accumulated for ``SCROLL_DEBOUNCE_MS`` and applied in one
     ``set_index`` call, on the Tk main thread. Brush resizing is immediate.
+
+Wheel priority:
+    1. Ctrl held: zoom the view under the pointer about the pointer
+       (:class:`~tk_rt_viewer.rendering.view_axes.ImageViewAxes`), even while
+       the brush is active
+    2. Brush tool: resize the brush
+    3. Otherwise: scroll slices; ``invert_scroll`` flips the direction
 """
 
 import numpy as np
 
 from .. import events
 from ..protocols import ViewerHost
+from ..rendering.view_axes import ImageViewAxes
 from ..state.viewer_state import SliceViewerState
 from .bbox3d_handler import Bbox3dEventHandler
 from .bbox_handler import BboxEventHandler
 from .brush_handler import BrushEventHandler
 from .crosshair_handler import CrosshairEventHandler
+
+#: Zoom ratio per Ctrl + wheel notch.
+ZOOM_STEP: float = 1.25
 
 #: Debounce window (ms) for batching scroll events; short enough to feel
 #: immediate, long enough to coalesce a wheel flick.
@@ -58,9 +69,18 @@ _MIN_WINDOW_WIDTH: float = 1.0
 class ViewerEventHandler:
     """Dispatch matplotlib canvas events to specialised sub-handlers."""
 
-    def __init__(self, state: SliceViewerState, viewer: ViewerHost) -> None:
+    def __init__(
+        self,
+        state: SliceViewerState,
+        viewer: ViewerHost,
+        *,
+        invert_scroll: bool = False,
+    ) -> None:
         self.state = state
         self.viewer = viewer
+        #: Reverse the wheel direction for slice scrolling only (the brush
+        #: size and zoom keep theirs)
+        self.invert_scroll: bool = invert_scroll
 
         self._current_axis: str = ""
 
@@ -130,7 +150,11 @@ class ViewerEventHandler:
     # Scroll
     # ------------------------------------------------------------------
     def on_scroll(self, event) -> None:
-        """Resize the brush immediately, or accumulate a debounced slice scroll."""
+        """Zoom (Ctrl), resize the brush, or accumulate a debounced slice scroll."""
+        if self._ctrl_held(event):
+            self._zoom_at_pointer(event)
+            return
+
         if self.state.brush_tool_active and self._current_axis:
             self.brush_handler.handle_scroll(event)
             return
@@ -145,7 +169,8 @@ class ViewerEventHandler:
             self._flush_scroll()
 
         self._scroll_axis = axis
-        self._scroll_accum += int(np.sign(event.step))
+        direction = -1 if self.invert_scroll else 1
+        self._scroll_accum += direction * int(np.sign(event.step))
 
         self._cancel_scroll_timer()
         handle = self.viewer.schedule(SCROLL_DEBOUNCE_MS, self._flush_scroll)
@@ -154,6 +179,35 @@ class ViewerEventHandler:
             self._flush_scroll()
             return
         self._scroll_handle = handle
+
+    def _zoom_at_pointer(self, event) -> None:
+        """Zoom the view under the pointer one notch, about the pointer."""
+        ax = self.viewer.axes_map.get(self._current_axis)
+        if (
+            not isinstance(ax, ImageViewAxes)
+            or self.state.primary_image is None
+            or event.xdata is None
+            or event.ydata is None
+            or not event.step
+        ):
+            return
+        factor = ZOOM_STEP ** float(np.sign(event.step))
+        ax.zoom_to(ax.zoom_factor() * factor, anchor=(event.xdata, event.ydata))
+        self.viewer.refresh_canvas()
+
+    @staticmethod
+    def _ctrl_held(event) -> bool:
+        """Return whether Ctrl is held during *event*.
+
+        ``modifiers`` (Matplotlib >= 3.7) is read from the GUI event itself;
+        ``key`` only reflects the last key event the canvas received, so it
+        is a fallback.
+        """
+        modifiers = getattr(event, "modifiers", None)
+        if modifiers is not None:
+            return "ctrl" in modifiers
+        key = event.key or ""
+        return key in ("control", "ctrl") or key.startswith("ctrl+")
 
     def _cancel_scroll_timer(self) -> None:
         """Cancel the pending scroll-debounce callback, if any."""

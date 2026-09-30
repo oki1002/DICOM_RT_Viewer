@@ -7,10 +7,14 @@ from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 
 from ..geometry import LAYOUT_MODES
+from .view_axes import ImageViewAxes
 
 
 class LayoutManager:
     """Builds the Axes layout for a given mode inside a shared Figure.
+
+    The image views are :class:`ImageViewAxes`, which fill their cell and
+    support zooming; the DVH panel is a plain Axes.
 
     Supported modes:
         ``"mpr_wide"`` — left column: large Axial; right column: Coronal /
@@ -47,22 +51,22 @@ class LayoutManager:
             ``None`` except for ``"mpr"``.
         """
         if mode == "single":
-            axs = {"axial": self._fig.add_subplot(111)}
+            axs = {"axial": self._add_view(111)}
             dvh_ax = None
         elif mode == "mpr_wide":
             gs = gridspec.GridSpec(2, 2, figure=self._fig, width_ratios=[2, 1])
             axs = {
-                "axial": self._fig.add_subplot(gs[:, 0]),
-                "coronal": self._fig.add_subplot(gs[0, 1]),
-                "sagittal": self._fig.add_subplot(gs[1, 1]),
+                "axial": self._add_view(gs[:, 0]),
+                "coronal": self._add_view(gs[0, 1]),
+                "sagittal": self._add_view(gs[1, 1]),
             }
             dvh_ax = None
         elif mode == "mpr":
             gs = gridspec.GridSpec(2, 2, figure=self._fig)
             axs = {
-                "axial": self._fig.add_subplot(gs[0, 0]),
-                "coronal": self._fig.add_subplot(gs[1, 0]),
-                "sagittal": self._fig.add_subplot(gs[1, 1]),
+                "axial": self._add_view(gs[0, 0]),
+                "coronal": self._add_view(gs[1, 0]),
+                "sagittal": self._add_view(gs[1, 1]),
             }
             dvh_ax = self._fig.add_subplot(gs[0, 1])
             self._style_dvh_axes(dvh_ax)
@@ -77,3 +81,7 @@ class LayoutManager:
             ax.set_axis_off()
 
         return axs, dvh_ax
+
+    def _add_view(self, spec) -> ImageViewAxes:
+        """Add an image view in the grid cell *spec*."""
+        return self._fig.add_subplot(spec, axes_class=ImageViewAxes)

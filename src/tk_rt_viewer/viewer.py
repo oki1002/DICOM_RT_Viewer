@@ -21,8 +21,13 @@ Architecture:
 
 Slice navigation:
     - Drag a crosshair line.
-    - Mouse wheel over any view.
+    - Mouse wheel over any view (``scroll_inverted`` reverses it).
     - Up / Down / PageUp / PageDown keys.
+
+Zoom:
+    Ctrl + mouse wheel zooms the view under the pointer about the pointer,
+    each view independently (``set_zoom`` / ``get_zoom`` / ``reset_zoom``).
+    The views fill their layout cells; a new image or layout starts fitted.
 
 Window / level:
     Right-click drag: horizontal -> width, vertical -> centre, applied to
@@ -49,6 +54,7 @@ from matplotlib.artist import Artist
 from matplotlib.axes import Axes
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
+from matplotlib.layout_engine import ConstrainedLayoutEngine
 from matplotlib.patches import Rectangle
 
 from .event_controllers.viewer_events import ViewerEventHandler
@@ -81,6 +87,7 @@ from .rendering.image_layer import ImageLayer
 from .rendering.isodose import IsoDoseOverlay
 from .rendering.layout import LayoutManager
 from .rendering.render import clim_to_window_level
+from .rendering.view_axes import ImageViewAxes
 from .state.viewer_state import SliceViewerState
 
 logger = logging.getLogger(__name__)
@@ -110,13 +117,30 @@ class DicomViewer(ttk.Frame):
     # must exceed the scroll debounce so a full render never lands mid-scroll
     _CACHE_REBUILD_IDLE_MS: int = 150
 
+    # Constrained-layout padding (inches / figure fraction). Matplotlib's
+    # defaults leave a visible frame around and between the views
+    _LAYOUT_PAD_INCHES: float = 1 / 72
+    _LAYOUT_SPACE: float = 0.0
+
     def __init__(
         self,
         parent: tk.Widget,
         state: SliceViewerState | None = None,
         fig_kwargs: dict | None = None,
+        *,
+        invert_scroll: bool = False,
     ) -> None:
+        """Build the widget.
+
+        Args:
+            parent: Tk parent widget.
+            state: Shared state; a private one is created when ``None``.
+            fig_kwargs: Extra ``Figure`` keyword arguments.
+            invert_scroll: Reverse the mouse-wheel direction for slice
+                scrolling (see :attr:`scroll_inverted`).
+        """
         super().__init__(parent)
+        self._invert_scroll_initial = invert_scroll
         self.rowconfigure(0, weight=1)
         self.columnconfigure(0, weight=1)
 
@@ -139,13 +163,21 @@ class DicomViewer(ttk.Frame):
     # ------------------------------------------------------------------
     def _build_widgets(self, fig_kwargs: dict | None) -> None:
         """Create the figure, canvas, toolbar and blend slider."""
-        kw: dict = {
-            "figsize": (10, 5),
-            "facecolor": (0.02, 0.02, 0.02),
-            "constrained_layout": True,
-        }
-        kw.update(fig_kwargs or {})
+        fig_kwargs = fig_kwargs or {}
+        kw: dict = {"figsize": (10, 5), "facecolor": (0.02, 0.02, 0.02)}
+        # Matplotlib rejects "layout" together with the legacy layout flags
+        if not {"layout", "constrained_layout", "tight_layout"} & fig_kwargs.keys():
+            kw["layout"] = "constrained"
+        kw.update(fig_kwargs)
         self.fig = Figure(**kw)
+        engine = self.fig.get_layout_engine()
+        if isinstance(engine, ConstrainedLayoutEngine):
+            engine.set(
+                w_pad=self._LAYOUT_PAD_INCHES,
+                h_pad=self._LAYOUT_PAD_INCHES,
+                wspace=self._LAYOUT_SPACE,
+                hspace=self._LAYOUT_SPACE,
+            )
         self.canvas = FigureCanvasTkAgg(self.fig, master=self)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self.toolbar = NavigationToolbar2Tk(self.canvas, self)
@@ -223,7 +255,9 @@ class DicomViewer(ttk.Frame):
         # Last rendered slice per axis (several viewers may share one state)
         self._last_rendered_index: dict[str, int] = dict.fromkeys(AXES, -1)
 
-        self.event_handler = ViewerEventHandler(self.viewer_state, self)
+        self.event_handler = ViewerEventHandler(
+            self.viewer_state, self, invert_scroll=self._invert_scroll_initial
+        )
 
     def _bind_events(self) -> None:
         """Connect canvas events and subscribe to the state."""
@@ -832,6 +866,49 @@ class DicomViewer(ttk.Frame):
                 self.isodose.update(axis, self.axs[axis])
                 self.drawing_manager.add_request(axis)
             self.drawing_manager.flush()
+
+    @property
+    def scroll_inverted(self) -> bool:
+        """Whether the mouse wheel scrolls slices in the reverse direction.
+
+        Affects slice scrolling only; the brush size and the Ctrl + wheel
+        zoom keep the natural direction.
+        """
+        return self.event_handler.invert_scroll
+
+    @scroll_inverted.setter
+    def scroll_inverted(self, inverted: bool) -> None:
+        self.event_handler.invert_scroll = bool(inverted)
+
+    def get_zoom(self, axis: str) -> float:
+        """Return *axis*' zoom factor (1.0 = the whole slice fitted to the view).
+
+        Returns 1.0 for a view the current layout does not build.
+        """
+        ax = self.axs.get(axis)
+        return ax.zoom_factor() if isinstance(ax, ImageViewAxes) else 1.0
+
+    def set_zoom(
+        self, axis: str, zoom: float, anchor: tuple[float, float] | None = None
+    ) -> None:
+        """Zoom *axis* to *zoom*, independently of the other views.
+
+        Args:
+            axis: View to zoom (ignored if the current layout lacks it).
+            zoom: Factor, clipped to ``[MIN_ZOOM, MAX_ZOOM]`` of
+                :mod:`~tk_rt_viewer.rendering.view_axes`.
+            anchor: Data point kept at its screen position; ``None`` zooms
+                about the view centre.
+        """
+        ax = self.axs.get(axis)
+        if isinstance(ax, ImageViewAxes):
+            ax.zoom_to(zoom, anchor)
+            self.canvas.draw_idle()
+
+    def reset_zoom(self, axis: str | None = None) -> None:
+        """Fit the whole slice into *axis*, or into every view when ``None``."""
+        for name in [axis] if axis is not None else list(self.axs):
+            self.set_zoom(name, 1.0)
 
     def get_slice(self, view: str) -> np.ndarray:
         """Return the current 2-D slice for *view* as a NumPy array."""

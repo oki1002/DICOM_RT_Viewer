@@ -16,6 +16,7 @@ from matplotlib.image import AxesImage
 
 from ..geometry import AXES
 from .render import GRAY_LUT, build_cmap_lut, slice_to_rgba, window_level_to_clim
+from .view_axes import ImageViewAxes
 
 if TYPE_CHECKING:
     from ..state.viewer_state import SliceViewerState
@@ -163,6 +164,10 @@ class ImageLayer:
 
         Coronal / sagittal show superior (large z) at the top. Axial inverts y
         so anterior is at the top, per radiological convention.
+
+        An :class:`ImageViewAxes` (every view the layout builds) keeps its
+        box filling the layout cell and conforms these limits to it; a plain
+        Axes shrinks its box to the slice's aspect instead.
         """
         if axis in ("coronal", "sagittal"):
             y_bottom, y_top = extent[2], extent[3]
@@ -171,6 +176,8 @@ class ImageLayer:
         ax.set_xlim(extent[0], extent[1])
         ax.set_ylim(y_bottom, y_top)
         ax.set_aspect("equal", adjustable="box")
+        if isinstance(ax, ImageViewAxes):
+            ax.set_image_extent(extent)
 
     def _update_secondary(
         self,

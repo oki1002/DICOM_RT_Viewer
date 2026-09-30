@@ -4,6 +4,34 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.3.0]
+
+Zoom per view, a reversible wheel, and views that fill the figure.
+
+### Added
+
+- **Ctrl + mouse wheel zooms** the view under the pointer, about the
+  pointer, from 1× (fitted) to 20×. Each view keeps its own zoom; a resize
+  keeps zoom and centre. Works while the brush tool is active.
+- **`DicomViewer.set_zoom(axis, zoom, anchor=None)`**, **`get_zoom(axis)`**
+  and **`reset_zoom(axis=None)`**.
+- **`DicomViewer(..., invert_scroll=False)`** and the
+  **`DicomViewer.scroll_inverted`** property reverse the wheel for slice
+  scrolling (`ViewerEventHandler.invert_scroll`). Brush resizing, zoom and
+  the arrow keys keep their direction.
+- **`ImageViewAxes`** (`tk_rt_viewer.rendering.view_axes`): the Axes class of
+  every image view. It fills its layout cell and keeps a 1:1 data aspect
+  through its limits; `set_aspect` is pinned to `"auto"` on it.
+
+### Changed
+
+- The image views no longer shrink their box to the slice's aspect
+  (`adjustable="box"`), so a zoomed slice uses the whole layout cell.
+- The constrained-layout padding around and between the views is reduced
+  to 1 pt (`DicomViewer._LAYOUT_PAD_INCHES` / `_LAYOUT_SPACE`). The figure is
+  created with `layout="constrained"` unless `fig_kwargs` sets `layout`,
+  `constrained_layout` or `tight_layout`.
+
 ## [2.2.0]
 
 Loading a series picked from a scan now reads only that series' files.

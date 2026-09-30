@@ -15,10 +15,12 @@ matplotlib.use("Agg")
 import numpy as np
 import pytest
 import SimpleITK as sitk
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 
 from tk_rt_viewer.event_controllers.viewer_events import ViewerEventHandler
 from tk_rt_viewer.protocols import ViewerHost
+from tk_rt_viewer.rendering.view_axes import ImageViewAxes
 from tk_rt_viewer.state.viewer_state import SliceViewerState
 
 
@@ -285,6 +287,135 @@ class TestScrollDebounce:
         handler.on_scroll(Event(step=1))
         viewer.run_pending()
         assert dict(state.indices) == before
+
+
+class TestScrollInversion:
+    def test_inverted_scroll_moves_the_other_way(self) -> None:
+        ax = Figure().add_subplot(111)
+        state = loaded_state()
+        state.set_index("axial", 4)
+        handler, viewer = handler_for(state, FakeViewer({"axial": ax}))
+        handler.invert_scroll = True
+        handler.on_enter_axes(Event(inaxes=ax))
+        handler.on_scroll(Event(step=1))
+        handler.on_scroll(Event(step=1))
+        viewer.run_pending()
+        assert state.indices["axial"] == 2
+
+    def test_inversion_does_not_touch_the_keyboard(self) -> None:
+        ax = Figure().add_subplot(111)
+        state = loaded_state()
+        state.set_index("axial", 4)
+        handler, _viewer = handler_for(state, FakeViewer({"axial": ax}))
+        handler.invert_scroll = True
+        handler.on_enter_axes(Event(inaxes=ax))
+        handler.on_key_press(Event(key="up"))
+        assert state.indices["axial"] == 5
+
+
+class ScrollEvent(Event):
+    """Event carrying Matplotlib's ``modifiers`` set."""
+
+    def __init__(self, *args, modifiers=frozenset(), **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.modifiers = frozenset(modifiers)
+
+
+def zoomable_axes(state: SliceViewerState, axis: str = "axial") -> ImageViewAxes:
+    """An Agg-backed view set up as ImageLayer does for a new slice."""
+    fig = Figure(figsize=(6, 3))
+    FigureCanvasAgg(fig)
+    ax = fig.add_subplot(111, axes_class=ImageViewAxes)
+    x0, x1, y0, y1 = state.get_extent(axis)
+    ax.set_xlim(x0, x1)
+    ax.set_ylim(y1, y0) if axis == "axial" else ax.set_ylim(y0, y1)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_image_extent((x0, x1, y0, y1))
+    ax.apply_aspect()
+    return ax
+
+
+def x_fraction(ax, x: float) -> float:
+    """Horizontal screen position of data x within the view (0..1)."""
+    left, right = ax.get_xlim()
+    return (x - left) / (right - left)
+
+
+class TestZoom:
+    def _setup(self):
+        state = loaded_state((8, 16, 32))
+        axial = zoomable_axes(state, "axial")
+        coronal = zoomable_axes(state, "coronal")
+        handler, viewer = handler_for(
+            state, FakeViewer({"axial": axial, "coronal": coronal})
+        )
+        handler.on_enter_axes(Event(inaxes=axial))
+        return state, handler, axial, coronal
+
+    def test_starts_fitted(self) -> None:
+        _state, _handler, axial, _coronal = self._setup()
+        assert axial.zoom_factor() == pytest.approx(1.0)
+
+    def test_ctrl_wheel_zooms_about_the_pointer(self) -> None:
+        state, handler, axial, _coronal = self._setup()
+        before = dict(state.indices)
+        anchor = (10.0, 5.0)
+        frac = x_fraction(axial, anchor[0])
+        handler.on_scroll(
+            ScrollEvent(step=1, xdata=anchor[0], ydata=anchor[1], modifiers={"ctrl"})
+        )
+        axial.apply_aspect()
+        assert axial.zoom_factor() == pytest.approx(1.25)
+        assert x_fraction(axial, anchor[0]) == pytest.approx(frac)
+        assert dict(state.indices) == before  # no slice scroll
+        assert axial.yaxis_inverted()  # radiological orientation kept
+
+    def test_views_zoom_independently(self) -> None:
+        _state, _handler, axial, coronal = self._setup()
+        coronal_before = coronal.get_xlim()
+        axial.zoom_to(3.0)
+        assert axial.zoom_factor() == pytest.approx(3.0)
+        assert coronal.get_xlim() == coronal_before
+
+    def test_zoom_is_clamped_and_stays_on_the_image(self) -> None:
+        state, _handler, axial, _coronal = self._setup()
+        axial.zoom_to(100.0, anchor=(-50.0, -50.0))
+        assert axial.zoom_factor() == pytest.approx(20.0)
+        x0, _x1, _y0, _y1 = state.get_extent("axial")
+        assert min(axial.get_xlim()) >= x0 - 1e-9
+        axial.zoom_to(0.1)
+        assert axial.zoom_factor() == pytest.approx(1.0)
+
+    def test_ctrl_wheel_zooms_even_with_the_brush_active(self) -> None:
+        state, handler, axial, _coronal = self._setup()
+        state.set_brush_tool_active(True)
+        handler.on_scroll(ScrollEvent(step=1, xdata=8.0, ydata=4.0, modifiers={"ctrl"}))
+        assert axial.zoom_factor() == pytest.approx(1.25)
+
+    def test_a_resize_keeps_the_zoom_and_the_centre(self) -> None:
+        _state, _handler, axial, _coronal = self._setup()
+        axial.zoom_to(2.0, anchor=(20.0, 10.0))
+        axial.apply_aspect()
+        centre = np.mean(axial.get_xlim()), np.mean(axial.get_ylim())
+        axial.figure.set_size_inches(3, 6)
+        axial.apply_aspect()
+        assert axial.zoom_factor() == pytest.approx(2.0)
+        assert np.mean(axial.get_xlim()) == pytest.approx(centre[0])
+        # The taller box shows more than the slice height: centred on it
+        _x0, _x1, y0, y1 = axial._image_extent
+        assert np.mean(axial.get_ylim()) == pytest.approx((y0 + y1) / 2)
+        # 1:1 data aspect: data units per pixel match on both axes
+        width, height = axial.bbox.width, axial.bbox.height
+        x_span = abs(np.diff(axial.get_xlim())[0])
+        y_span = abs(np.diff(axial.get_ylim())[0])
+        assert x_span / width == pytest.approx(y_span / height)
+
+    def test_drawing_logs_no_aspect_warning(self, caplog) -> None:
+        _state, _handler, axial, _coronal = self._setup()
+        axial.zoom_to(3.0, anchor=(4.0, 4.0))
+        axial.figure.set_size_inches(5, 5)
+        axial.figure.canvas.draw()
+        assert "aspect" not in caplog.text
 
 
 class TestKeyboardNavigation:
