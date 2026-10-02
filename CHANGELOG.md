@@ -4,6 +4,29 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.3.1]
+
+A newly drawn 3-D box no longer spans the whole image along the axis that
+cannot be seen while drawing.
+
+### Added
+
+- **`geometry.fit_box_length(image, dim, length, min_extent)`**: returns
+  *length*, or half of the image's extent along *dim* when that extent is
+  shorter than *min_extent*.
+
+### Changed
+
+- A 3-D box newly drawn on a view is now
+  **`Bbox3dEventHandler.NEW_BOX_DEPTH_MM`** (50 mm) deep along that view's
+  normal, centred on the displayed slice. It used to keep the depth of the box
+  it replaced, or span the whole image when none was left (e.g. after a
+  clearing click), which hid how deep the box was while drawing.
+- Where the image along that normal is shorter than
+  **`Bbox3dEventHandler.NARROW_EXTENT_MM`** (60 mm), e.g. a short
+  craniocaudal scan range, the new box is half the image deep instead, so it
+  does not fill the image end to end.
+
 ## [2.3.0]
 
 Zoom per view, a reversible wheel, and views that fill the figure.

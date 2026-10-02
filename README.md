@@ -507,7 +507,7 @@ visible the 3-D box takes the mouse.
 ```python
 from tk_rt_viewer import Box3D
 
-# Turn the tool on; the user draws on any view. Drawing on a second view
+# Turn the tool on; the user draws on any view. Resizing on a second view
 # trims the depth of the box drawn on the first.
 state.set_bbox_3d_visible(True)
 
@@ -523,7 +523,10 @@ state.set_bounding_box_3d(None)
 ```
 
 Clicking outside the box clears it, as with the per-view box; a drag that
-follows redraws it in that plane while keeping the depth set on another view.
+follows draws a new box in that plane, 50 mm deep along the view's normal and
+centred on the displayed slice (`Bbox3dEventHandler.NEW_BOX_DEPTH_MM`), or half
+the image deep where the image is narrower than 60 mm along that normal
+(`NARROW_EXTENT_MM`). Resize or move it on another view to change its depth.
 
 Each view draws the box solid while the displayed slice cuts through it and
 dashed while it does not, so its depth is visible without leaving the slice.

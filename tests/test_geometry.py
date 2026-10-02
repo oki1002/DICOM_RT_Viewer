@@ -14,6 +14,7 @@ import SimpleITK as sitk
 from tk_rt_viewer.geometry import (
     AXES,
     compute_extent,
+    fit_box_length,
     mask_slice_to_paths,
     slice_along_axis,
 )
@@ -123,3 +124,19 @@ class TestSliceAlongAxis:
         np.testing.assert_array_equal(
             slice_along_axis(arr, "sagittal", 3), arr[:, :, 3]
         )
+
+
+class TestFitBoxLength:
+    @staticmethod
+    def _image(slices: int) -> sitk.Image:
+        image = sitk.GetImageFromArray(np.zeros((slices, 4, 4), dtype=np.int16))
+        image.SetSpacing((1.0, 1.0, 2.0))
+        return image
+
+    def test_keeps_the_length_on_a_wide_image(self) -> None:
+        # 30 slices x 2 mm = 60 mm: not narrower than the threshold
+        assert fit_box_length(self._image(30), 2, 50.0, 60.0) == 50.0
+
+    def test_uses_half_the_extent_on_a_narrow_image(self) -> None:
+        # 20 slices x 2 mm = 40 mm
+        assert fit_box_length(self._image(20), 2, 50.0, 60.0) == 40.0 / 2

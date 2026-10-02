@@ -19,7 +19,7 @@ from matplotlib.figure import Figure
 
 from tk_rt_viewer.event_controllers import rect_drag
 from tk_rt_viewer.event_controllers.bbox3d_handler import Bbox3dEventHandler
-from tk_rt_viewer.geometry import AXES, Box3D
+from tk_rt_viewer.geometry import AXES
 from tk_rt_viewer.state.viewer_state import SliceViewerState
 
 
@@ -134,32 +134,79 @@ class TestRectDrag:
 
 
 class TestBbox3dHandler:
-    def test_drag_creates_a_full_depth_box(self, setup) -> None:
+    @staticmethod
+    def _slice_coordinate(state: SliceViewerState, axis: str) -> float:
+        return state.index_to_physical(axis, state.indices[axis])
+
+    def test_drag_creates_a_fixed_depth_box_on_the_displayed_slice(self, setup) -> None:
         state, handler, _ = setup
         drag(handler, (-10.0, -10.0), (10.0, 20.0))
 
         box = state.bounding_box_3d
         assert box is not None
         assert box.project("axial") == pytest.approx((-10.0, -10.0, 20.0, 30.0))
-        extent = Box3D.from_image_extent(state.primary_image)
-        assert (box.lower[2], box.upper[2]) == (extent.lower[2], extent.upper[2])
+        center = self._slice_coordinate(state, "axial")
+        half = Bbox3dEventHandler.NEW_BOX_DEPTH_MM / 2.0
+        assert (box.lower[2], box.upper[2]) == pytest.approx(
+            (center - half, center + half)
+        )
 
-    def test_drag_on_another_view_only_changes_that_view_dimensions(
+    def test_new_box_on_a_narrow_image_is_half_the_image_deep(self) -> None:
+        state = SliceViewerState()
+        # 10 axial slices x 3 mm = 30 mm craniocaudally (narrower than 60 mm)
+        image = sitk.GetImageFromArray(np.zeros((10, 40, 40), dtype=np.int16))
+        image.SetSpacing((2.0, 2.0, 3.0))
+        state.set_primary_image_data(image)
+        state.set_bbox_3d_visible(True)
+        handler = Bbox3dEventHandler(state, FakeViewer(), FakeHover())
+
+        drag(handler, (10.0, 10.0), (30.0, 30.0))
+
+        assert state.bounding_box_3d.size[2] == pytest.approx(15.0)
+
+    def test_new_box_after_a_clearing_click_keeps_the_fixed_depth(self, setup) -> None:
+        state, handler, _ = setup
+        drag(handler, (-10.0, -10.0), (10.0, 20.0))
+        drag(handler, (-30.0, -30.0), (-30.0, -30.0))
+        assert state.bounding_box_3d is None
+
+        drag(handler, (-20.0, -20.0), (0.0, 0.0))
+
+        box = state.bounding_box_3d
+        assert box.size[2] == pytest.approx(Bbox3dEventHandler.NEW_BOX_DEPTH_MM)
+
+    def test_new_box_on_another_view_uses_that_view_slice_for_depth(
         self, setup
     ) -> None:
         state, handler, hover = setup
         drag(handler, (-10.0, -10.0), (10.0, 20.0))
-        y_range = (state.bounding_box_3d.lower[1], state.bounding_box_3d.upper[1])
 
-        # Start outside the current projection: the box is redrawn in this
-        # plane, keeping the depth (y) set from the axial view.
+        # Start outside the current projection: a new box is drawn in this
+        # plane, its depth (y) centred on the displayed coronal slice
         hover.current_axis = "coronal"  # shows x and z
         drag(handler, (-30.0, -6.0), (-20.0, 6.0))
 
         box = state.bounding_box_3d
-        assert (box.lower[1], box.upper[1]) == y_range
+        center = self._slice_coordinate(state, "coronal")
+        half = Bbox3dEventHandler.NEW_BOX_DEPTH_MM / 2.0
+        assert (box.lower[1], box.upper[1]) == pytest.approx(
+            (center - half, center + half)
+        )
         assert (box.lower[2], box.upper[2]) == pytest.approx((-6.0, 6.0))
         assert (box.lower[0], box.upper[0]) == pytest.approx((-30.0, -20.0))
+
+    def test_resize_on_another_view_keeps_the_depth(self, setup) -> None:
+        state, handler, hover = setup
+        drag(handler, (-10.0, -10.0), (10.0, 20.0))
+        y_range = (state.bounding_box_3d.lower[1], state.bounding_box_3d.upper[1])
+
+        hover.current_axis = "coronal"
+        z_low = state.bounding_box_3d.lower[2]
+        drag(handler, (0.0, z_low), (0.0, z_low - 5.0))  # bottom edge
+
+        box = state.bounding_box_3d
+        assert (box.lower[1], box.upper[1]) == y_range
+        assert box.lower[2] == pytest.approx(z_low - 5.0)
 
     def test_click_outside_clears_the_box(self, setup) -> None:
         state, handler, _ = setup

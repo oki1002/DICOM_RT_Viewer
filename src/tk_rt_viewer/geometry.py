@@ -197,6 +197,25 @@ def as_point(values) -> tuple[float, float, float]:
     return (float(values[0]), float(values[1]), float(values[2]))
 
 
+def fit_box_length(
+    image: sitk.Image, dim: int, length: float, min_extent: float
+) -> float:
+    """Return *length*, or half of *image*'s extent along *dim* if it is narrow.
+
+    A default-sized box would cover a narrow image (e.g. a short craniocaudal
+    scan range) end to end, so when the extent along physical dimension *dim*
+    (0=x, 1=y, 2=z) is shorter than *min_extent* the box takes half of it.
+
+    Args:
+        image: The image the box is drawn on.
+        dim: Physical dimension (0=x, 1=y, 2=z).
+        length: Preferred box length in mm.
+        min_extent: Extent (mm) below which half the extent is used instead.
+    """
+    extent = Box3D.from_image_extent(image).size[dim]
+    return extent / 2.0 if extent < min_extent else length
+
+
 def view_dims(axis: str) -> tuple[int, int]:
     """Return the physical dimensions plotted on *axis*' x and y axes.
 
