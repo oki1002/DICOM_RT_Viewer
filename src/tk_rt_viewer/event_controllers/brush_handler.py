@@ -88,7 +88,7 @@ class BrushEventHandler:
         self.is_active = False
         self._cursor_ready = False
         self._abandon_stroke()
-        self._remove_brush_cursor()
+        self.remove_cursor()
         self.viewer.refresh_canvas()
 
     def _abandon_stroke(self) -> None:
@@ -153,7 +153,7 @@ class BrushEventHandler:
         """Continue the stroke or update the brush cursor position."""
         if not self.is_active or not self._hover.current_axis:
             if self.brush_circle:
-                self._remove_brush_cursor()
+                self.remove_cursor()
             return
 
         current = self._hover.current_axis
@@ -225,19 +225,19 @@ class BrushEventHandler:
     def _update_brush_cursor(self, event) -> None:
         """Create or reposition the circular brush cursor at the event location."""
         if self.viewer.toolbar_mode:
-            self._remove_brush_cursor()
+            self.remove_cursor()
             return
 
         axis = self._hover.current_axis
         if not (axis and event.xdata is not None and event.ydata is not None):
-            self._remove_brush_cursor()
+            self.remove_cursor()
             return
 
         if (
             not self.brush_circle
             or self.brush_circle.axes != self.viewer.axes_map[axis]
         ):
-            self._remove_brush_cursor()
+            self.remove_cursor()
             roi_number = self.state.selected_roi_number
             color = (
                 self.state.structure_set.get_color(roi_number)
@@ -259,10 +259,6 @@ class BrushEventHandler:
         self.viewer.request_redraw(axis)
 
     def remove_cursor(self) -> None:
-        """Remove the brush cursor circle from the canvas."""
-        self._remove_brush_cursor()
-
-    def _remove_brush_cursor(self) -> None:
         """Remove the brush cursor circle from the canvas."""
         if not self.brush_circle:
             return

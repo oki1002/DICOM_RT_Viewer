@@ -720,6 +720,13 @@ class TestResampleRequiresAPrimaryImage:
         with pytest.raises(RuntimeError, match="no primary image"):
             state.set_secondary_image_data(self._small_image())
 
+    def test_a_failed_secondary_leaves_no_source_behind(self) -> None:
+        state = SliceViewerState()
+        with pytest.raises(RuntimeError):
+            state.set_secondary_image_data(self._small_image())
+        assert state.secondary_source_image is None
+        assert state.secondary_image is None
+
     def test_clearing_the_secondary_without_a_primary_is_allowed(self) -> None:
         state = SliceViewerState()
         state.set_secondary_image_data(None)  # must not raise
@@ -756,3 +763,31 @@ class TestDeletingTheSelectedRoi:
         state.delete_contour(other)
 
         assert state.selected_roi_number == keep
+
+
+class TestResampleOntoTheSameGrid:
+    """An image already on the primary grid is not resampled again.
+
+    A 4DCT phase is resampled once into the LRU cache and then handed to
+    ``set_secondary_image_data``, which used to resample it a second time
+    on every phase switch.
+    """
+
+    def test_identity_on_the_primary_grid_returns_the_image(self) -> None:
+        state = make_state_with_image()
+        image = sitk.Image(state.primary_image)
+        assert state.get_resampled_image(image) is image
+
+    def test_a_transform_still_resamples(self) -> None:
+        state = make_state_with_image()
+        image = sitk.Image(state.primary_image)
+        moved = state.get_resampled_image(
+            image, transform=sitk.TranslationTransform(3, (1.0, 0.0, 0.0))
+        )
+        assert moved is not image
+
+    def test_another_grid_still_resamples(self) -> None:
+        state = make_state_with_image()
+        image = sitk.Image(state.primary_image)
+        image.SetOrigin(tuple(v + 0.5 for v in image.GetOrigin()))
+        assert state.get_resampled_image(image) is not image

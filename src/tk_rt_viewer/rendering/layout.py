@@ -1,6 +1,7 @@
 """layout.py — Builds the Matplotlib Axes for each layout mode."""
 
 from collections.abc import Callable
+from typing import cast
 
 import matplotlib.gridspec as gridspec
 from matplotlib.axes import Axes
@@ -50,6 +51,7 @@ class LayoutManager:
             For ``"single"``, ``axs`` is ``{"axial": Axes}``. ``dvh_ax`` is
             ``None`` except for ``"mpr"``.
         """
+        axs: dict[str, Axes]
         if mode == "single":
             axs = {"axial": self._add_view(111)}
             dvh_ax = None
@@ -76,12 +78,20 @@ class LayoutManager:
             )
 
         for ax in axs.values():
-            ax.set_facecolor("black")
-            ax.tick_params(colors="white")
-            ax.set_axis_off()
+            self.style_view(ax)
 
         return axs, dvh_ax
 
+    @staticmethod
+    def style_view(ax: Axes) -> None:
+        """Apply the image-view styling (also after ``Axes.clear()``)."""
+        ax.set_facecolor("black")
+        ax.tick_params(colors="white")
+        ax.set_axis_off()
+
     def _add_view(self, spec) -> ImageViewAxes:
         """Add an image view in the grid cell *spec*."""
-        return self._fig.add_subplot(spec, axes_class=ImageViewAxes)
+        # add_subplot is typed as returning Axes, whatever axes_class is
+        return cast(
+            ImageViewAxes, self._fig.add_subplot(spec, axes_class=ImageViewAxes)
+        )

@@ -109,7 +109,9 @@ class ImageViewAxes(Axes):
         resized = (
             previous is not None and previous[:2] == limits and previous[2] != ratio
         )
-        old_fit = self._fit_spans(previous[2]) if resized else None
+        old_fit = (
+            self._fit_spans(previous[2]) if resized and previous is not None else None
+        )
         new_fit = self._fit_spans(ratio)
         if old_fit is not None and new_fit is not None:
             zoom = old_fit[0] / span_x
@@ -140,7 +142,7 @@ class ImageViewAxes(Axes):
         width, height = self.bbox.width, self.bbox.height
         if width <= 0 or height <= 0:
             return None
-        return height / width
+        return float(height / width)
 
     def _fit_spans(self, ratio: float | None) -> tuple[float, float] | None:
         """Return the spans showing the whole slice in a box of *ratio*."""

@@ -83,10 +83,7 @@ class PhaseManager:
 
     def clear(self) -> None:
         """Drop all phases, the resampled cache, and the current-phase marker."""
-        self._phases = {}
-        self._rebuild_view()
-        self._resampled.clear()
-        self._current_phase = None
+        self.set_all({})
 
     def _rebuild_view(self) -> None:
         """Refresh the read-only view after :attr:`_phases` has been replaced."""

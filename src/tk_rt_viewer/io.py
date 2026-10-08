@@ -62,11 +62,11 @@ import pydicom
 import SimpleITK as sitk
 from pydicom.errors import InvalidDicomError
 
+from .reg_io import SPATIAL_REGISTRATION_SOP_CLASS_UID
 from .window_level import compute_auto_window_level
 
 logger = logging.getLogger(__name__)
 
-_SPATIAL_REGISTRATION_UID = "1.2.840.10008.5.1.4.1.1.66.1"
 _CT_IMAGE_STORAGE_UID = "1.2.840.10008.5.1.4.1.1.2"
 _PHASE_LABEL_PATTERN = re.compile(r"\d+%")
 
@@ -248,7 +248,10 @@ def _scan_dicom_tree(dcm_root_dir: str | pathlib.Path) -> _ScanResult:
         if series_uid is not None and modality:
             scan.modality_by_series[str(series_uid)] = modality
 
-        if modality == "REG" and ds.get("SOPClassUID", "") == _SPATIAL_REGISTRATION_UID:
+        if (
+            modality == "REG"
+            and ds.get("SOPClassUID", "") == SPATIAL_REGISTRATION_SOP_CLASS_UID
+        ):
             _collect_reg_matrices(ds, file, scan.reg_matrices, reg_series_refs)
 
     # A REG object may name only one instance of the moving series; resolve
@@ -661,18 +664,17 @@ def select_phase_series(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-def _read_series(
+def _read_files(
     reader: sitk.ImageSeriesReader,
-    dcm_dir: pathlib.Path,
+    file_names: Sequence[str],
     series_id: str,
-) -> tuple[sitk.Image, tuple[str, ...]]:
-    """Load *series_id* from *dcm_dir* and return ``(image, file_names)``."""
-    file_names = reader.GetGDCMSeriesFileNames(str(dcm_dir), series_id)
+) -> sitk.Image:
+    """Read *file_names* as one series, keeping per-slice metadata on *reader*."""
     reader.SetFileNames(file_names)
     reader.MetaDataDictionaryArrayUpdateOn()
     image = reader.Execute()
     logger.info(f"Series '{series_id}' loaded with {len(file_names)} files.")
-    return image, file_names
+    return image
 
 
 def _axis_aligned_grid(
@@ -887,7 +889,7 @@ def _read_reg_files(
         except Exception as exc:
             logger.warning(f"Skipping unreadable REG file '{file}': {exc}")
             continue
-        if ds.get("SOPClassUID", "") == _SPATIAL_REGISTRATION_UID:
+        if ds.get("SOPClassUID", "") == SPATIAL_REGISTRATION_SOP_CLASS_UID:
             _collect_reg_matrices(ds, pathlib.Path(file), by_sop, by_series)
     return by_sop, by_series
 
@@ -944,7 +946,8 @@ def _load_all_series_impl(
             if modality.upper() in NON_IMAGE_MODALITIES:
                 logger.info(f"Skipping {modality} series '{sid}' (not an image).")
                 continue
-            raw_image, file_names = _read_series(reader, dcm_dir, sid)
+            file_names = reader.GetGDCMSeriesFileNames(str(dcm_dir), sid)
+            raw_image = _read_files(reader, file_names, sid)
             description, info = _build_series_info(
                 reader, raw_image, _find_reg_matrix(scan, file_names, sid), sid
             )
@@ -1133,12 +1136,8 @@ def _load_scanned_series(
             f"'{entry.series_dir}'."
         )
 
-    reader.SetFileNames(file_names)
-    reader.MetaDataDictionaryArrayUpdateOn()
-    raw_image = reader.Execute()
     series_id = entry.series_uid or str(entry.series_dir)
-    logger.info(f"Series '{series_id}' loaded with {len(file_names)} files.")
-
+    raw_image = _read_files(reader, file_names, series_id)
     reg_matrix = _match_reg_matrix(
         reader, len(file_names), entry.series_uid, reg_matrices
     )

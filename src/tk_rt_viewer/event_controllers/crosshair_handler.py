@@ -131,6 +131,4 @@ class CrosshairEventHandler:
     def handle_release(self, event) -> None:
         """End the crosshair drag on left-button release."""
         if event.button == 1:
-            self._is_dragging = False
-            self._active_axis = None
-            self._drag_target = None
+            self.cancel()

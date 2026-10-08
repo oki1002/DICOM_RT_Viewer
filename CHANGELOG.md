@@ -4,6 +4,30 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.3.2]
+
+### Fixed
+
+- `reg_io.save_registration` wrote matrix values longer than the 16
+  characters the DS value representation allows (a rotation cosine prints as
+  18-19), so strict readers rejected the file. Values are now formatted to
+  fit.
+- A `set_secondary_image_data` call that raised (no primary image) left its
+  image behind as `secondary_source_image`.
+- `mypy src/tk_rt_viewer` failed with Matplotlib 3.11 (two errors in
+  `rendering/view_axes.py` and `rendering/isodose.py`). Annotations only.
+
+### Changed
+
+- `SliceViewerState.get_resampled_image` returns an image already on the
+  primary grid as-is when no transform is given. Switching between cached
+  4DCT phases no longer resamples the volume again.
+- `rtstruct_io.load_rt_struct` reads the RT-STRUCT file once instead of
+  twice, and skips a malformed `ROIContourSequence` item with a warning.
+- Internal cleanup: `geometry.mask_bounds` replaces two copies of the mask
+  bounding-box code; duplicated series reading, scheduling and box-patch
+  code were merged.
+
 ## [2.3.1]
 
 A newly drawn 3-D box no longer spans the whole image along the axis that

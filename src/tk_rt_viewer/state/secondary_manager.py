@@ -73,12 +73,22 @@ class SecondaryManager:
 
         Returns:
             The resampled image, or ``None`` when *image* is ``None``.
+
+        Raises:
+            Whatever the resample callable raises (e.g. ``RuntimeError``
+            without a primary image); the stored source is then unchanged.
         """
+        fill_value = float(fill_value)
+        # Resampled before anything is stored, so a failure leaves no source
+        # behind that the displayed image does not come from
+        resampled = (
+            None if image is None else self._resample(image, transform, fill_value)
+        )
         self._source = image
         self._transform = transform
-        self._fill_value = float(fill_value)
-        self._resampled = None if image is None else self.resample_with(transform)
-        return self._resampled
+        self._fill_value = fill_value
+        self._resampled = resampled
+        return resampled
 
     def set_transform(
         self, transform: sitk.Transform | None, resampled: sitk.Image | None = None

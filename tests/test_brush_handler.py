@@ -239,7 +239,7 @@ class TestResetAfterAxesCleared:
             ax.clear()  # Mirrors DicomViewer._reset_artists()
 
             try:
-                handler._remove_brush_cursor()
+                handler.remove_cursor()
             except NotImplementedError:
                 pass
             else:
@@ -270,7 +270,7 @@ class TestResetAfterAxesCleared:
             assert handler.brush_circle is None
 
             # Must not raise: no stale artist reference remains.
-            handler._remove_brush_cursor()
+            handler.remove_cursor()
             handler.handle_motion(_Event(xdata=1.0, ydata=1.0))
             handler.remove_cursor()
         finally:

@@ -11,6 +11,8 @@ import numpy as np
 import SimpleITK as sitk
 from matplotlib.axes import Axes
 
+from ..geometry import mask_bounds
+
 if TYPE_CHECKING:
     from ..state.viewer_state import SliceViewerState
 
@@ -39,14 +41,9 @@ class DvhPanel:
         Cropping to the mask's bounding box first avoids scanning the whole
         volume for a typically small ROI.
         """
-        occupied = [
-            np.flatnonzero(mask_arr.any(axis=axes)) for axes in ((1, 2), (0, 2), (0, 1))
-        ]
-        if any(indices.size == 0 for indices in occupied):
+        box = mask_bounds(mask_arr)
+        if box is None:
             return np.empty(0, dtype=dose_arr.dtype)
-        box = tuple(
-            slice(int(indices[0]), int(indices[-1]) + 1) for indices in occupied
-        )
         mask_box = mask_arr[box]
         return np.asarray(dose_arr[box][mask_box != 0])
 

@@ -48,8 +48,8 @@ ZOOM_STEP: float = 1.25
 #: immediate, long enough to coalesce a wheel flick.
 SCROLL_DEBOUNCE_MS: int = 30
 
-# Slice step for PageUp / PageDown (Up / Down move by 1)
-_PAGE_STEP: int = 10
+# Slice steps per navigation key (PageUp / PageDown move by 10)
+_KEY_STEPS: dict[str, int] = {"up": 1, "down": -1, "pageup": 10, "pagedown": -10}
 
 # Right mouse button drives the window/level drag
 _WL_BUTTON: int = 3
@@ -418,8 +418,7 @@ class ViewerEventHandler:
         axis = self._current_axis
         if not axis or self.state.primary_image is None:
             return
-        deltas = {"up": 1, "down": -1, "pageup": _PAGE_STEP, "pagedown": -_PAGE_STEP}
-        delta = deltas.get(event.key)
+        delta = _KEY_STEPS.get(event.key)
         if delta is None:
             return
         current = self.state.indices[axis]

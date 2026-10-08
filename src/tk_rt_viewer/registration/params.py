@@ -140,19 +140,17 @@ def params_from_resample_transform(
     center_array = np.array(center)
 
     # Re-express T(p) = R p + offset about the requested centre, i.e. solve
-    # R (p - c) + c + t = R p + offset for t.
-    recentred = sitk.Euler3DTransform()
-    recentred.SetCenter(center)
-    recentred.SetMatrix(matrix.ravel().tolist())
+    # R (p - c) + c + t = R p + offset for t. The angles depend on R alone,
+    # so they are read from the motion transform as it is
     translation = offset + matrix @ center_array - center_array
 
     return RigidParams(
         vert=float(translation[1]),
         lat=float(translation[0]),
         long=float(translation[2]),
-        roll=math.degrees(recentred.GetAngleZ()),
-        pitch=math.degrees(recentred.GetAngleX()),
-        yaw=math.degrees(recentred.GetAngleY()),
+        roll=math.degrees(motion.GetAngleZ()),
+        pitch=math.degrees(motion.GetAngleX()),
+        yaw=math.degrees(motion.GetAngleY()),
     )
 
 

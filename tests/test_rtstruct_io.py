@@ -350,9 +350,9 @@ class TestLoadRtStructDuplicateNames:
     ``rt_utils.RTStruct.get_roi_mask_by_name`` matches the *first*
     ``StructureSetROISequence`` entry with a given name, which is a real risk
     for TPS exports (duplicate ROI names are not invalid DICOM). These tests
-    stub out ``RTStructBuilder.create_from`` and ``pydicom.dcmread`` with a
-    minimal fake object exposing only what ``load_rt_struct`` reads, so no
-    on-disk DICOM series is needed.
+    stub out ``RTStructBuilder.create_from`` with a minimal fake object
+    exposing only what ``load_rt_struct`` reads, so no on-disk DICOM series
+    is needed.
     """
 
     class _FakeRoi:
@@ -403,7 +403,6 @@ class TestLoadRtStructDuplicateNames:
         monkeypatch.setattr(
             rtstruct_io.RTStructBuilder, "create_from", lambda **kw: rtstruct
         )
-        monkeypatch.setattr(rtstruct_io.pydicom, "dcmread", lambda *a, **kw: ds)
 
         result = rtstruct_io.load_rt_struct(ct_dir="/ct", rtstruct_path="/rs.dcm")
 
@@ -441,7 +440,6 @@ class TestLoadRtStructDuplicateNames:
         monkeypatch.setattr(
             rtstruct_io.RTStructBuilder, "create_from", lambda **kw: rtstruct
         )
-        monkeypatch.setattr(rtstruct_io.pydicom, "dcmread", lambda *a, **kw: ds)
 
         rtstruct_io.load_rt_struct(ct_dir="/ct", rtstruct_path="/rs.dcm")
 
@@ -474,10 +472,18 @@ class TestLoadRtStructMissingSequences:
             "create_from",
             lambda **kw: self._FakeRTStruct(ds),
         )
-        monkeypatch.setattr(rtstruct_io.pydicom, "dcmread", lambda *a, **kw: ds)
 
     def test_missing_roi_contour_sequence_returns_empty(self, monkeypatch) -> None:
         self._patch(monkeypatch, self._EmptyDs())
+        result = rtstruct_io.load_rt_struct(ct_dir="/ct", rtstruct_path="/rs.dcm")
+        assert result == {}
+
+    def test_a_malformed_contour_item_is_skipped(self, monkeypatch) -> None:
+        class _Ds:
+            StructureSetROISequence: list = []
+            ROIContourSequence = [object()]  # no ReferencedROINumber
+
+        self._patch(monkeypatch, _Ds())
         result = rtstruct_io.load_rt_struct(ct_dir="/ct", rtstruct_path="/rs.dcm")
         assert result == {}
 

@@ -116,6 +116,29 @@ class TestSaveRegistration:
             moving.SeriesInstanceUID,
         ]
 
+    def test_matrix_values_fit_the_ds_length_limit(self, tmp_path) -> None:
+        """A rotation's cosines print as 18-19 characters; DS allows 16."""
+        matrix = transform_to_matrix(
+            motion_transform(
+                RigidParams(lat=1.23456789, roll=7.3, pitch=-2.9, yaw=11.1),
+                center=(0.0, 0.0, 0.0),
+            )
+        )
+        path = tmp_path / "reg.dcm"
+        save_registration(path, matrix, make_reference(), make_reference("1.2.9"))
+
+        ds = pydicom.dcmread(path)
+        values = (
+            ds.RegistrationSequence[1]
+            .MatrixRegistrationSequence[0]
+            .MatrixSequence[0]
+            .FrameOfReferenceTransformationMatrix
+        )
+        assert all(len(str(value)) <= 16 for value in values)
+        assert np.array(values, dtype=float).reshape(4, 4) == pytest.approx(
+            matrix, abs=1e-12
+        )
+
     def test_rejects_a_reflection(self, tmp_path) -> None:
         matrix = np.eye(4)
         matrix[0, 0] = -1.0  # orthonormal, but det == -1

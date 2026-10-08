@@ -13,6 +13,8 @@ axis the user cannot see while drawing. Along an image narrower than
 :attr:`Bbox3dEventHandler.NARROW_EXTENT_MM` it is half the image instead.
 """
 
+import SimpleITK as sitk
+
 from ..geometry import AXIS_TO_XYZ_DIM, Box3D, fit_box_length
 from .rect_drag import Rect, RectDragHandler
 
@@ -39,21 +41,17 @@ class Bbox3dEventHandler(RectDragHandler):
         self.state.set_bounding_box_3d(None)
 
     def _commit(self, axis: str, rect: Rect, mode: str) -> None:
-        if mode == "create" and self.state.primary_image is not None:
-            self.state.set_bounding_box_3d(self._new_box(axis, rect))
+        image = self.state.primary_image
+        if mode == "create" and image is not None:
+            self.state.set_bounding_box_3d(self._new_box(image, axis, rect))
         else:
             self.state.set_bbox_3d_from_view(axis, rect)
 
-    def _new_box(self, axis: str, rect: Rect) -> Box3D:
+    def _new_box(self, image: sitk.Image, axis: str, rect: Rect) -> Box3D:
         """Return a box drawn as *rect* on *axis*, centred on the displayed slice."""
         dim = AXIS_TO_XYZ_DIM[axis]
         center = self.state.index_to_physical(axis, self.state.indices[axis])
-        depth = fit_box_length(
-            self.state.primary_image,
-            dim,
-            self.NEW_BOX_DEPTH_MM,
-            self.NARROW_EXTENT_MM,
-        )
+        depth = fit_box_length(image, dim, self.NEW_BOX_DEPTH_MM, self.NARROW_EXTENT_MM)
         base = Box3D(lower=(0.0, 0.0, 0.0), upper=(0.0, 0.0, 0.0))
         return base.with_range(
             dim, center - depth / 2.0, center + depth / 2.0

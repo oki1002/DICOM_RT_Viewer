@@ -233,7 +233,7 @@ class DicomViewer(ttk.Frame):
             self.viewer_state, on_artists_changed=self._compositor.invalidate
         )
         self._contour_redraws = ContourRedrawCoalescer(
-            schedule=self._schedule_from_worker,
+            schedule=self.schedule,
             cancel=self._safe_after_cancel,
             redraw=self._update_all_contours,
             active_rois=lambda: self.viewer_state.active_contours,
@@ -331,8 +331,11 @@ class DicomViewer(ttk.Frame):
     def schedule(self, delay_ms: int, callback: Callable[[], None]) -> str | None:
         """Run *callback* after *delay_ms*, returning a cancellation handle.
 
-        Returns ``None`` when no Tk event loop is available, so a caller can
-        fall back to acting immediately instead of losing the work.
+        Returns ``None`` when no Tk event loop is available (or the widget is
+        gone), so a caller can fall back to acting immediately instead of
+        losing the work. Also called from the contour-build workers: ``after``
+        is thread-safe with a threaded Tcl (CPython's default; see the
+        README's "Threading model").
         """
         try:
             return self.after(delay_ms, callback)
@@ -526,9 +529,7 @@ class DicomViewer(ttk.Frame):
         """
         for ax in self.axs.values():
             ax.clear()
-            ax.set_facecolor("black")
-            ax.tick_params(colors="white")
-            ax.set_axis_off()
+            LayoutManager.style_view(ax)
         self.image_layer.reset()
         self.isodose.reset()
         self.contours.reset()
@@ -628,35 +629,9 @@ class DicomViewer(ttk.Frame):
             return
         patch = self.bbox_patches[axis]
         if patch is None:
-            patch = Rectangle(
-                (0, 0),
-                0,
-                0,
-                linewidth=1.0,
-                edgecolor="red",
-                facecolor="none",
-                visible=False,
-            )
-            ax.add_patch(patch)
-            self.bbox_patches[axis] = patch
-            self._compositor.invalidate(axis)
-
-        if bbox is None or not self.viewer_state.bbox_visible:
-            if patch.get_visible():
-                patch.set_visible(False)
-                self._compositor.invalidate(axis)
-            patch.set_xy((0, 0))
-            patch.set_width(0)
-            patch.set_height(0)
-        else:
-            x, y, w, h = bbox
-            patch.set_xy((x, y))
-            patch.set_width(w)
-            patch.set_height(h)
-            if not patch.get_visible():
-                patch.set_visible(True)
-                self._compositor.invalidate(axis)
-        self.drawing_manager.add_request(axis)
+            patch = self.bbox_patches[axis] = self._add_box_patch(axis, ax)
+        rect = bbox if self.viewer_state.bbox_visible else None
+        self._place_box_patch(axis, patch, rect)
 
     def _on_bounding_box_3d_changed(self, box: Box3D | None) -> None:
         """Redraw every view's projection of the volumetric bounding box."""
@@ -681,35 +656,48 @@ class DicomViewer(ttk.Frame):
 
         patch = self.bbox_3d_patches[axis]
         if patch is None:
-            patch = Rectangle(
-                (0, 0),
-                0,
-                0,
-                linewidth=1.0,
-                edgecolor="red",
-                facecolor="none",
-                visible=False,
-            )
-            ax.add_patch(patch)
-            self.bbox_3d_patches[axis] = patch
-            self._compositor.invalidate(axis)
-
+            patch = self.bbox_3d_patches[axis] = self._add_box_patch(axis, ax)
         if box is None or not self.viewer_state.bbox_3d_visible:
-            if patch.get_visible():
-                patch.set_visible(False)
-                self._compositor.invalidate(axis)
-            patch.set_bounds(0, 0, 0, 0)
-        else:
-            patch.set_bounds(*box.project(axis))
-            slice_coord = self.viewer_state.index_to_physical(
-                axis, self.viewer_state.indices[axis]
-            )
-            patch.set_linestyle(
-                "solid" if box.contains_coordinate(axis, slice_coord) else "dashed"
-            )
-            if not patch.get_visible():
-                patch.set_visible(True)
-                self._compositor.invalidate(axis)
+            self._place_box_patch(axis, patch, None)
+            return
+        slice_coord = self.viewer_state.index_to_physical(
+            axis, self.viewer_state.indices[axis]
+        )
+        patch.set_linestyle(
+            "solid" if box.contains_coordinate(axis, slice_coord) else "dashed"
+        )
+        self._place_box_patch(axis, patch, box.project(axis))
+
+    def _add_box_patch(self, axis: str, ax: Axes) -> Rectangle:
+        """Add a hidden box outline to *ax* and invalidate its artist list."""
+        patch = Rectangle(
+            (0, 0),
+            0,
+            0,
+            linewidth=1.0,
+            edgecolor="red",
+            facecolor="none",
+            visible=False,
+        )
+        ax.add_patch(patch)
+        self._compositor.invalidate(axis)
+        return patch
+
+    def _place_box_patch(
+        self,
+        axis: str,
+        patch: Rectangle,
+        rect: tuple[float, float, float, float] | None,
+    ) -> None:
+        """Move *patch* onto *rect* ``(x, y, width, height)``, or hide it for ``None``.
+
+        The artist list is invalidated only when the visibility changes.
+        """
+        visible = rect is not None
+        patch.set_bounds(*(rect if rect is not None else (0, 0, 0, 0)))
+        if patch.get_visible() != visible:
+            patch.set_visible(visible)
+            self._compositor.invalidate(axis)
         self.drawing_manager.add_request(axis)
 
     def _on_all_contours_changed(self, structure_set) -> None:
@@ -729,21 +717,6 @@ class DicomViewer(ttk.Frame):
         Called on a worker thread; see :class:`ContourRedrawCoalescer`.
         """
         self._contour_redraws.notify_built(roi_number)
-
-    def _schedule_from_worker(
-        self, delay_ms: int, callback: Callable[[], None]
-    ) -> str | None:
-        """Schedule *callback* on the Tk main loop from a worker thread.
-
-        ``after`` is thread-safe with a threaded Tcl (CPython's default; see
-        the README's "Threading model").
-        """
-        try:
-            return self.after(delay_ms, callback)
-        except (RuntimeError, tk.TclError):
-            # The main loop has exited or the widget is gone: nothing to redraw
-            logger.debug("Contour cache built after teardown; redraw skipped.")
-            return None
 
     def _on_rt_dose_changed(self, image) -> None:
         """Update the dose overlay and DVH panel when the RT-DOSE changes."""

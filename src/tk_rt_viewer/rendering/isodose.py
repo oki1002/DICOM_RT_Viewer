@@ -270,7 +270,7 @@ class IsoDoseOverlay:
                 zorder=2,
             )
             # Per-instance override (documented Matplotlib pattern)
-            fill.format_cursor_data = _format_fill_cursor_data  # type: ignore[method-assign,assignment]
+            fill.format_cursor_data = _format_fill_cursor_data  # type: ignore[method-assign,assignment,unused-ignore]
             self._fill[axis] = fill
             self._on_artists_changed(axis)
             return

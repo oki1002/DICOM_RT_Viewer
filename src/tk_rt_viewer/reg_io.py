@@ -23,6 +23,7 @@ import numpy as np
 import SimpleITK as sitk
 from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
 from pydicom.uid import UID, ExplicitVRLittleEndian, generate_uid
+from pydicom.valuerep import DSfloat
 
 logger = logging.getLogger(__name__)
 
@@ -260,8 +261,10 @@ def _registration_item(
     """Build one item of the Registration Sequence."""
     matrix_item = Dataset()
     matrix_item.FrameOfReferenceTransformationMatrixType = "RIGID"
+    # DS values are limited to 16 characters; a plain float such as a rotation
+    # cosine prints 18-19, which strict readers reject
     matrix_item.FrameOfReferenceTransformationMatrix = [
-        float(value) for value in matrix.reshape(16)
+        DSfloat(float(value), auto_format=True) for value in matrix.reshape(16)
     ]
 
     matrix_registration = Dataset()

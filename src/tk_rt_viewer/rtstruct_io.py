@@ -34,7 +34,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, Any, TypedDict
 
 import numpy as np
-import pydicom
 import SimpleITK as sitk
 from rt_utils import RTStructBuilder
 
@@ -213,7 +212,9 @@ def load_rt_struct(
             dicom_series_path=str(ct_dir),
             rt_struct_path=str(rtstruct_path),
         )
-        ds = pydicom.dcmread(str(rtstruct_path))
+        # rtstruct.ds is the file already parsed by rt-utils; reading it again
+        # would double the I/O for a large structure set
+        ds = rtstruct.ds
         # ROIContourSequence is conditional: a structure set without contours
         # may omit it, which must yield {} rather than AttributeError
         roi_name_map: dict[int, str] = {
@@ -228,9 +229,14 @@ def load_rt_struct(
 
     roi_tasks: list[tuple[int, str, str]] = []
     for roi_contour in roi_contours:
-        roi_number = int(roi_contour.ReferencedROINumber)
+        # One malformed item is skipped, like an ROI whose mask cannot be built
+        try:
+            roi_number = int(roi_contour.ReferencedROINumber)
+            color_hex = _extract_roi_color(roi_contour)
+        except (AttributeError, TypeError, ValueError) as exc:
+            logger.warning(f"Skipping a malformed ROIContourSequence item: {exc}")
+            continue
         roi_name = roi_name_map.get(roi_number, f"ROI_{roi_number}")
-        color_hex = _extract_roi_color(roi_contour)
         roi_tasks.append((roi_number, roi_name, color_hex))
 
     if not roi_tasks:
@@ -254,7 +260,7 @@ def load_rt_struct(
             f"{sorted(duplicate_names)}; resolving each by ROINumber instead "
             "of name to avoid every same-named ROI receiving the same mask."
         )
-        for roi in rtstruct.ds.StructureSetROISequence:
+        for roi in ds.StructureSetROISequence:
             if roi.ROIName in duplicate_names:
                 unique_name = f"__tk_rt_viewer_load_tmp_{roi.ROINumber}__"
                 lookup_name_by_number[int(roi.ROINumber)] = unique_name

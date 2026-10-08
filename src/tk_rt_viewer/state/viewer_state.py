@@ -97,6 +97,16 @@ WINDOW_LEVEL_TARGETS: tuple[str, ...] = ("primary", "secondary")
 MIN_BRUSH_SIZE_MM: float = 0.1
 
 
+def _same_grid(image: sitk.Image, reference: sitk.Image) -> bool:
+    """Return whether *image* has exactly *reference*'s voxel grid."""
+    return bool(
+        image.GetSize() == reference.GetSize()
+        and image.GetOrigin() == reference.GetOrigin()
+        and image.GetSpacing() == reference.GetSpacing()
+        and image.GetDirection() == reference.GetDirection()
+    )
+
+
 @dataclass(eq=False)
 class SliceViewerState:
     """State container for the 3-plane DICOM viewer.
@@ -561,6 +571,10 @@ class SliceViewerState:
     ) -> sitk.Image:
         """Resample *image* onto the primary image grid (linear interpolation).
 
+        An *image* already on the primary grid is returned as-is when no
+        *transform* is given: an identity resample would only copy it. That
+        is the case for every 4DCT phase leaving the LRU cache.
+
         Args:
             image: The source image.
             transform: Maps primary-grid points into *image* (a registration
@@ -576,6 +590,8 @@ class SliceViewerState:
                 "Cannot resample: no primary image is loaded, so there is no "
                 "reference grid to resample onto."
             )
+        if transform is None and _same_grid(image, self.primary_image):
+            return image
         resample = sitk.ResampleImageFilter()
         resample.SetReferenceImage(self.primary_image)
         resample.SetInterpolator(sitk.sitkLinear)

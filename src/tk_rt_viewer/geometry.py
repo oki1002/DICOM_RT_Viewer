@@ -216,6 +216,27 @@ def fit_box_length(
     return extent / 2.0 if extent < min_extent else length
 
 
+def mask_bounds(
+    mask: np.ndarray, pad_voxels: tuple[int, int, int] = (0, 0, 0)
+) -> tuple[slice, slice, slice] | None:
+    """Return the bounding box of a ``(z, y, x)`` mask grown by *pad_voxels*.
+
+    Clamped to the array; ``None`` when the mask is empty. Lets whole-volume
+    work (a distance transform, a DVH) run on the usually small region the
+    mask occupies.
+    """
+    occupied = [
+        np.flatnonzero(mask.any(axis=axes)) for axes in ((1, 2), (0, 2), (0, 1))
+    ]
+    if any(indices.size == 0 for indices in occupied):
+        return None
+    z, y, x = (
+        slice(max(0, int(indices[0]) - pad), min(extent, int(indices[-1]) + pad + 1))
+        for indices, pad, extent in zip(occupied, pad_voxels, mask.shape, strict=True)
+    )
+    return z, y, x
+
+
 def view_dims(axis: str) -> tuple[int, int]:
     """Return the physical dimensions plotted on *axis*' x and y axes.
 

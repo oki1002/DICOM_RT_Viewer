@@ -14,13 +14,14 @@ result keeps the input's origin / spacing / direction.
 import logging
 from dataclasses import dataclass
 from enum import Enum, auto
+from itertools import pairwise
 
 import numpy as np
 import SimpleITK as sitk
 from scipy.ndimage import distance_transform_edt, gaussian_filter
 from scipy.ndimage import shift as ndshift
 
-from .geometry import resample_binary_mask
+from .geometry import mask_bounds, resample_binary_mask
 
 logger = logging.getLogger(__name__)
 
@@ -209,7 +210,7 @@ def interpolate_contour(mask_image: sitk.Image) -> sitk.Image:
 
     result = binary.copy()
     n_filled = 0
-    for prev_z, next_z in zip(nonempty, nonempty[1:], strict=False):
+    for prev_z, next_z in pairwise(nonempty):
         gap = next_z - prev_z
         if gap <= 1:
             continue
@@ -258,27 +259,6 @@ def _margin_sampling(
     return (scaled[2], scaled[1], scaled[0])
 
 
-def _margin_bounds(
-    mask: np.ndarray, pad_voxels: tuple[int, int, int]
-) -> tuple[slice, slice, slice] | None:
-    """Return the mask's bounding box grown by *pad_voxels*, or ``None`` if empty.
-
-    The distance transform only needs to run inside the region the margin
-    can reach, which is usually a small fraction of the grid.
-    """
-    occupied = [
-        np.flatnonzero(mask.any(axis=axes)) for axes in ((1, 2), (0, 2), (0, 1))
-    ]
-    if any(indices.size == 0 for indices in occupied):
-        return None
-    bounds = []
-    for indices, pad, extent in zip(occupied, pad_voxels, mask.shape, strict=True):
-        lo = max(0, int(indices[0]) - pad)
-        hi = min(extent, int(indices[-1]) + pad + 1)
-        bounds.append(slice(lo, hi))
-    return (bounds[0], bounds[1], bounds[2])
-
-
 def apply_margin(mask_image: sitk.Image, config: MarginConfig) -> sitk.Image:
     """Apply a true Euclidean margin to a binary mask.
 
@@ -310,14 +290,15 @@ def apply_margin(mask_image: sitk.Image, config: MarginConfig) -> sitk.Image:
     mask = sitk.GetArrayViewFromImage(mask_image).astype(bool)  # (z, y, x)
     result = np.zeros_like(mask)
 
-    # Only a dilation can reach outside the mask's bounding box
+    # The distance transform only runs where the margin can reach; only a
+    # dilation reaches outside the mask's bounding box
     reach_mm = [radius + abs(off) for radius, off in zip(radii, offset, strict=True)]
     pad_voxels = (
         int(np.ceil(reach_mm[2] / spacing[2])) + 2 if expand else 2,
         int(np.ceil(reach_mm[1] / spacing[1])) + 2 if expand else 2,
         int(np.ceil(reach_mm[0] / spacing[0])) + 2 if expand else 2,
     )
-    bounds = _margin_bounds(mask, pad_voxels)
+    bounds = mask_bounds(mask, pad_voxels)
     if bounds is None:
         logger.warning("Margin skipped: the mask is empty.")
         return mask_image
