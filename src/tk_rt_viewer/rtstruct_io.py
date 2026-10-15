@@ -8,13 +8,15 @@ load_rt_struct(ct_dir, rtstruct_path, progress_callback=None, max_workers=1)
     and display metadata. Raises RtStructLoadError if the file itself
     cannot be parsed.
 
-mask2rtstruct(ct_dir, rtss_path, structures) -> pathlib.Path
+mask2rtstruct(ct_dir, rtss_path, structures, *, replace_existing=True,
+              add_roi_kwargs=None) -> pathlib.Path
     Convert NumPy mask arrays to an RT-STRUCT DICOM file, creating or
     updating as appropriate. Returns the path actually written to (rt-utils
-    appends ".dcm" to a path that lacks it).
+    appends ".dcm" to a path that lacks it). add_roi_kwargs is forwarded to
+    rt-utils' RTStruct.add_roi (e.g. approximate_contours).
 
 save_structure_set(structure_set, ct_dir, rtss_path, lps_image,
-                   original_image=None) -> int
+                   original_image=None, *, add_roi_kwargs=None) -> int
     Write every ROI of a StructureSet to an RT-STRUCT file, resampling
     each mask back to the original DICOM geometry first.
 
@@ -29,7 +31,7 @@ random_hex_color() -> str
 import logging
 import pathlib
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, Any, TypedDict
 
@@ -62,6 +64,9 @@ _COLOR_RNG: np.random.Generator = np.random.default_rng()
 
 #: Suffix rt-utils' ``RTStruct.save()`` silently appends to any path lacking it.
 _RTSTRUCT_SUFFIX = ".dcm"
+
+#: add_roi keywords mask2rtstruct fills in itself from *structures*
+_RESERVED_ADD_ROI_KEYS = frozenset({"mask", "color", "name"})
 
 
 def _resolved_rtss_path(rtss_path: pathlib.Path) -> pathlib.Path:
@@ -97,6 +102,8 @@ def save_structure_set(
     rtss_path: str | pathlib.Path,
     lps_image: sitk.Image,
     original_image: sitk.Image | None = None,
+    *,
+    add_roi_kwargs: Mapping[str, Any] | None = None,
 ) -> int:
     """Write every ROI of *structure_set* to an RT-STRUCT file.
 
@@ -115,13 +122,15 @@ def save_structure_set(
         original_image: The CT before LPS alignment
             (``SeriesInfo["original_sitk_image"]``). ``None`` when the series
             needed no reorientation; the masks are then written as they are.
+        add_roi_kwargs: Forwarded to :func:`mask2rtstruct`.
 
     Returns:
         The number of ROIs written.
 
     Raises:
         ValueError: If *structure_set* contains no ROI with a usable mask,
-            since that would write an RT-STRUCT with no structures at all.
+            since that would write an RT-STRUCT with no structures at all,
+            or if *add_roi_kwargs* contains a reserved key.
         RuntimeError: If rt-utils rejects an ROI (propagated from
             :func:`mask2rtstruct`).
     """
@@ -146,7 +155,9 @@ def save_structure_set(
     if not structures:
         raise ValueError("Structure set contains no ROI with a mask to save.")
 
-    written_path = mask2rtstruct(ct_dir, rtss_path, structures)
+    written_path = mask2rtstruct(
+        ct_dir, rtss_path, structures, add_roi_kwargs=add_roi_kwargs
+    )
     logger.info(f"Structure set saved to '{written_path}' ({len(structures)} ROIs).")
     return len(structures)
 
@@ -333,6 +344,7 @@ def mask2rtstruct(
     structures: dict[int, dict[str, Any]],
     *,
     replace_existing: bool = True,
+    add_roi_kwargs: Mapping[str, Any] | None = None,
 ) -> pathlib.Path:
     """Write ``(D, H, W)`` mask arrays to an RT-STRUCT DICOM file.
 
@@ -346,16 +358,31 @@ def mask2rtstruct(
             rebuilt so it holds exactly *structures*. ``False`` appends to the
             existing file instead; rt-utils cannot remove ROIs, so saving the
             same ROIs twice that way duplicates them.
+        add_roi_kwargs: Extra keyword arguments forwarded to rt-utils'
+            ``RTStruct.add_roi`` for every ROI, e.g.
+            ``{"approximate_contours": False, "use_pin_hole": True}``.
+            ``mask``, ``color`` and ``name`` are taken from *structures*
+            and must not be given here.
 
     Returns:
         The path actually written.
 
     Raises:
-        ValueError: If *rtss_path* is ``None``.
-        RuntimeError: If any ROI cannot be added to the RT-STRUCT builder.
+        ValueError: If *rtss_path* is ``None`` or *add_roi_kwargs* contains
+            a reserved key.
+        RuntimeError: If any ROI cannot be added to the RT-STRUCT builder
+            (including unknown keys in *add_roi_kwargs*).
     """
     if rtss_path is None:
         raise ValueError("rtss_path must not be None; provide a concrete output path.")
+
+    roi_options = dict(add_roi_kwargs or {})
+    reserved = _RESERVED_ADD_ROI_KEYS & roi_options.keys()
+    if reserved:
+        raise ValueError(
+            f"add_roi_kwargs must not contain {sorted(reserved)}; "
+            "they are taken from structures."
+        )
 
     ct_dir = pathlib.Path(ct_dir)
     rtss_path = _resolved_rtss_path(pathlib.Path(rtss_path))
@@ -382,6 +409,7 @@ def mask2rtstruct(
                 mask=np.transpose(roi_data["mask"], (1, 2, 0)).astype(bool, copy=False),
                 color=roi_data["color"],
                 name=roi_name,
+                **roi_options,
             )
         except Exception as exc:
             logger.error(f"Failed to add ROI '{roi_name}': {exc}")

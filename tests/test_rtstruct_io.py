@@ -22,16 +22,17 @@ from tk_rt_viewer.state.viewer_state import StructureSet
 
 @pytest.fixture()
 def captured_structures(monkeypatch) -> dict:
-    """Capture the structures dict (and replace_existing) passed to mask2rtstruct."""
+    """Capture the arguments passed to mask2rtstruct."""
     captured: dict = {}
 
     def fake_mask2rtstruct(
-        ct_dir, rtss_path, structures, *, replace_existing=True
+        ct_dir, rtss_path, structures, *, replace_existing=True, add_roi_kwargs=None
     ) -> pathlib.Path:
         captured["ct_dir"] = ct_dir
         captured["rtss_path"] = rtss_path
         captured["structures"] = structures
         captured["replace_existing"] = replace_existing
+        captured["add_roi_kwargs"] = add_roi_kwargs
         return pathlib.Path(rtss_path)
 
     monkeypatch.setattr(rtstruct_io, "mask2rtstruct", fake_mask2rtstruct)
@@ -141,6 +142,22 @@ class TestSaveStructureSet:
         )
 
         assert captured_structures["replace_existing"] is True
+
+    def test_add_roi_kwargs_is_forwarded(self, captured_structures) -> None:
+        lps = _image()
+        structure_set = StructureSet()
+        structure_set.add("PTV", _mask(lps), "#ff0000")
+        options = {"approximate_contours": False}
+
+        rtstruct_io.save_structure_set(
+            structure_set,
+            "/ct",
+            "/out/rs.dcm",
+            lps_image=lps,
+            add_roi_kwargs=options,
+        )
+
+        assert captured_structures["add_roi_kwargs"] == options
 
 
 class TestSaveStructureSetResampling:
@@ -342,6 +359,92 @@ class TestMask2RtStructImplicitDcmSuffix:
         written = rtstruct_io.mask2rtstruct(ct_dir, out, self._structures())
 
         assert written == out
+
+
+class TestMask2RtStructAddRoiKwargs:
+    """``add_roi_kwargs`` reaches ``RTStruct.add_roi`` for every ROI."""
+
+    @staticmethod
+    def _structures() -> dict:
+        mask = np.zeros((4, 8, 8), dtype=bool)
+        mask[1:3, 2:6, 2:6] = True
+        return {
+            1: {"name": "PTV", "mask": mask, "color": "#ff0000"},
+            2: {"name": "CTV", "mask": mask.copy(), "color": "#00ff00"},
+        }
+
+    @staticmethod
+    def _ct_dir(tmp_path) -> pathlib.Path:
+        ct_dir = tmp_path / "ct"
+        ct_dir.mkdir()
+        _write_minimal_ct_series(ct_dir)
+        return ct_dir
+
+    def test_options_are_passed_to_every_add_roi_call(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from rt_utils import RTStruct
+
+        calls: list[dict] = []
+        real_add_roi = RTStruct.add_roi
+
+        def spy(self, **kwargs):
+            calls.append(kwargs)
+            return real_add_roi(self, **kwargs)
+
+        monkeypatch.setattr(RTStruct, "add_roi", spy)
+
+        rtstruct_io.mask2rtstruct(
+            self._ct_dir(tmp_path),
+            tmp_path / "rs.dcm",
+            self._structures(),
+            add_roi_kwargs={"approximate_contours": False, "description": "auto"},
+        )
+
+        assert len(calls) == 2
+        assert all(c["approximate_contours"] is False for c in calls)
+        assert all(c["description"] == "auto" for c in calls)
+
+    def test_none_keeps_the_rt_utils_defaults(self, tmp_path, monkeypatch) -> None:
+        from rt_utils import RTStruct
+
+        calls: list[dict] = []
+        real_add_roi = RTStruct.add_roi
+
+        def spy(self, **kwargs):
+            calls.append(kwargs)
+            return real_add_roi(self, **kwargs)
+
+        monkeypatch.setattr(RTStruct, "add_roi", spy)
+
+        rtstruct_io.mask2rtstruct(
+            self._ct_dir(tmp_path), tmp_path / "rs.dcm", self._structures()
+        )
+
+        assert all(set(c) == {"mask", "color", "name"} for c in calls)
+
+    @pytest.mark.parametrize("key", ["mask", "color", "name"])
+    def test_reserved_keys_are_rejected_before_writing(self, tmp_path, key) -> None:
+        out = tmp_path / "rs.dcm"
+
+        with pytest.raises(ValueError, match=key):
+            rtstruct_io.mask2rtstruct(
+                tmp_path / "missing_ct",
+                out,
+                self._structures(),
+                add_roi_kwargs={key: None},
+            )
+
+        assert not out.exists()
+
+    def test_an_unknown_option_raises_runtime_error(self, tmp_path) -> None:
+        with pytest.raises(RuntimeError, match="PTV"):
+            rtstruct_io.mask2rtstruct(
+                self._ct_dir(tmp_path),
+                tmp_path / "rs.dcm",
+                self._structures(),
+                add_roi_kwargs={"no_such_option": True},
+            )
 
 
 class TestLoadRtStructDuplicateNames:

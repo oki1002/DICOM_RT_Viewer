@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.3.3]
+
+### Added
+
+- `rtstruct_io.mask2rtstruct` and `rtstruct_io.save_structure_set` take a
+  keyword-only `add_roi_kwargs` mapping, forwarded to rt-utils'
+  `RTStruct.add_roi` for every ROI. Callers can now set
+  `approximate_contours`, `use_pin_hole`, `roi_generation_algorithm`,
+  `description`, etc. `mask`, `color` and `name` still come from the
+  structures and raise `ValueError` if given here. The default (`None`)
+  keeps the previous behaviour.
+
 ## [2.3.2]
 
 ### Fixed

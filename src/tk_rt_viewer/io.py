@@ -55,7 +55,7 @@ import re
 from collections.abc import Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-from typing import TypedDict
+from typing import TypedDict, cast
 
 import numpy as np
 import pydicom
@@ -672,7 +672,7 @@ def _read_files(
     """Read *file_names* as one series, keeping per-slice metadata on *reader*."""
     reader.SetFileNames(file_names)
     reader.MetaDataDictionaryArrayUpdateOn()
-    image = reader.Execute()
+    image = cast(sitk.Image, reader.Execute())
     logger.info(f"Series '{series_id}' loaded with {len(file_names)} files.")
     return image
 

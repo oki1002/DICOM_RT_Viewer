@@ -337,6 +337,11 @@ written = save_structure_set(
 )
 ```
 
+Pass `add_roi_kwargs` to forward options to rt-utils' `RTStruct.add_roi`
+for every ROI, e.g. `add_roi_kwargs={"approximate_contours": False}` to
+keep every contour vertex instead of the simplified outline. `mask2rtstruct`
+accepts the same keyword.
+
 `rt_utils.RTStruct.save` silently appends `.dcm` to a path that does not
 already end with it, with no way to opt out; `mask2rtstruct` resolves
 against that internally so its `exists()` check, its log messages, and its
