@@ -51,14 +51,6 @@ From PyPI:
 pip install tk-rt-viewer
 ```
 
-Or directly from source (editable mode — changes take effect immediately):
-
-```bash
-git clone https://github.com/oki1002/DICOM_RT_Viewer.git
-cd DICOM_RT_Viewer
-pip install -e .
-```
-
 > **Note** — Tkinter is part of the CPython standard library but is *not*
 > pip-installable; on some Linux distributions it ships as a separate OS
 > package (e.g. `sudo apt install python3-tk` on Debian/Ubuntu).
